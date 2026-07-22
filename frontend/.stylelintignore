@@ -1,0 +1,7 @@
+public
+# 第三方库 / 构建产物 / 静态资源
+src/assets/fontawesome/**
+# 常见可选项
+dist/**
+docs/**
+node_modules/**

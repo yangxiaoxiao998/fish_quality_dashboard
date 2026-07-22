@@ -1,0 +1,503 @@
+"""Classify black-background fish crops with the local ViT model.
+
+Crop/mask pairs from ``first_match`` are classified into ``complete_match`` or
+``incomplete_match``.  Complete fish retain the existing direction-correction
+workflow before they are saved.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import tempfile
+from pathlib import Path
+from typing import Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:  # 仅类型检查，运行时延后加载
+    import cv2  # noqa: F401
+
+
+def _cv2():
+    import cv2  # type: ignore
+
+    return cv2
+
+THIS_DIR = Path(__file__).resolve().parent
+ALGORITHMS_ROOT = THIS_DIR.parent
+if str(ALGORITHMS_ROOT) not in sys.path:
+    sys.path.insert(0, str(ALGORITHMS_ROOT))
+
+from config.naming import (  # noqa: E402  pylint: disable=wrong-import-position
+    FISH_CROP_SUFFIX,
+    FISH_MASK_SUFFIX,
+    make_fish_crop_name,
+    make_fish_mask_name,
+    parse_fish_file_name,
+)
+from config.paths import (  # noqa: E402  pylint: disable=wrong-import-position
+    ALGORITHMS_DENGCHAO_DIR,
+    PROJECT_ROOT,
+    ensure_dir,
+    to_project_relative,
+    video_complete_match_dir,
+    video_first_match_dir,
+    video_incomplete_match_dir,
+)
+
+
+if str(ALGORITHMS_DENGCHAO_DIR) not in sys.path:
+    sys.path.insert(0, str(ALGORITHMS_DENGCHAO_DIR))
+
+
+def _import_processing_functions():
+    """Import orientation and ViT helpers only when processing starts."""
+
+    from merge_funs import (  # type: ignore[import-not-found]  # noqa: WPS433
+        DEFAULT_ANGLE_THRESHOLD,
+        DEFAULT_MIN_AREA,
+        DEFAULT_THRESHOLD,
+        compute_belly_orientation,
+        compute_head_orientation,
+        estimate_head_half_angle,
+        estimate_level_angle,
+        get_fish_mask,
+        rotate_bound,
+    )
+    from vit_completeness import get_default_classifier  # type: ignore[import-not-found]  # noqa: WPS433
+    return {
+        "DEFAULT_ANGLE_THRESHOLD": DEFAULT_ANGLE_THRESHOLD,
+        "DEFAULT_MIN_AREA": DEFAULT_MIN_AREA,
+        "DEFAULT_THRESHOLD": DEFAULT_THRESHOLD,
+        "compute_belly_orientation": compute_belly_orientation,
+        "compute_head_orientation": compute_head_orientation,
+        "estimate_head_half_angle": estimate_head_half_angle,
+        "estimate_level_angle": estimate_level_angle,
+        "get_fish_mask": get_fish_mask,
+        "get_default_classifier": get_default_classifier,
+        "rotate_bound": rotate_bound,
+    }
+
+
+def _processing_functions():
+    """Return cached orientation helpers and the ViT classifier factory."""
+
+    global DEFAULT_ANGLE_THRESHOLD, DEFAULT_MIN_AREA, DEFAULT_THRESHOLD
+    global compute_belly_orientation, compute_head_orientation
+    global estimate_head_half_angle, estimate_level_angle, get_default_classifier
+    global get_fish_mask, rotate_bound
+
+    if compute_belly_orientation is None:
+        loaded = _import_processing_functions()
+        for name, value in loaded.items():
+            globals()[name] = value
+    return {
+        "DEFAULT_ANGLE_THRESHOLD": DEFAULT_ANGLE_THRESHOLD,
+        "DEFAULT_MIN_AREA": DEFAULT_MIN_AREA,
+        "DEFAULT_THRESHOLD": DEFAULT_THRESHOLD,
+        "compute_belly_orientation": compute_belly_orientation,
+        "compute_head_orientation": compute_head_orientation,
+        "estimate_head_half_angle": estimate_head_half_angle,
+        "estimate_level_angle": estimate_level_angle,
+        "get_fish_mask": get_fish_mask,
+        "get_default_classifier": get_default_classifier,
+        "rotate_bound": rotate_bound,
+    }
+
+
+# Lazy-import placeholders populated by _processing_functions().
+DEFAULT_ANGLE_THRESHOLD = None  # type: ignore
+DEFAULT_MIN_AREA = None  # type: ignore
+DEFAULT_THRESHOLD = None  # type: ignore
+compute_belly_orientation = None  # type: ignore
+compute_head_orientation = None  # type: ignore
+estimate_head_half_angle = None  # type: ignore
+estimate_level_angle = None  # type: ignore
+get_fish_mask = None  # type: ignore
+get_default_classifier = None  # type: ignore
+rotate_bound = None  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# 路径解析
+# ---------------------------------------------------------------------------
+
+
+def _resolve_project_relative(path: str | Path) -> Path:
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return p.resolve()
+
+
+def _log_path(p: Path) -> str:
+    return to_project_relative(p)
+
+
+def resolve_dirs(args) -> tuple[Path, Path, Path]:
+    """根据 ``--video-id`` 或显式参数解析 ``(input, complete, incomplete)`` 三个目录。
+
+    - ``--video-id`` 给定时：所有目录按 ``data/jobs/<video-id>/crop_images/...`` 自动推导。
+    - 否则：使用 ``--input-dir``、``--complete-output-dir``、``--incomplete-output-dir``。
+      其中 ``--output-dir`` 是 ``--complete-output-dir`` 的兼容别名；
+      ``--complete-dir``/``--incomplete-dir`` 同样保留兼容。
+    """
+
+    video_id = getattr(args, "video_id", None)
+
+    if video_id:
+        input_dir = (
+            _resolve_project_relative(args.input_dir)
+            if getattr(args, "input_dir", None)
+            else video_first_match_dir(video_id)
+        )
+        complete_dir = video_complete_match_dir(video_id)
+        incomplete_dir = video_incomplete_match_dir(video_id)
+        return input_dir, complete_dir, incomplete_dir
+
+    input_dir = (
+        _resolve_project_relative(args.input_dir)
+        if getattr(args, "input_dir", None)
+        else None
+    )
+    if input_dir is None:
+        raise SystemExit(
+            "请指定 --input-dir 或 --video-id（同时也需要 --video-id 自动推导 input 目录）。"
+        )
+
+    complete_dir = (
+        _resolve_project_relative(args.complete_output_dir)
+        if getattr(args, "complete_output_dir", None)
+        else (
+            _resolve_project_relative(args.output_dir)
+            if getattr(args, "output_dir", None)
+            else _resolve_project_relative(getattr(args, "complete_dir", None))
+            if getattr(args, "complete_dir", None)
+            else input_dir.parent / "complete_match"
+        )
+    )
+    incomplete_dir = (
+        _resolve_project_relative(args.incomplete_output_dir)
+        if getattr(args, "incomplete_output_dir", None)
+        else (
+            _resolve_project_relative(getattr(args, "incomplete_dir", None))
+            if getattr(args, "incomplete_dir", None)
+            else input_dir.parent / "incomplete_match"
+        )
+    )
+
+    return input_dir, complete_dir, incomplete_dir
+
+
+# ---------------------------------------------------------------------------
+# 输入扫描 / 配对
+# ---------------------------------------------------------------------------
+
+
+def iter_crop_mask_pairs(input_dir: Path):
+    """扫描 ``input_dir`` 返回 ``(stem, crop_path, mask_path)``。
+
+    兼容 6 位 / 12 位：只要文件名满足 ``id_<track>_<frame>_(crop|mask_crop_bw).{jpg,png}`` 即可。
+    输出文件名始终统一为 12 位 ``id_<track>_<012d>_crop.jpg``。
+    """
+
+    pairs: dict[tuple[int, int], dict[str, Path]] = {}
+    if not input_dir.exists():
+        return
+    for entry in input_dir.iterdir():
+        if not entry.is_file():
+            continue
+        info = parse_fish_file_name(entry.name)
+        if info is None:
+            continue
+        key = (info.track_id, info.frame_index)
+        bucket = pairs.setdefault(key, {})
+        if info.kind == "crop":
+            bucket["crop"] = entry
+        elif info.kind == "mask":
+            bucket["mask"] = entry
+    for (track_id, frame_index), parts in sorted(pairs.items()):
+        crop = parts.get("crop")
+        mask = parts.get("mask")
+        if crop is None or mask is None:
+            continue
+        canonical_stem = f"id_{track_id}_{frame_index:012d}"
+        yield canonical_stem, crop, mask, track_id, frame_index
+
+
+def read_crop_mask_images(crop_path: Path, mask_path: Path):
+    crop_image = _cv2().imread(str(crop_path), _cv2().IMREAD_COLOR)
+    if crop_image is None:
+        raise ValueError(f"cannot read crop image: {crop_path}")
+
+    mask_image = _cv2().imread(str(mask_path), _cv2().IMREAD_GRAYSCALE)
+    if mask_image is None:
+        raise ValueError(f"cannot read mask image: {mask_path}")
+
+    if crop_image.shape[:2] != mask_image.shape[:2]:
+        raise ValueError(
+            f"image/mask size mismatch: {crop_path.name} {crop_image.shape[:2]} "
+            f"vs {mask_path.name} {mask_image.shape[:2]}"
+        )
+
+    _, binary_mask = _cv2().threshold(mask_image, 127, 255, _cv2().THRESH_BINARY)
+    return crop_image, binary_mask
+
+
+def make_black_background_fish_from_images(crop_image, binary_mask):
+    return _cv2().bitwise_and(crop_image, crop_image, mask=binary_mask)
+
+
+def binarize_mask(mask_image):
+    _, binary_mask = _cv2().threshold(mask_image, 1, 255, _cv2().THRESH_BINARY)
+    return binary_mask
+
+
+def rotate_aligned_images(black_background_fish, crop_image, mask_image, angle: float,
+                        rotate_bound_fn):
+    cv2 = _cv2()
+    rotated_fish = rotate_bound_fn(black_background_fish, angle, interpolation=cv2.INTER_LINEAR)
+    rotated_crop = rotate_bound_fn(crop_image, angle, interpolation=cv2.INTER_LINEAR)
+    rotated_mask = rotate_bound_fn(mask_image, angle, interpolation=cv2.INTER_NEAREST)
+    return rotated_fish, rotated_crop, binarize_mask(rotated_mask)
+
+
+def crop_aligned_images(black_background_fish, crop_image, mask_image, get_fish_mask_fn):
+    cv2 = _cv2()
+    fish_mask = get_fish_mask_fn(black_background_fish, threshold=DEFAULT_THRESHOLD)
+    fish_mask = binarize_mask(fish_mask)
+    if cv2.countNonZero(fish_mask) == 0:
+        raise ValueError("no fish pixels found after rotation")
+
+    x, y, width, height = cv2.boundingRect(fish_mask)
+    return (
+        black_background_fish[y:y + height, x:x + width],
+        crop_image[y:y + height, x:x + width],
+        mask_image[y:y + height, x:x + width],
+    )
+
+
+def align_complete_pair(crop_image, mask_image, mf: dict):
+    cv2 = _cv2()
+    black_background_fish = make_black_background_fish_from_images(crop_image, mask_image)
+
+    level_angle = mf["estimate_level_angle"](
+        black_background_fish, threshold=DEFAULT_THRESHOLD, min_area=DEFAULT_MIN_AREA,
+    )
+    black_background_fish, crop_image, mask_image = rotate_aligned_images(
+        black_background_fish, crop_image, mask_image, level_angle,
+        rotate_bound_fn=mf["rotate_bound"],
+    )
+    black_background_fish, crop_image, mask_image = crop_aligned_images(
+        black_background_fish, crop_image, mask_image,
+        get_fish_mask_fn=mf["get_fish_mask"],
+    )
+
+    (_left, _right, _score, _can_judge, head_position, _head_direction,
+     _reason, _confidence) = mf["compute_head_orientation"](
+        black_background_fish, threshold=DEFAULT_THRESHOLD
+    )
+
+    head_level_angle = 0.0
+    head_level_rotated = False
+    if head_position != "不确定":
+        head_level_angle = mf["estimate_head_half_angle"](
+            black_background_fish,
+            head_position=head_position,
+            threshold=DEFAULT_THRESHOLD,
+            min_area=DEFAULT_MIN_AREA,
+        )
+        if abs(head_level_angle) > DEFAULT_ANGLE_THRESHOLD:
+            black_background_fish, crop_image, mask_image = rotate_aligned_images(
+                black_background_fish, crop_image, mask_image, head_level_angle,
+                rotate_bound_fn=mf["rotate_bound"],
+            )
+            head_level_rotated = True
+
+    belly_position, _scores = mf["compute_belly_orientation"](black_background_fish)
+    belly_flipped = False
+    if belly_position == "top":
+        crop_image = cv2.flip(crop_image, 0)
+        mask_image = cv2.flip(mask_image, 0)
+        belly_flipped = True
+
+    return (
+        crop_image,
+        binarize_mask(mask_image),
+        level_angle,
+        head_position,
+        head_level_angle,
+        head_level_rotated,
+        belly_position,
+        belly_flipped,
+    )
+
+
+def save_aligned_pair(track_id: int, frame_index: int,
+                      crop_image, mask_image,
+                      output_dir: Path) -> None:
+    ensure_dir(output_dir)
+    crop_name = make_fish_crop_name(track_id, frame_index)
+    mask_name = make_fish_mask_name(track_id, frame_index)
+    _cv2().imwrite(str(output_dir / crop_name), crop_image)
+    _cv2().imwrite(str(output_dir / mask_name), mask_image)
+
+
+def save_incomplete_pair(crop_path: Path, mask_path: Path,
+                         track_id: int, frame_index: int,
+                         output_dir: Path) -> None:
+    """不完整鱼原样拷贝，文件名统一 12 位编号。"""
+
+    ensure_dir(output_dir)
+    crop_image = _cv2().imread(str(crop_path))
+    mask_image = _cv2().imread(str(mask_path), _cv2().IMREAD_GRAYSCALE)
+    if crop_image is None:
+        raise ValueError(f"cannot read crop image: {crop_path}")
+    if mask_image is None:
+        raise ValueError(f"cannot read mask image: {mask_path}")
+    crop_name = make_fish_crop_name(track_id, frame_index)
+    mask_name = make_fish_mask_name(track_id, frame_index)
+    _cv2().imwrite(str(output_dir / crop_name), crop_image)
+    _cv2().imwrite(str(output_dir / mask_name), mask_image)
+
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+
+
+def process_directory(input_dir: Path, complete_dir: Path, incomplete_dir: Path) -> int:
+    if not input_dir.is_dir():
+        print(f"[ERROR] 输入目录不存在：{_log_path(input_dir)}")
+        return 1
+
+    ensure_dir(complete_dir)
+    ensure_dir(incomplete_dir)
+
+    # Initialise the classifier once per stage.  A resource/configuration
+    # error must fail the stage rather than skip every fish below.
+    try:
+        mf = _processing_functions()
+        classifier = mf["get_default_classifier"]()
+    except Exception as exc:
+        print(f"[ERROR] failed to initialize ViT completeness classifier: {exc}")
+        return 1
+
+    total = 0
+    complete_count = 0
+    incomplete_count = 0
+    skipped_count = 0
+
+    with tempfile.TemporaryDirectory(prefix="fish_complete_") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+
+        for stem, crop_path, mask_path, track_id, frame_index in iter_crop_mask_pairs(input_dir):
+            total += 1
+            if not mask_path.is_file():
+                skipped_count += 1
+                print(f"[skip] {stem}: missing mask {mask_path.name}")
+                continue
+            try:
+                crop_image, mask_image = read_crop_mask_images(crop_path, mask_path)
+                black_background_fish = make_black_background_fish_from_images(crop_image, mask_image)
+                temp_image_path = temp_dir / f"{stem}_black_bg.png"
+                _cv2().imwrite(str(temp_image_path), black_background_fish)
+
+                result = classifier.predict_path(temp_image_path)
+
+                if result.is_complete:
+                    (
+                        aligned_crop,
+                        aligned_mask,
+                        level_angle,
+                        head_position,
+                        head_level_angle,
+                        head_level_rotated,
+                        belly_position,
+                        belly_flipped,
+                    ) = align_complete_pair(crop_image, mask_image, mf)
+                    save_aligned_pair(track_id, frame_index,
+                                       aligned_crop, aligned_mask, complete_dir)
+                else:
+                    save_incomplete_pair(crop_path, mask_path,
+                                         track_id, frame_index,
+                                         incomplete_dir)
+            except Exception as exc:
+                skipped_count += 1
+                print(f"[skip] {stem}: {exc}")
+                continue
+
+            if result.is_complete:
+                complete_count += 1
+                action = (
+                    "aligned"
+                    f", level_angle={level_angle:+.4f}"
+                    f", head_position={head_position}"
+                    f", head_level_angle={head_level_angle:+.4f}"
+                    f", head_level_rotated={head_level_rotated}"
+                    f", belly={belly_position}"
+                    f", flipped={belly_flipped}"
+                )
+            else:
+                incomplete_count += 1
+                action = "saved to incomplete"
+
+            print(f"[{result.label}] {stem}: confidence={result.confidence:.6f}, {action}")
+
+    print()
+    print("==== filter_complete_fish 完成 ====")
+    print(f"total       : {total}")
+    print(f"complete    : {complete_count}")
+    print(f"incomplete  : {incomplete_count}")
+    print(f"skipped     : {skipped_count}")
+    print(f"complete_dir   : {_log_path(complete_dir)}")
+    print(f"incomplete_dir : {_log_path(incomplete_dir)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="鱼体完整性过滤；完整鱼进 complete_match，不完整鱼进 incomplete_match"
+    )
+    parser.add_argument("--video-id", default=None,
+                        help="视频 ID；传入时自动按 data/jobs/<video-id>/crop_images/{first,complete,incomplete}_match 解析")
+    parser.add_argument("--input-dir", dest="input_dir", default=None,
+                        help="first_match 输入目录（默认 data/jobs/<video-id>/crop_images/first_match）")
+
+    parser.add_argument("--complete-output-dir", "--complete_output_dir",
+                        dest="complete_output_dir", default=None,
+                        help="完整鱼输出目录（默认 data/jobs/<video-id>/crop_images/complete_match）")
+    parser.add_argument("--incomplete-output-dir", "--incomplete_output_dir",
+                        dest="incomplete_output_dir", default=None,
+                        help="不完整鱼输出目录（默认 data/jobs/<video-id>/crop_images/incomplete_match）")
+
+    # 兼容旧参数：
+    parser.add_argument("--output-dir", dest="output_dir", default=None,
+                        help="兼容旧参数：相当于 --complete-output-dir")
+    parser.add_argument("--complete-dir", dest="complete_dir", default=None,
+                        help="兼容旧参数：相当于 --complete-output-dir")
+    parser.add_argument("--incomplete-dir", dest="incomplete_dir", default=None,
+                        help="兼容旧参数：相当于 --incomplete-output-dir")
+    return parser
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        input_dir, complete_dir, incomplete_dir = resolve_dirs(args)
+    except SystemExit as exc:
+        print(f"[ERROR] {exc}")
+        return 2
+    return process_directory(input_dir, complete_dir, incomplete_dir)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

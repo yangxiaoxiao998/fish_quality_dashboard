@@ -1,0 +1,12 @@
+name: Path Validation
+on: [pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          pip install pyyaml
+          python .github/path_validator.py ${{ github.actor }}
+        env:
+          PR_FILES: ${{ toJson(github.event.pull_request.changed_files) }}

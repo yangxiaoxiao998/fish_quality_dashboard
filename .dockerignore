@@ -1,0 +1,61 @@
+# .dockerignore - Docker build context 排除
+# 模型权重和数据不打包进镜像，全部通过 volume 挂载。
+
+.git
+.gitignore
+.github
+.ruff_cache
+.venv
+.venv_algo
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+node_modules
+frontend/node_modules
+frontend/dist
+frontend/docs
+
+data
+data/**
+deploy/.env.gpu
+deploy/.env.gpu.bak
+
+# 大文件 / 模型 / 数据 / 二进制
+*.pth
+*.pkl
+*.pt
+*.onnx
+*.h5
+*.parquet
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+
+# 编辑器 / 系统
+.vscode
+.idea
+.DS_Store
+*.swp
+*.swo
+
+# 日志 / 临时
+*.log
+logs
+**/tmp
+**/__pycache__
+
+# 文档
+*.md
+docs
+README*

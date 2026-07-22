@@ -1,0 +1,4 @@
+--2026-05-28 17:09:48--  https://huggingface.co/lkeab/hq-sam/resolve/main/sam_hq_vit_h.pth
+正在解析主机 huggingface.co (huggingface.co)... 184.72.1.148, 2a03:2880:f12c:183:face:b00c:0:25de
+正在连接 huggingface.co (huggingface.co)|184.72.1.148|:443... 失败：连接超时。
+正在连接 huggingface.co (huggingface.co)|2a03:2880:f12c:183:face:b00c:0:25de|:443... 失败：网络不可达。

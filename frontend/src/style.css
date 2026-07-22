@@ -1,0 +1,16 @@
+/* /home/yangzt/Code/fish_quality_dashboard/frontend/src/style.css */
+:root {
+  color-scheme: dark;
+}
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+body {
+  display: block;
+  overflow: hidden;
+}

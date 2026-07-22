@@ -1,0 +1,6 @@
+export { default as Layout } from './Layout.vue'
+export { default as LayoutFooter } from './LayoutFooter.vue'
+export { default as LayoutHeader } from './LayoutHeader.vue'
+export { default as LayoutLoading } from './LayoutLoading.vue'
+export { default as LayoutPanel } from './LayoutPanel.vue'
+export { default as VideoLayoutPanel } from './VideoLayoutPanel.vue'
