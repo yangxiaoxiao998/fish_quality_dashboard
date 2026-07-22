@@ -35,3 +35,10 @@ pydantic==2.10.6
 pydantic-settings==2.8.1
 pydantic_core==2.27.2
 pydeck==0.9.1
+
+# gaoyuxi
+# torch: 2.7.0+cu128
+# torch cuda: 12.8
+# cuda available: True
+# gpu: NVIDIA GeForce RTX 5060 Ti
+# capability: (12, 0)
