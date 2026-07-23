@@ -1,12 +1,28 @@
 name: Path Validation
-on: [pull_request]
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - run: |
-          pip install pyyaml
-          python .github/path_validator.py ${{ github.actor }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate changed paths
         env:
-          PR_FILES: ${{ toJson(github.event.pull_request.changed_files) }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          pip install pyyaml
+          git diff --name-only -z "$BASE_SHA" "$HEAD_SHA" |
+            python .github/path_validator.py "$PR_AUTHOR"

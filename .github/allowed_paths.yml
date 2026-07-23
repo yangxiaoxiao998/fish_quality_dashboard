@@ -3,3 +3,5 @@
   - "algorithms/**"      # 仅允许修改目录
 lpynb666:  # 替换为2的GitHub用户名
   - "camera/**"   # 仅允许修改目录
+yangxiaoxiao998:
+  - "**"

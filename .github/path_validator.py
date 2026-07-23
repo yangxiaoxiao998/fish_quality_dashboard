@@ -1,21 +1,38 @@
-import yaml
-import json
+import fnmatch
+import os
 import sys
-import re
+
+import yaml
+
+
+if len(sys.argv) != 2:
+    print("❌ Usage: path_validator.py <pr_author>")
+    sys.exit(1)
 
 author = sys.argv[1]
-changed_files = json.loads(sys.argv[2])  # 现在changed_files是字符串列表
 
-with open('.github/allowed_paths.yml') as f:
-    rules = yaml.safe_load(f)
+# 从标准输入读取由 NUL 分隔的文件名，避免空格等特殊字符造成解析错误
+changed_files = [
+    os.fsdecode(item)
+    for item in sys.stdin.buffer.read().split(b"\0")
+    if item
+]
+
+with open(".github/allowed_paths.yml", encoding="utf-8") as file:
+    rules = yaml.safe_load(file) or {}
 
 if author not in rules:
     print(f"❌ {author} not in allowed_paths.yml")
-    exit(1)
+    sys.exit(1)
 
-patterns = [p.replace('**', '.*') for p in rules[author]]
-for file in changed_files:
-    if not any(re.match(pattern, file) for pattern in patterns):
-        print(f"❌ {file} not allowed for {author}")
-        exit(1)
-print("✅ All changes in allowed paths")
+allowed_patterns = rules[author]
+
+for changed_file in changed_files:
+    if not any(
+        fnmatch.fnmatchcase(changed_file, pattern)
+        for pattern in allowed_patterns
+    ):
+        print(f"❌ {changed_file} not allowed for {author}")
+        sys.exit(1)
+
+print(f"✅ All {len(changed_files)} changed files are allowed for {author}")
