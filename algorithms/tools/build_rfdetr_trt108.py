@@ -254,19 +254,35 @@ def build_engine(args: argparse.Namespace) -> Path:
     config.set_flag(trt.BuilderFlag.FP16)
 
     profile = builder.create_optimization_profile()
-    if not profile.set_shape(
+    # TensorRT 10.8 Python API returns None from set_shape() on success.
+    # Do not use its return value as a Boolean; validate the stored shapes.
+    profile.set_shape(
         input_name,
         FIXED_INPUT_SHAPE,
         FIXED_INPUT_SHAPE,
         FIXED_INPUT_SHAPE,
-    ):
-        raise RuntimeError("Could not set the TensorRT optimization profile")
+    )
+
+    actual_profile = tuple(
+        as_shape(shape) for shape in profile.get_shape(input_name)
+    )
+    expected_profile = (
+        FIXED_INPUT_SHAPE,
+        FIXED_INPUT_SHAPE,
+        FIXED_INPUT_SHAPE,
+    )
+    if actual_profile != expected_profile or not profile:
+        raise RuntimeError(
+            "Invalid TensorRT optimization profile: "
+            f"expected={expected_profile}, actual={actual_profile}"
+        )
+
     if config.add_optimization_profile(profile) < 0:
         raise RuntimeError("Could not add the TensorRT optimization profile")
 
-    print("Profile min:", FIXED_INPUT_SHAPE)
-    print("Profile opt:", FIXED_INPUT_SHAPE)
-    print("Profile max:", FIXED_INPUT_SHAPE)
+    print("Profile min:", actual_profile[0])
+    print("Profile opt:", actual_profile[1])
+    print("Profile max:", actual_profile[2])
 
     print("\n[3/5] Building the engine; this can take several minutes...")
     started_at = time.monotonic()
