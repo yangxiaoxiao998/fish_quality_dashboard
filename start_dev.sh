@@ -29,13 +29,15 @@ mkdir -p "$PID_DIR"
 # ----------------------------------------------------------------------
 # 2) conda 环境：默认 test
 # ----------------------------------------------------------------------
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-test}"
+# CONDA_ENV_NAME="${CONDA_ENV_NAME:-test}"
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-full}"
 PY="/home/$USER/miniconda3/envs/${CONDA_ENV_NAME}/bin/python"
 
 if [ ! -x "$PY" ]; then
   echo "[ERROR] python not found: $PY"
   echo "[HINT] 当前 CONDA_ENV_NAME=$CONDA_ENV_NAME"
-  echo "[HINT] 推荐：conda create -n test python=3.10 && conda activate test"
+  # echo "[HINT] 推荐：conda create -n test python=3.10 && conda activate test"
+    echo "[HINT] 推荐：conda create -n full python=3.10 && conda activate full"
   echo "[HINT]        pip install psycopg2-binary redis rq fastapi 'sqlalchemy[asyncio]' pydantic-settings"
   exit 1
 fi
