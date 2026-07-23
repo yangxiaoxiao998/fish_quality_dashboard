@@ -16,13 +16,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install dependency
+        run: pip install pyyaml
+
       - name: Validate changed paths
         env:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          set -o pipefail
-          pip install pyyaml
-          git diff --name-only -z "$BASE_SHA" "$HEAD_SHA" |
-            python .github/path_validator.py "$PR_AUTHOR"
+          set -euo pipefail
+
+          CHANGED_FILES="$(
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" |
+            python -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))'
+          )"
+
+          python .github/path_validator.py \
+            "$PR_AUTHOR" \
+            "$CHANGED_FILES"
