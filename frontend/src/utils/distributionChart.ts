@@ -59,14 +59,6 @@ export function setDistributionChartOption(
   const labels = data.map((d) => d.label)
   const ratios = data.map((d) => d.ratio)
   const counts = data.map((d) => d.count)
-  const maxRatio = ratios.length > 0 ? Math.max(...ratios) : 0
-
-  // y 轴最大值：非空时 max(0.1, maxRatio * 1.15)，不超过 1
-  const yMax =
-    maxRatio <= 0
-      ? 1
-      : Math.min(1, Math.max(0.1, Math.round(maxRatio * 1.15 * 1000) / 1000))
-
   chart.setOption({
     backgroundColor: 'transparent',
     tooltip: {
@@ -109,12 +101,12 @@ export function setDistributionChartOption(
       nameGap: 46,
       nameTextStyle: { color: 'rgb(255,255,255,0.7)', fontSize: 11 },
       min: 0,
-      max: yMax,
+      max: 1,
       axisLine: { lineStyle: { color: 'rgb(255,255,255,0.2)' } },
       axisLabel: {
         color: 'rgb(255,255,255,0.6)',
         fontSize: 10,
-        formatter: (v: number) => `${Math.round(Number(v) * 100)}%`,
+        formatter: (v: number) => (Number(v) === 0 ? '' : `${Math.round(Number(v) * 100)}%`),
       },
       splitLine: { lineStyle: { color: 'rgb(255,255,255,0.1)' } },
     },
@@ -123,6 +115,16 @@ export function setDistributionChartOption(
         data: ratios,
         type: 'bar',
         barWidth: '60%',
+        label: {
+          show: true,
+          formatter: (p: any) => {
+            const value = Number(p.value || 0)
+            return value > 0 ? `${(value * 100).toFixed(1)}%` : ''
+          },
+          color: 'rgb(255,255,255,0.85)',
+          fontSize: 10,
+          position: 'top',
+        },
         itemStyle: {
           color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
             { offset: 0, color: color[0] },

@@ -37,6 +37,8 @@ logger = logging.getLogger("video_playback_service")
 PLAYABLE_DIR_REL = "data/uploads/videos/playable"
 PLAYABLE_DIR_ABS = DATA_DIR / "uploads" / "videos" / "playable"
 PLAYABLE_SUFFIX = "_h264.mp4"
+WEBM_SUFFIX = ".webm"
+RESULT_WEBM_SUFFIX = "_grounded.webm"
 
 FFPROBE_BIN = shutil.which("ffprobe")
 FFMPEG_BIN = shutil.which("ffmpeg")
@@ -47,7 +49,7 @@ def _ensure_playable_dir() -> Path:
     return PLAYABLE_DIR_ABS
 
 
-def _candidate_source_paths(video_id: str) -> list[Path]:
+def _candidate_source_paths(video_id: str, stored_path: str | None = None) -> list[Path]:
     """
     列出可能的源视频路径，按优先级返回：
 
@@ -55,21 +57,34 @@ def _candidate_source_paths(video_id: str) -> list[Path]:
     2. data/uploads/videos/<video_id>_h264.mp4（已经是 H.264 副本）
     """
     base = DATA_DIR / "uploads" / "videos"
-    return [
+    stored = to_abs_data_path(stored_path) if stored_path else None
+    candidates = [
+        stored,
+        PLAYABLE_DIR_ABS / f"{video_id}{PLAYABLE_SUFFIX}",
         base / f"{video_id}.mp4",
         base / f"{video_id}_h264.mp4",
     ]
+    return [path for path in candidates if path is not None]
 
 
-def _resolve_source_path(video_id: str) -> Optional[Path]:
-    for p in _candidate_source_paths(video_id):
+def _resolve_source_path(video_id: str, stored_path: str | None = None) -> Optional[Path]:
+    for p in _candidate_source_paths(video_id, stored_path):
         if p.exists() and p.is_file():
             return p
     return None
 
 
+def resolve_canonical_video_path(video_id: str, stored_path: str | None = None) -> Optional[Path]:
+    return _resolve_source_path(video_id, stored_path)
+
+
 def _resolve_playable_path(video_id: str) -> Path:
     return PLAYABLE_DIR_ABS / f"{video_id}{PLAYABLE_SUFFIX}"
+
+
+def _resolve_webm_path(video_id: str, *, result_video: bool = False) -> Path:
+    suffix = RESULT_WEBM_SUFFIX if result_video else WEBM_SUFFIX
+    return PLAYABLE_DIR_ABS / f"{video_id}{suffix}"
 
 
 def _probe_codec(video_path: Path, timeout: float = 8.0) -> dict[str, Any]:
@@ -154,6 +169,88 @@ def _probe_codec(video_path: Path, timeout: float = 8.0) -> dict[str, Any]:
     }
 
 
+def probe_media_duration_seconds(
+    video_path: str | Path,
+    timeout: float = 20.0,
+) -> Optional[float]:
+    """用 ffprobe 探测媒体文件真实时长（秒）。
+
+    返回：
+        - float：真实时长（> 0）
+        - None：文件不存在 / ffprobe 缺失 / 解析失败 / 时长为 0
+    """
+    if not FFPROBE_BIN:
+        return None
+    p = Path(video_path)
+    if not p.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                FFPROBE_BIN,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(p),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            text=True,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        value = float((proc.stdout or "").strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def validate_recording_duration(
+    video_path: str | Path,
+    requested_duration_seconds: float,
+    *,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """验收录制视频时长是否满足用户设定时长。
+
+    验收规则：``实际时长 >= 设定时长``。
+
+    返回：
+        {
+            "ok": bool,
+            "video_path": str,
+            "actual_duration_seconds": float | None,
+            "requested_duration_seconds": float,
+            "shortfall_seconds": float | None,
+            "error_message": str | None,
+        }
+    """
+    requested = float(requested_duration_seconds)
+    actual = probe_media_duration_seconds(video_path, timeout=timeout)
+    if actual is None:
+        return {
+            "ok": False,
+            "video_path": str(video_path),
+            "actual_duration_seconds": None,
+            "requested_duration_seconds": requested,
+            "shortfall_seconds": None,
+            "error_message": "无法用 ffprobe 探测媒体时长（文件缺失或 ffprobe 不可用）。",
+        }
+    ok = actual >= requested
+    return {
+        "ok": ok,
+        "video_path": str(video_path),
+        "actual_duration_seconds": round(actual, 3),
+        "requested_duration_seconds": requested,
+        "shortfall_seconds": round(max(0.0, requested - actual), 3),
+        "error_message": None if ok else "实际录制时长不足设定时长。",
+    }
+
+
 def _transcode_to_h264(
     source: Path,
     target: Path,
@@ -216,6 +313,7 @@ def _transcode_to_h264(
 def ensure_browser_playable_video(
     video_id: str,
     *,
+    stored_path: str | None = None,
     force_reconvert: bool = False,
     timeout: float = 7200.0,
 ) -> dict[str, Any]:
@@ -243,7 +341,7 @@ def ensure_browser_playable_video(
             "converted": True | False,
         }
     """
-    source = _resolve_source_path(video_id)
+    source = _resolve_source_path(video_id, stored_path)
     if source is None:
         return {
             "ok": False,
@@ -331,6 +429,85 @@ def ensure_browser_playable_video(
         "codec_name": new_probe.get("codec_name") or codec_name,
         "pix_fmt": new_probe.get("pix_fmt") or pix_fmt,
         "converted": True,
+    }
+
+
+def ensure_browser_webm_video(
+    source: Path,
+    output: Path,
+    *,
+    timeout: float = 7200.0,
+) -> dict[str, Any]:
+    """Create a Chromium-compatible VP8/WebM fallback when H.264 is unavailable.
+
+    Some Linux Chromium/Electron builds ship without the proprietary H.264
+    decoder. The MP4 can be valid and still report ``no supported streams``.
+    WebM is decoded by the bundled open-source codecs, so it is a reliable
+    fallback for those deployments.
+    """
+    if not FFMPEG_BIN:
+        return {"ok": False, "error_message": "服务器未安装 ffmpeg。"}
+    if not source.exists():
+        return {"ok": False, "error_message": f"视频文件不存在：{source}"}
+    if output.exists() and output.stat().st_mtime >= source.stat().st_mtime:
+        return {"ok": True, "cached": True, "path": output}
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Keep the final media suffix at the end so ffmpeg can infer WebM format.
+    temp = output.with_name(f".{output.name}.partial.webm")
+    try:
+        temp.unlink(missing_ok=True)
+        proc = subprocess.run(
+            [
+                FFMPEG_BIN,
+                "-y",
+                "-i",
+                str(source),
+                "-map",
+                "0:v:0",
+                "-vf",
+                "scale=320:-2,fps=6",
+                "-c:v",
+                "libvpx",
+                "-deadline",
+                "realtime",
+                "-cpu-used",
+                "8",
+                "-crf",
+                "40",
+                "-b:v",
+                "0",
+                "-an",
+                str(temp),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if proc.returncode != 0 or not temp.exists() or temp.stat().st_size == 0:
+            return {
+                "ok": False,
+                "error_message": (proc.stderr or "WebM 转码失败")[-2000:],
+            }
+        temp.replace(output)
+        return {"ok": True, "path": output, "cached": False}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error_message": "WebM 转码超时。"}
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def ensure_video_id_webm(video_id: str, *, result_video: bool = False) -> dict[str, Any]:
+    source = (
+        DATA_DIR / "results" / video_id / "videos" / "grounded_sam.mp4"
+        if result_video
+        else _resolve_source_path(video_id)
+    )
+    output = _resolve_webm_path(video_id, result_video=result_video)
+    return ensure_browser_webm_video(source, output) if source else {
+        "ok": False,
+        "error_message": f"视频文件不存在：{video_id}",
     }
 
 

@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+
 from app.routers.health_router import router as health_router
 from app.routers.stream_router import router as stream_router
 from app.routers.fish_router import router as fish_router
@@ -13,8 +17,6 @@ from app.routers.stats_router import router as stats_router
 from app.routers.camera_router import router as camera_router
 from app.routers.camera_yzt_router import router as camera_yzt_router
 from app.routers.report_router import router as report_router
-from app.paths import ensure_directories, DATA_DIR
-from app.repositories.startup_migrations import run_frame_detection_tables_migration
 from app.routers.calibration_router import router as calibration_router
 from app.routers.led_router import router as led_router
 from app.routers.system_router import router as system_router
@@ -87,19 +89,44 @@ def _should_log_operation(method: str, path: str) -> bool:
     return False
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="Fish Quality Dashboard API")
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """FastAPI 启动 / 关闭生命周期。
 
+    启动顺序：
+        1. ensure_directories
+        2. log_db_connection + init_db_schema
+        3. 全部 startup_migrations（10 个）
+        4. path_migrations
+        5. 摄像头 startup_recovery（容错，失败仅记录）
+        6. 启动 camera_record_schedule scheduler（所有前置成功后才启动）
+
+    关闭顺序：
+        1. 停止 camera_record_schedule scheduler（幂等）
+        2. 任何后续清理如需添加，按顺序追加
+
+    设计原则：
+        - 不在 import 阶段执行任何运行期副作用；
+        - 迁移失败 / 启动恢复失败不掩盖，按当前容错语义处理；
+        - 关闭时只 stop scheduler；不再次迁移、不重复执行 startup。
+    """
+    # ---- startup ----
     print("=========================================")
     print("[startup] Fish Quality Dashboard API")
     print("=========================================")
 
+    # 1) 目录
+    from app.paths import ensure_directories
+
     ensure_directories()
 
+    # 2) DB 连接 + schema
     from app.repositories.db import log_db_connection, init_db_schema
+
     log_db_connection()
     init_db_schema()
 
+    # 3) 全部 startup migrations（保持现有调用顺序）
     from app.repositories.startup_migrations import (
         run_track_id_migration,
         run_body_length_without_tail_migration,
@@ -109,8 +136,12 @@ def create_app() -> FastAPI:
         run_detection_report_conclusion_migration,
         run_algorithm_result_tables_migration,
         run_video_task_timed_recording_migration,
+        run_video_task_report_migration,
+        run_camera_schedule_integrity_migration,
         run_detection_report_video_report_migration,
+        run_camera_record_schedule_migration,
     )
+
     run_track_id_migration()
     run_body_length_without_tail_migration()
     run_report_tables_migration()
@@ -119,13 +150,27 @@ def create_app() -> FastAPI:
     run_detection_report_conclusion_migration()
     run_algorithm_result_tables_migration()
     run_video_task_timed_recording_migration()
+    run_video_task_report_migration()
+    run_camera_schedule_integrity_migration()
     run_detection_report_video_report_migration()
+    run_camera_record_schedule_migration()
 
+    # Redis/RQ can lose queued jobs while the database keeps the queued state.
+    # Restore only missing jobs before declaring the API ready.
+    try:
+        from app.workers.queue import recover_missing_queued_video_tasks
+
+        recovery = recover_missing_queued_video_tasks()
+        print(f"[queue] startup recovery: {recovery}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[queue] startup recovery failed: {exc!r}")
+
+    # 4) 路径迁移
     from app.repositories.path_migrations import migrate_paths_to_relative
+
     migrate_paths_to_relative()
 
-    # 后端启动恢复：清理 DB 残留 recording / running 任务 + 树莓派残留推流。
-    # 必须 try/except 包裹；恢复失败不能让后端无法启动。
+    # 5) 摄像头启动恢复（容错，失败不能阻断启动）
     try:
         from app.services.camera_yzt.camera_yzt_service import (
             camera_service_yzt,
@@ -135,11 +180,65 @@ def create_app() -> FastAPI:
         recovery_result = (
             camera_service_yzt.recover_interrupted_recordings_on_startup()
         )
-        print(
-            f"[camera_yzt] startup recovery done: {recovery_result}"
-        )
-    except Exception as exc:
+        print(f"[camera_yzt] startup recovery done: {recovery_result}")
+    except Exception as exc:  # noqa: BLE001
         print(f"[camera_yzt] startup recovery failed: {exc!r}")
+
+    # 6) 启动 future 录制计划调度器（仅在所有前置成功后）
+    try:
+        from app.services.camera_yzt.camera_record_schedule_service import (
+            camera_record_schedule_service,
+        )
+
+        camera_record_schedule_service.start()
+        print("[camera_schedule] scheduler started")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[camera_schedule] scheduler start failed: {exc!r}")
+
+    try:
+        from app.services.backup import rsync_backup_service
+        rsync_backup_service.start_scheduler()
+        print("[rsync_backup] scheduler initialized")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[rsync_backup] scheduler start failed: {exc!r}")
+
+    print("=========================================")
+    print("[startup] ready")
+    print("=========================================")
+
+    try:
+        yield
+    finally:
+        # ---- shutdown ----
+        try:
+            from app.services.camera_yzt.camera_record_schedule_service import (
+                camera_record_schedule_service,
+            )
+
+            camera_record_schedule_service.stop()
+            print("[camera_schedule] scheduler stopped")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[camera_schedule] scheduler stop failed: {exc!r}")
+        try:
+            from app.services.backup import rsync_backup_service
+            rsync_backup_service.stop_scheduler()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[rsync_backup] scheduler stop failed: {exc!r}")
+
+
+def create_app() -> FastAPI:
+    """组装 FastAPI 应用结构。
+
+    重要：本函数只做结构组装（middleware、router、lifespan、mount），
+    不得直接执行运行期副作用（DB 连接、迁移、startup_recovery、scheduler.start）。
+    所有运行期副作用在 lifespan async context 中执行。
+    """
+    from app.paths import DATA_DIR
+
+    app = FastAPI(
+        title="Fish Quality Dashboard API",
+        lifespan=lifespan,
+    )
 
     app.mount("/static", StaticFiles(directory=str(DATA_DIR)), name="static")
 
@@ -204,11 +303,9 @@ def create_app() -> FastAPI:
         prefix="/api",
         tags=["ops-algorithm-tasks"],
     )
-    print("=========================================")
-    print("[startup] ready")
-    print("=========================================")
 
     return app
 
 
+# 模块级 app：import 阶段仅做结构组装，不执行运行期副作用。
 app = create_app()

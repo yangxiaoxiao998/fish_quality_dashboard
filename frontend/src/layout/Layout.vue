@@ -73,7 +73,7 @@ const loading = reactive({
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 0.4fr 1fr 0.4fr;
+  grid-template-columns: minmax(220px, 0.4fr) minmax(0, 1fr) minmax(220px, 0.4fr);
   gap: 16px;
   padding: 0 12px 12px;
   box-sizing: border-box;
@@ -92,4 +92,5 @@ const loading = reactive({
 .main-middle {
   position: relative;
 }
+
 </style>

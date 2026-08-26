@@ -5,10 +5,13 @@
     <Layout>
       <!-- 左侧区域：4个ECharts图表 (20%) -->
       <template #left>
-        <LayoutPanel title="数据统计" class="left-panel-wrapper">
+        <LayoutPanel
+          :title="isResultMode ? '视频检测统计' : '数据统计'"
+          class="left-panel-wrapper"
+        >
           <div class="left-panel">
-            <!-- 时间范围选择器：真实可点击的按钮组 -->
-            <div class="time-range-bar">
+            <!-- 非 result 模式才显示时间范围选择器 -->
+            <div v-if="!isResultMode" class="time-range-bar">
               <div class="range-buttons">
                 <button
                   v-for="opt in RANGE_OPTIONS"
@@ -28,10 +31,21 @@
               />
               <div class="range-hint">{{ rangeHint }}</div>
             </div>
+            <!-- result 模式：顶部提示当前视频，避免与"数据统计"语义冲突 -->
+            <div v-else class="time-range-bar result-mode-bar">
+              <div class="result-mode-meta">
+                <div class="result-mode-title">
+                  当前视频：<code>{{ resultVideoId || '--' }}</code>
+                </div>
+                <div class="result-mode-desc">
+                  统计图来源为当前视频的鱼体数据，结果模式下不再请求当日聚合。
+                </div>
+              </div>
+            </div>
 
             <div class="charts-grid">
               <div class="chart-card">
-                <div class="card-title">体长分布 (cm)</div>
+                 <div class="card-title">全长分布 (cm)</div>
                 <div ref="lengthChartRef" class="chart-container"></div>
               </div>
               <div class="chart-card">
@@ -196,17 +210,19 @@
               <template v-if="isCameraLive || cameraState === 'starting' || cameraState === 'running'">
                 <div class="camera-stream-container">
                   <img
-                    :src="cameraFrameUrl"
+                    v-if="sharedCameraFrameUrl"
+                    :src="sharedCameraFrameUrl"
                     alt="Camera Stream"
                     class="camera-stream-img"
+                    :class="{ 'camera-frame-reconnecting': sharedCameraFrameState === 'reconnecting' }"
                     @click="handleCameraFrameClick"
-                    @error="onCameraFrameError"
+                    @error="onSharedFrameImgError"
                   />
                   <div class="camera-statusbar">
-                    <div class="status">
+                    <!-- <div class="status">
                       <span class="k">视频流：</span>
                       <span class="v">{{ streamUrl }}</span>
-                    </div>
+                    </div> -->
                     <div class="status">
                       <span class="k">状态：</span>
                       <span class="v">{{ cameraStateText(cameraState) }}</span>
@@ -326,10 +342,10 @@
                   </div>
                   <img
                     v-show="aperturePreviewActive && !aperturePreviewError"
-                    :src="apertureFrameUrl"
+                    :src="sharedCameraFrameUrl"
                     class="aperture-frame-img"
                     alt="光圈预览"
-                    @error="onApertureFrameError"
+                    @error="onSharedFrameImgError"
                   />
                   <div class="aperture-preview-tip">
                     预览为实时 JPEG 抓帧，不会保存为视频，也不会进入视频历史记录
@@ -582,6 +598,37 @@
                 </div>
               </div>
             </a-modal>
+
+            <RecordScheduleDialog
+              v-model:visible="recordScheduleDialogVisible"
+              mode="duration"
+              @confirm="handleRecordScheduleConfirm"
+            />
+            <RecordScheduleDialog
+              v-model:visible="recordPlanningDialogVisible"
+              mode="schedule"
+              :force-all-complete="forceAllComplete"
+            />
+            <a-modal
+              v-model:visible="recordModeDialogVisible"
+              title="请选择录制方式"
+              :footer="false"
+              :mask-closable="false"
+              width="420px"
+            >
+              <div class="record-mode-dialog">
+                <div class="record-mode-dialog-tip">请选择录制方式</div>
+                <a-space direction="vertical" fill>
+                  <a-button type="primary" long @click="chooseImmediateRecording">
+                    立即开始
+                  </a-button>
+                  <a-button long @click="chooseScheduledRecording">
+                    计划开始
+                  </a-button>
+                </a-space>
+              </div>
+            </a-modal>
+            <IntegritySettingDialog v-model:visible="integrityDialogVisible" @confirm="handleIntegrityConfirm" />
             <a-modal
               v-model:visible="calibrationVisible"
               title="摄像头视角标定"
@@ -771,41 +818,25 @@
             </div>
             <div class="query-row">
               <label class="query-label">视频信息</label>
-              <a-select
+              <a-input
                 v-model="fishQueryVideoId"
-                placeholder="请选择视频"
-                allow-search
+                placeholder="请输入视频 ID，回车搜索"
                 allow-clear
                 style="flex:1"
-                @change="onFishQueryVideoChange"
-              >
-                <a-option
-                  v-for="v in fishQueryVideos"
-                  :key="v.video_id"
-                  :value="v.video_id"
-                >
-                  {{ v.label || v.video_id }}
-                </a-option>
-              </a-select>
+                @press-enter="onFishQueryVideoChange(fishQueryVideoId)"
+                @clear="onFishQueryVideoChange('')"
+              />
             </div>
             <div class="query-row">
               <label class="query-label">鱼 ID</label>
-              <a-select
+              <a-input
                 v-model="fishQueryFishId"
-                placeholder="请选择鱼 ID"
-                allow-search
+                placeholder="请输入鱼 ID，回车搜索"
                 allow-clear
                 style="flex:1"
-                @change="onFishQueryFishChange"
-              >
-                <a-option
-                  v-for="f in fishQueryFishOptions"
-                  :key="f.key"
-                  :value="f.key"
-                >
-                  {{ f.label }}
-                </a-option>
-              </a-select>
+                @press-enter="onFishQueryFishChange(fishQueryFishId)"
+                @clear="onFishQueryFishChange('')"
+              />
             </div>
           </section>
 
@@ -895,7 +926,7 @@
       </template>
     </Layout>
   </div>
-  </div>
+    </div>
   </div>
 </template>
 
@@ -904,6 +935,10 @@ import { ref, onMounted, onUnmounted, onErrorCaptured, computed, reactive, nextT
 import Layout from '@/layout/Layout.vue'
 import { LayoutPanel } from '@/layout'
 import VideoWall from '@/components/stream/VideoWall.vue'
+import {
+  useCameraJpegFramePolling,
+  type CameraFrameState,
+} from '@/composables/useCameraJpegFramePolling'
 // 注：Dashboard 不再打开"摄像头设置"弹窗。
 // 摄像头设置功能已迁移到 系统设置 → 摄像头设置（admin/system/CameraSettingsPage.vue）。
 // CameraSettings.vue 保留作为旧调用方兼容，本阶段此处不再 import。
@@ -930,6 +965,10 @@ import { cameraStateText } from '@/utils/status'
 import { formatChinaDateTime } from '@/utils/time'
 import { normalizeReportUrl } from '@/utils/reportPath'
 import { logUserAction } from '@/utils/operationLogger'
+import RecordScheduleDialog, {
+  type RecordTask,
+} from '@/components/camera/RecordScheduleDialog.vue'
+import IntegritySettingDialog from '@/components/camera/IntegritySettingDialog.vue'
 import {
   getAlgorithmCalibrationStatus,
   runAlgorithmCalibration,
@@ -969,7 +1008,15 @@ const resultSelectedTrackId = ref<string>('')
 // resultGroundedUrl / resultVideoErrored 在更下方 normalizeStaticUrl 附近声明。
 // 注意：showCameraSettings 已删除。摄像头设置入口已迁移到 系统设置 → 摄像头设置。
 const cameraStreamActive = ref(false)
-const cameraFrameUrl = ref('')
+// 统一实时帧轮询 composable（Dashboard 与 DataInput 共享同一接口，
+// 主画面与光圈预览都引用这一个 frameUrl）。
+const {
+  frameUrl: sharedCameraFrameUrl,
+  frameState: sharedCameraFrameState,
+  start: startSharedFramePolling,
+  stop: stopSharedFramePolling,
+  onVisibleImgError: onSharedFrameImgError,
+} = useCameraJpegFramePolling()
 const cameraConnected = ref(false)
 const cameraState = ref<string>('idle')
 let cameraFrameTimer: number | null = null
@@ -1006,11 +1053,6 @@ const aperturePreviewStartedByDialog = ref(false)
 //   - 'unknown'           拉 status 失败 / 初始探测中
 const aperturePreviewMode = ref<'preview' | 'recording-reuse' | 'unknown'>('unknown')
 const aperturePreviewError = ref('')
-const apertureFrameTs = ref<number>(Date.now())
-const apertureFrameUrl = computed(
-  () => `${apiDomainForFrame()}/api/camera_yzt/frame?t=${apertureFrameTs.value}`,
-)
-let apertureFrameTimer: number | null = null
 
 // 光圈 LED 控制状态（参考 CameraSettingsPanel.vue 中光圈设置 tab）
 const apertureLedStatus = ref<'unknown' | 'online' | 'offline'>('unknown')
@@ -1043,6 +1085,13 @@ const timedRecordingDialogVisible = ref(false)
 const selectedDurationMinutes = ref<number>(60)
 const customDurationHours = ref<number>(1)
 const customDurationMinutes = ref<number>(0)
+
+// ---- 统一录制任务计划弹窗（多任务） ----
+const recordScheduleDialogVisible = ref(false)
+const recordModeDialogVisible = ref(false)
+const recordPlanningDialogVisible = ref(false)
+const integrityDialogVisible = ref(false)
+const forceAllComplete = ref(false)
 
 // 服务端 /status 是权威值；本地每秒递减仅做 UI 平滑。
 const recordDurationSeconds = ref<number | null>(null)
@@ -1125,6 +1174,9 @@ const cameraConfig = reactive({
   stream_url: '',
   width: 1920,
   height: 1080,
+  // fps: 25,
+  // width: 960,
+  // height: 540,
   fps: 25,
 })
 
@@ -1157,12 +1209,20 @@ const resultFishList = computed<any[]>(() => {
   if (!data) return []
   return Array.isArray(data.fish) ? data.fish : []
 })
+const resultMetricFishList = computed<any[]>(() =>
+  resultFishList.value.filter((fish: any) => {
+    const status = String(fish?.status || '').toLowerCase()
+    if (status !== 'complete' && status !== 'done') return false
+    return ['body_length_cm', 'body_height_cm', 'pred_weight_g', 'condition_factor', 'surface_damage_ratio']
+      .every((key) => Number.isFinite(Number(fish?.[key])))
+  }),
+)
 const resultTrackIdList = computed<any[]>(() =>
   resultFishList.value.map((f: any) => f?.track_id).filter((x: any) => x !== null && x !== undefined)
 )
 const resultTotalFish = computed(() => resultFishList.value.length)
 const resultCompleteFish = computed(
-  () => resultFishList.value.filter((f: any) => (f?.status || '').toLowerCase() === 'done').length
+  () => resultFishList.value.filter((f: any) => ['done', 'complete'].includes((f?.status || '').toLowerCase())).length
 )
 const resultIncompleteFish = computed(
   () => resultFishList.value.filter((f: any) => (f?.status || '').toLowerCase() === 'incomplete').length
@@ -1319,9 +1379,9 @@ function getResultFishStatusColor(status: string | undefined | null): string {
 
 function resultFishStatusText(status: string | undefined | null): string {
   const s = String(status || '').toLowerCase()
-  if (s === 'done') return '完整鱼 / done'
-  if (s === 'incomplete') return '不完整鱼 / incomplete'
-  if (s === 'failed') return '计算失败 / failed'
+  if (s === 'done' || s === 'complete') return '完整'
+  if (s === 'incomplete') return '不完整'
+  if (s === 'failed') return '失败'
   return status || '未知'
 }
 
@@ -1448,7 +1508,15 @@ function getShortFishId(fish: any): string {
 }
 
 const fishQueryFishOptions = computed(() => {
-  const list = Array.isArray(fishQueryFishes.value) ? fishQueryFishes.value : []
+  // 大屏指标/图片列表只展示实际完成五维测量的鱼，避免 incomplete 记录混入结果列表。
+  const list = Array.isArray(fishQueryFishes.value)
+    ? fishQueryFishes.value.filter((fish: any) => {
+        const status = String(fish?.status || '').toLowerCase()
+        return (status === 'complete' || status === 'done') &&
+          ['body_length_cm', 'body_height_cm', 'pred_weight_g', 'condition_factor']
+            .every((key) => Number.isFinite(Number(fish?.[key])))
+      })
+    : []
   return list.map((f) => {
     const value = getDashboardFishOptionValue(f)
     const shortId = getShortFishId(f)
@@ -1472,7 +1540,10 @@ const selectedDashboardFish = computed(() => {
   const list = Array.isArray(fishQueryFishes.value) ? fishQueryFishes.value : []
   const id = String(fishQueryFishId.value || '')
   if (!id) return null
-  return list.find((f) => getDashboardFishOptionValue(f) === id) || null
+  return list.find((f) => {
+    const candidates = [f?.track_id, f?.fish_id, f?.fish_uid, f?.id, f?.fishId]
+    return candidates.some((candidate) => String(candidate ?? '').trim() === id)
+  }) || null
 })
 
 const selectedDashboardFishImageUrl = computed(() => {
@@ -1505,7 +1576,7 @@ function _toNumOrNull(v: any): number | null {
   return n
 }
 
-const selectedDashboardFishLength = computed(() => _toNumOrNull(selectedDashboardFish.value?.body_length_cm))
+const selectedDashboardFishLength = computed(() => _toNumOrNull(selectedDashboardFish.value?.body_length_cm ?? selectedDashboardFish.value?.body_length_no_tail_cm))
 const selectedDashboardFishNoTail = computed(() => _toNumOrNull(selectedDashboardFish.value?.body_length_no_tail_cm))
 const selectedDashboardFishHeight = computed(() => _toNumOrNull(selectedDashboardFish.value?.body_height_cm))
 const selectedDashboardFishWeight = computed(() => _toNumOrNull(selectedDashboardFish.value?.pred_weight_g))
@@ -1642,7 +1713,6 @@ async function loadDashboardFishQueryVideos() {
 
 async function loadDashboardFishQueryFishes(videoId: string) {
   fishQueryFishes.value = []
-  fishQueryFishId.value = ''
   dashboardFishImageStyle.value = {}
   if (!videoId) return
   try {
@@ -1653,8 +1723,11 @@ async function loadDashboardFishQueryFishes(videoId: string) {
     const fish = payload.fish || payload.fishes || []
     fishQueryFishes.value = Array.isArray(fish) ? fish : []
     console.log('[Dashboard FishQuery] fishes:', fishQueryFishes.value.length, fishQueryFishes.value.slice(0, 3))
-    if (fishQueryFishes.value.length > 0) {
-      fishQueryFishId.value = getDashboardFishOptionValue(fishQueryFishes.value[0])
+    if (!fishQueryFishes.value.some((fish) => {
+      const candidates = [fish?.track_id, fish?.fish_id, fish?.fish_uid, fish?.id, fish?.fishId]
+      return candidates.some((candidate) => String(candidate ?? '').trim() === fishQueryFishId.value)
+    })) {
+      fishQueryFishId.value = ''
     }
   } catch (err) {
     console.warn('[fish-query] load fish failed:', err)
@@ -1677,8 +1750,8 @@ async function onFishQueryVideoChange(videoId: string) {
   await loadDashboardFishQueryFishes(fishQueryVideoId.value)
 }
 
-function onFishQueryFishChange(_val: string) {
-  // selectedDashboardFish computed will update automatically
+function onFishQueryFishChange(value: string) {
+  fishQueryFishId.value = String(value || '').trim()
 }
 
 watch(
@@ -1690,13 +1763,6 @@ watch(
     }
   },
   { immediate: true },
-)
-
-watch(
-  () => fishQueryVideoId.value,
-  async (vid) => {
-    if (vid) await loadDashboardFishQueryFishes(String(vid))
-  },
 )
 
 // 算法新字段：选中鱼的字段统一走 fishFields helper（兼容旧字段）
@@ -2268,7 +2334,12 @@ function clearAllTimers() {
   if (taskPollTimer) { clearTimeout(taskPollTimer); taskPollTimer = null }
   if (cameraPollTimer) { clearTimeout(cameraPollTimer); cameraPollTimer = null }
   if (remainingTickTimer) { clearInterval(remainingTickTimer); remainingTickTimer = null }
-  if (apertureFrameTimer) { clearInterval(apertureFrameTimer); apertureFrameTimer = null }
+  // 历史 apertureFrameTimer 变量已废弃（composable 接管）；保留 typeof 防御避免 TS 报错
+  const legacyApertureTimer = (window as any).__legacyApertureFrameTimer
+  if (legacyApertureTimer) {
+    clearInterval(legacyApertureTimer)
+    ;(window as any).__legacyApertureFrameTimer = null
+  }
 }
 
 // 检测耗时 = finished_at - started_at（带状态刷新）。
@@ -2374,6 +2445,11 @@ function applyVideoTaskToUi(task: any) {
   } else {
     videoDurationSeconds.value = null
     videoDurationLabel.value = '--'
+  }
+
+  // 统一使用后端记录的最终处理耗时，避免页面自行推算产生差异。
+  if (typeof task.processing_duration_seconds === 'number') {
+    duration.value = formatSeconds(task.processing_duration_seconds)
   }
 }
 
@@ -2577,6 +2653,7 @@ async function startCameraCapture(durationMinutes?: number) {
   if (typeof durationMinutes === 'number' && Number.isFinite(durationMinutes) && durationMinutes > 0) {
     payload.duration_minutes = durationMinutes
   }
+  payload.force_all_complete = forceAllComplete.value
 
   try {
     const resp = await http.post('/api/camera_yzt/start', payload)
@@ -2722,45 +2799,74 @@ function handleCameraInput() {
   }
 
   if (canStart.value) {
-    // 主"摄像头输入"：必须先选择定时录制时长，再调用 start。
+    // 主"摄像头输入"：先弹出统一的"录制任务计划"弹窗（支持多任务 + 持续时间/指定时间两种模式）。
     // 关键：如果当前处于 result mode（?mode=result&video_id=xxx），
     // 必须先退出 result 展示状态，否则：
     //   1. 中央仍会显示旧视频的 grounded_sam 视频
     //   2. 右侧仍会显示旧视频的鱼指标
     //   3. route watcher 会反复把旧 result 拉回来
-    // 默认值：1 小时，方便快速测试。
     if (isResultMode.value) {
       switchToCameraLiveMode()
     }
-    pickPresetDuration(selectedDurationMinutes.value || 60)
-    timedRecordingDialogVisible.value = true
+    integrityDialogVisible.value = true
     return
   }
 
   console.warn(`[Camera] 当前状态 ${cameraState.value} 不可操作`)
 }
 
-function startCameraFramePolling() {
-  stopCameraFramePolling()
-  const base = import.meta.env.VITE_API_DOMAIN
-  cameraFrameUrl.value = `${base}/api/camera_yzt/frame?t=${Date.now()}`
-  cameraFrameTimer = window.setInterval(() => {
-    cameraFrameUrl.value = `${base}/api/camera_yzt/frame?t=${Date.now()}`
-  }, 200)
+function handleIntegrityConfirm(value: { forceAllComplete: boolean }): void {
+  forceAllComplete.value = value.forceAllComplete
+  recordModeDialogVisible.value = true
 }
 
-function stopCameraFramePolling() {
-  if (cameraFrameTimer) {
-    clearInterval(cameraFrameTimer)
-    cameraFrameTimer = null
+function chooseImmediateRecording() {
+  recordModeDialogVisible.value = false
+  recordScheduleDialogVisible.value = true
+}
+
+function chooseScheduledRecording() {
+  recordModeDialogVisible.value = false
+  recordPlanningDialogVisible.value = true
+}
+
+async function handleRecordScheduleConfirm(tasks: RecordTask[]) {
+  if (!tasks || tasks.length === 0) return
+  const first = tasks[0]
+  if (!first) return
+  // 透传 duration_minutes 给后端；多任务的扩展由后端按需支持，前端先保持兼容。
+  selectedDurationMinutes.value = first.durationMinutes
+  await startCameraCapture(first.durationMinutes)
+}
+
+function startCameraFramePolling() {
+  // 不直接无条件 start：必须 cameraStreamActive=true 或 cameraState 处于运行态
+  // 才允许启动 JPEG 轮询。否则只是被 status 轮询触发的伪"start"。
+  if (
+    cameraStreamActive.value
+    || cameraState.value === 'starting'
+    || cameraState.value === 'running'
+    || cameraState.value === 'stopping'
+  ) {
+    startSharedFramePolling()
   }
 }
 
+function stopCameraFramePolling() {
+  // 是否清空旧帧取决于调用上下文：
+  // - cameraStreamActive 仍为 true → 仅停轮询但保留最后帧（光圈临时 preview 关闭时）
+  // - cameraStreamActive=false → 清空
+  const needClear = !(
+    cameraStreamActive.value
+    || cameraState.value === 'starting'
+    || cameraState.value === 'running'
+    || cameraState.value === 'stopping'
+  )
+  stopSharedFramePolling({ clearFrame: needClear })
+}
+
 function onCameraFrameError() {
-  // 单帧加载失败（可能是 204 / 流还没到 / 一帧丢失）不触发 stop。
-  // 由 pollCameraStatus 决定是否真正结束。
-  // eslint-disable-next-line no-console
-  console.warn('[camera_frame] 单帧加载失败，继续等待下一帧 / status 轮询')
+  onSharedFrameImgError()
 }
 
 function handleCameraSettingsApplied(cfg: any) {
@@ -2826,6 +2932,9 @@ async function startAperturePreview() {
       stream_url: cameraConfig.stream_url || undefined,
       width: cameraConfig.width || 1920,
       height: cameraConfig.height || 1080,
+      // fps: cameraConfig.fps || 25,
+      // width: cameraConfig.width || 960,
+      // height: cameraConfig.height || 540,
       fps: cameraConfig.fps || 25,
     })
     const data = resp.data || {}
@@ -2850,19 +2959,11 @@ async function startAperturePreview() {
 }
 
 function startApertureFramePolling() {
-  stopApertureFramePolling()
-  // 立即刷一次
-  apertureFrameTs.value = Date.now()
-  apertureFrameTimer = window.setInterval(() => {
-    apertureFrameTs.value = Date.now()
-  }, 500)
+  startSharedFramePolling()
 }
 
 function stopApertureFramePolling() {
-  if (apertureFrameTimer) {
-    clearInterval(apertureFrameTimer)
-    apertureFrameTimer = null
-  }
+  // 是否清空旧帧取决于调用方（光圈临时 preview 停止且主录制未运行时清空）
 }
 
 // 幂等标记：避免同一轮 close 事件中重复调 stop（@cancel / @before-close / 关闭按钮
@@ -3026,9 +3127,7 @@ async function runCalibrationWithImage(sourceImage: string) {
 }
 
 // ---------- 统计图 ----------
-// 1920x1080 固定缩放：浏览器 80% / 90% / 100% / 110% 缩放时内部不乱
-const { fixedScreenStyle, updateFixedScreen } = useFixedScreen(1920, 1080)
-
+const { fixedScreenStyle } = useFixedScreen(1920, 1080)
 const lengthChartRef = ref<HTMLElement>()
 const weightChartRef = ref<HTMLElement>()
 const conditionChartRef = ref<HTMLElement>()
@@ -3070,21 +3169,18 @@ function pickNumber(row: any, keys: string[]): number | null {
   return null
 }
 
-function buildDistributionFromValues(
+function buildFixedDistributionFromValues(
   values: number[],
   bins: Array<{ label: string; min: number; max: number }>,
 ): Array<{ label: string; count: number }> {
   const out = bins.map((b) => ({ label: b.label, count: 0 }))
   for (const v of values) {
-    for (let i = 0; i < bins.length; i++) {
-      const b = bins[i]
-      if (!b) continue
-      if (v >= b.min && v < b.max) {
-        const slot = out[i]
-        if (slot) slot.count += 1
-        break
-      }
-    }
+    const index = bins.findIndex((b, i) =>
+      i === bins.length - 1
+        ? v >= b.min && v <= b.max
+        : v >= b.min && v < b.max,
+    )
+    if (index >= 0 && out[index]) out[index].count += 1
   }
   return out
 }
@@ -3117,44 +3213,34 @@ const CONDITION_BINS: Array<{ label: string; min: number; max: number }> = [
   { label: '>=2.0', min: 2.0, max: Infinity },
 ]
 
-const DAMAGE_BINS: Array<{ label: string; min: number; max: number }> = [
-  { label: '0%', min: -Infinity, max: 0.0001 },
-  { label: '0-5%', min: 0.0001, max: 0.05 },
-  { label: '5-10%', min: 0.05, max: 0.10 },
-  { label: '10-20%', min: 0.10, max: 0.20 },
-  { label: '20-30%', min: 0.20, max: 0.30 },
-  { label: '>=30%', min: 0.30, max: Infinity },
+const RATIO_BINS: Array<{ label: string; min: number; max: number }> = [
+  { label: '<0.05', min: -Infinity, max: 0.05 },
+  { label: '0.05-0.10', min: 0.05, max: 0.1 },
+  { label: '0.10-0.15', min: 0.1, max: 0.15 },
+  { label: '0.15-0.20', min: 0.15, max: 0.2 },
+  { label: '0.20-0.30', min: 0.2, max: 0.3 },
+  { label: '>=0.30', min: 0.3, max: Infinity },
 ]
 
 function deriveStatsFromFish(fishList: any[]) {
   const lengths: number[] = []
   const weights: number[] = []
   const conditions: number[] = []
-  const damages: number[] = []
+  const ratios: number[] = []
   for (const f of fishList || []) {
-    const len = pickNumber(f, [
-      'body_length_cm',
-      'body_length',
-      'length',
-      'fish_length',
-    ])
+    const len = pickNumber(f, ['body_length_cm'])
     if (len !== null) lengths.push(len)
-    const w = pickNumber(f, ['body_weight_g', 'body_weight', 'weight'])
+    const w = pickNumber(f, ['pred_weight_g'])
     if (w !== null) weights.push(w)
+    if (len !== null && w !== null && w > 0) ratios.push(len / w)
     const cf = pickNumber(f, ['condition_factor', 'cf'])
     if (cf !== null) conditions.push(cf)
-    const dmg = pickNumber(f, [
-      'surface_damage_ratio',
-      'damage_ratio',
-      'wound_ratio',
-    ])
-    if (dmg !== null) damages.push(dmg)
   }
   return {
-    length: buildDistributionFromValues(lengths, LENGTH_BINS),
-    weight: buildDistributionFromValues(weights, WEIGHT_BINS),
-    condition: buildDistributionFromValues(conditions, CONDITION_BINS),
-    ratio: buildDistributionFromValues(damages, DAMAGE_BINS),
+    length: buildFixedDistributionFromValues(lengths, LENGTH_BINS),
+    weight: buildFixedDistributionFromValues(weights, WEIGHT_BINS),
+    condition: buildFixedDistributionFromValues(conditions, CONDITION_BINS),
+    ratio: buildFixedDistributionFromValues(ratios, RATIO_BINS),
   }
 }
 
@@ -3166,7 +3252,7 @@ function applyResultModeStats(fishList: any[]) {
       chartData.condition = []
       chartData.ratio = []
     } else {
-      const derived = deriveStatsFromFish(fishList)
+      const derived = deriveStatsFromFish(resultMetricFishList.value)
       chartData.length = derived.length
       chartData.weight = derived.weight
       chartData.condition = derived.condition
@@ -3567,7 +3653,7 @@ onUnmounted(() => {
 </script>
 
 <style lang="scss" scoped>
-/* 1920x1080 固定比例缩放的外层 viewport：撑满浏览器窗口，不滚动 */
+/* 使用视口原生尺寸，所有内部列和图表按可用空间流式布局。 */
 .dashboard-viewport {
   width: 100vw;
   height: 100vh;
@@ -3575,15 +3661,11 @@ onUnmounted(() => {
   position: relative;
   background: #000;
 }
-
-/* 内层 fixed 容器：固定 1920x1080 设计尺寸，通过 transform: scale 等比缩放 */
 .dashboard-fixed {
   position: absolute;
   width: 1920px;
   height: 1080px;
   overflow: hidden;
-  left: 0;
-  top: 0;
   transform-origin: top left;
 }
 .dashboard-background {
@@ -3710,6 +3792,27 @@ onUnmounted(() => {
     justify-content: center;
     pointer-events: none;
     color: rgb(255, 255, 255, 70%);
+    font-size: 12px;
+  }
+  .result-mode-bar {
+    padding: 10px 14px;
+    background: rgb(26, 26, 46, 70%);
+    border: 1px solid rgb(0, 168, 232, 30%);
+    border-radius: 10px;
+    margin-bottom: 10px;
+  }
+  .result-mode-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    color: rgb(255, 255, 255, 85%);
+  }
+  .result-mode-title code {
+    color: #00a8e8;
+    font-family: SarasaMonoSC, monospace;
+  }
+  .result-mode-desc {
+    color: rgb(255, 255, 255, 60%);
     font-size: 12px;
   }
   .chart-card {

@@ -127,6 +127,7 @@ async def stop_video(
 async def requeue_video(
     video_id: str,
     force: bool = False,
+    force_all_complete: bool = False,
     db: Session = Depends(get_db),
 ) -> dict:
     """
@@ -134,27 +135,11 @@ async def requeue_video(
 
     注意：当前阶段已切到整视频算法 CLI；旧 requeue 行为暂时保留，但内部走新队列函数。
     """
-    import os as _os
     from app.services.path_service import to_abs_data_path
 
     task = session_repo.get_video_task(db, video_id=video_id)
     if task is None:
         return {"status": "not_found", "video_id": video_id}
-
-    if not task.source_path:
-        err = f"video_task has no source_path: {video_id}"
-        session_repo.update_video_task_status(
-            db, video_id=video_id, status="failed", last_error=err
-        )
-        return {"status": "failed", "video_id": video_id, "error": err}
-
-    abs_video_path = to_abs_data_path(task.source_path)
-    if not abs_video_path or not _os.path.exists(abs_video_path):
-        err = f"video file missing on disk: {task.source_path}"
-        session_repo.update_video_task_status(
-            db, video_id=video_id, status="failed", last_error=err
-        )
-        return {"status": "failed", "video_id": video_id, "error": err}
 
     if task.status in ("queued", "processing") and not force:
         return {
@@ -164,9 +149,41 @@ async def requeue_video(
             "message": "task already queued/processing; use force=true to requeue anyway",
         }
 
+    from app.services.video_playback_service import (
+        ensure_browser_playable_video,
+        resolve_canonical_video_path,
+    )
+
+    canonical_source = resolve_canonical_video_path(video_id)
+    if canonical_source is None:
+        playback_result = ensure_browser_playable_video(video_id)
+        if playback_result.get("ok"):
+            canonical_source = resolve_canonical_video_path(video_id)
+
+    abs_video_path = canonical_source
+    if abs_video_path is None and task.source_path:
+        abs_video_path = to_abs_data_path(task.source_path)
+
+    if not abs_video_path or not abs_video_path.is_file():
+        source_label = task.source_path or f"data/uploads/videos/{video_id}.mp4"
+        err = f"video file missing on disk: {source_label}"
+        session_repo.update_video_task_status(
+            db, video_id=video_id, status="failed", last_error=err
+        )
+        return {"status": "failed", "video_id": video_id, "error": err}
+
+    if canonical_source is not None:
+        from app.services.path_service import to_data_relative
+
+        canonical_rel = to_data_relative(canonical_source)
+        if canonical_rel and task.source_path != canonical_rel:
+            task.source_path = canonical_rel
+            db.commit()
+
     job_id = enqueue_algorithm_video_pipeline_from_video_task(
         video_id=video_id,
         input_video=str(abs_video_path),
+        force_all_complete=force_all_complete,
     )
 
     task.status = "queued"

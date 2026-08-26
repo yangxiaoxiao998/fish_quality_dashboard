@@ -237,6 +237,7 @@ wget-log.*
 *.swo
 *~
 nohup.out
+.runtime/
 
 # ============================================================
 # 数据库本地文件和备份
@@ -271,6 +272,10 @@ nohup.out
 *.tar
 *.tar.gz
 *.tgz
+algorothmsbackup.tar.xz
+
+# Desktop dependencies
+desktop/node_modules/
 
 # ============================================================
 # 编辑器和系统文件

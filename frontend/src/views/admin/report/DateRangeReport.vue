@@ -22,7 +22,7 @@
       <!-- 文字板块 -->
       <ReportSection
         id="text-block"
-        title="文字板块"
+        title="一、文字板块"
         subtitle="以文字和指标卡片形式汇总时间范围内的检测数据。"
       >
         <div class="block-subtitle">时间范围概览</div>
@@ -38,7 +38,7 @@
       <!-- 图表板块 -->
       <ReportSection
         id="chart-block"
-        title="图表板块"
+        title="二、可视化统计分析"
         subtitle="以统计图表形式展示按日趋势与体征分布。"
       >
         <a-empty
@@ -50,10 +50,14 @@
             <template #title><span class="chart-title">每日视频任务数趋势</span></template>
             <div ref="trendRef" class="chart-canvas chart-canvas-tall"></div>
           </a-card>
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">体长分布 (cm)</span></template>
-            <div ref="lengthDistRef" class="chart-canvas"></div>
-          </a-card>
+           <a-card :bordered="false" class="chart-card">
+             <template #title><span class="chart-title">全长分布 (cm)</span></template>
+             <div ref="lengthDistRef" class="chart-canvas"></div>
+           </a-card>
+           <a-card :bordered="false" class="chart-card">
+               <template #title><span class="chart-title">体高分布 (cm)</span></template>
+             <div ref="noTailDistRef" class="chart-canvas"></div>
+           </a-card>
           <a-card :bordered="false" class="chart-card">
             <template #title><span class="chart-title">体高分布 (cm)</span></template>
             <div ref="heightDistRef" class="chart-canvas"></div>
@@ -76,28 +80,36 @@
       <!-- Excel 板块 -->
       <ReportSection
         id="excel-block"
-        title="Excel 板块"
+        title="三、视频数据表格"
         subtitle="以表格形式展示时间范围内所有视频任务数据。"
       >
         <a-empty v-if="!tasks.length" description="时间范围内暂无视频任务" />
         <div v-else class="table-scroll">
           <a-table
-            :data="tasks"
-            :pagination="false"
+            :data="pagedTasks"
+            :pagination="taskPagination"
             row-key="video_id"
             stripe
             :scroll="{ x: 1100 }"
           >
+            <template #columns>
             <a-table-column title="视频编号" data-index="video_id" :width="220" />
-            <a-table-column title="检测时间" :width="170">
-              <template #cell="{ record }">{{ formatChinaDateTime(record.created_at) }}</template>
-            </a-table-column>
-            <a-table-column title="状态" data-index="status" :width="110" />
-            <a-table-column title="总鱼数" data-index="total_fish" :width="90" />
-            <a-table-column title="完整" data-index="complete_fish" :width="80" />
-            <a-table-column title="不完整" data-index="incomplete_fish" :width="90" />
-            <a-table-column title="失败" data-index="failed_fish" :width="80" />
-            <a-table-column title="破损" data-index="damaged_fish" :width="80" />
+              <a-table-column title="检测时间" :width="170">
+                <template #cell="{ record }">{{ formatChinaDateTime(record.created_at) }}</template>
+              </a-table-column>
+              <a-table-column title="状态" data-index="status" :width="110" />
+              <a-table-column title="总鱼数" :width="90"><template #cell="{ record }">{{ displayValue(record.total_fish) }}</template></a-table-column>
+              <a-table-column title="完整" :width="80"><template #cell="{ record }">{{ displayValue(record.complete_fish) }}</template></a-table-column>
+              <a-table-column title="不完整" :width="90"><template #cell="{ record }">{{ displayValue(record.incomplete_fish) }}</template></a-table-column>
+              <a-table-column title="失败" :width="80"><template #cell="{ record }">{{ displayValue(record.failed_fish) }}</template></a-table-column>
+              <a-table-column title="破损" :width="80"><template #cell="{ record }">{{ displayValue(record.damaged_fish) }}</template></a-table-column>
+              <a-table-column title="视频时长" :width="120">
+                <template #cell="{ record }">{{ formatDuration(record.video_duration_seconds) }}</template>
+              </a-table-column>
+              <a-table-column title="处理耗时" :width="120">
+                <template #cell="{ record }">{{ formatDuration(record.processing_duration_seconds) }}</template>
+              </a-table-column>
+            </template>
           </a-table>
         </div>
       </ReportSection>
@@ -105,8 +117,8 @@
       <!-- 视频板块 -->
       <ReportSection
         id="video-block"
-        title="视频板块"
-        subtitle="提供时间范围内 done 视频的单视频报表与结果大屏入口。"
+        title="四、视频对比展示"
+        subtitle="提供时间范围内 已完成 视频的单视频报表与结果大屏入口。"
       >
         <a-empty
           v-if="!entryLinks.length"
@@ -150,7 +162,7 @@
     </main>
 
     <aside class="report-aside">
-      <ReportToc :items="tocItems" />
+      <ReportToc :items="tocItems" separator="、" />
     </aside>
   </div>
 </template>
@@ -180,9 +192,9 @@ const dateRange = ref<string[]>([weekAgo, today])
 
 const tocItems: ReportTocItem[] = [
   { id: 'text-block', index: '1', title: '文字板块' },
-  { id: 'chart-block', index: '2', title: '图表板块' },
-  { id: 'excel-block', index: '3', title: 'Excel板块' },
-  { id: 'video-block', index: '4', title: '视频板块' },
+  { id: 'chart-block', index: '2', title: '可视化统计分析' },
+  { id: 'excel-block', index: '3', title: '视频数据表格' },
+  { id: 'video-block', index: '4', title: '视频对比展示' },
 ]
 
 const rangeStart = computed(() => dateRange.value?.[0] || weekAgo)
@@ -206,6 +218,36 @@ const { loading, summary, charts, loadAll } = useReportData(
 )
 
 const tasks = ref<any[]>([])
+const taskPage = ref(1)
+const taskPageSize = ref(10)
+const pagedTasks = computed(() => {
+  const start = (taskPage.value - 1) * taskPageSize.value
+  return tasks.value.slice(start, start + taskPageSize.value)
+})
+const taskPagination = computed(() => ({
+  current: taskPage.value,
+  pageSize: taskPageSize.value,
+  total: tasks.value.length,
+  showTotal: true,
+  showPageSize: true,
+  pageSizeOptions: [10, 20, 50],
+  onChange: (page: number) => { taskPage.value = page },
+  onPageSizeChange: (size: number) => { taskPageSize.value = size; taskPage.value = 1 },
+}))
+
+function displayValue(value: unknown): string | number {
+  return value === null || value === undefined || value === '' ? '--' : (value as string | number)
+}
+
+function formatDuration(seconds: number | null | undefined): string {
+  const n = Number(seconds)
+  if (!Number.isFinite(n) || n < 0) return '--'
+  const total = Math.round(n)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return h ? `${h}小时${m}分${s}秒` : m ? `${m}分${s}秒` : `${s}秒`
+}
 
 async function loadTasks() {
   try {
@@ -215,6 +257,7 @@ async function loadTasks() {
       const ca = String(v?.created_at || '').slice(0, 10)
       return ca >= rangeStart.value && ca <= rangeEnd.value
     })
+    taskPage.value = 1
   } catch (err) {
     tasks.value = []
     Message.error(toErrorMessage(err))
@@ -225,11 +268,23 @@ async function loadTasks() {
 const overviewRows = computed(() => [
   { key: 'days', title: '覆盖天数', value: coverDays.value, unit: '天' },
   { key: 'videos', title: '视频任务总数', value: summary.value.total_video, unit: '个' },
+  { key: 'videoDuration', title: '总视频时长', value: formatDurationPrecise(summary.value.total_video_duration), unit: '' },
   { key: 'fishes', title: '检测总鱼数', value: summary.value.total_fish, unit: '条' },
   { key: 'valid', title: '完整鱼总数', value: summary.value.valid_fish, unit: '条' },
   { key: 'invalid', title: '不完整鱼总数', value: summary.value.abnormal_fish, unit: '条' },
   { key: 'damaged', title: '破损鱼总数', value: summary.value.surface_damage_count, unit: '条' },
 ])
+
+function formatDurationPrecise(seconds: number | null | undefined): string {
+  const n = Number(seconds)
+  if (!Number.isFinite(n) || n < 0) return '--'
+  if (n < 60) return `${n.toFixed(2)}秒`
+  const total = Math.round(n)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return h ? `${h}小时${m}分${s}秒` : `${m}分${s}秒`
+}
 
 const metricsRows = computed(() => [
   { key: 'len', title: '平均体长', value: summary.value.avg_body_length, unit: 'cm' },
@@ -243,11 +298,12 @@ const fishSummaryRows = computed(() => [
   { key: 'fishTotal', title: '鱼总数', value: summary.value.total_fish, unit: '条' },
   { key: 'fishValid', title: '完整鱼数', value: summary.value.valid_fish, unit: '条' },
   { key: 'fishInvalid', title: '不完整鱼数', value: summary.value.abnormal_fish, unit: '条' },
-  { key: 'fishDamaged', title: '破损鱼数', value: summary.value.surface_damage_count, unit: '条' },
+  // { key: 'fishDamaged', title: '破损鱼数', value: summary.value.surface_damage_count, unit: '条' },
 ])
 
 const trendRef = ref<HTMLElement>()
 const lengthDistRef = ref<HTMLElement>()
+const noTailDistRef = ref<HTMLElement>()
 const heightDistRef = ref<HTMLElement>()
 const weightDistRef = ref<HTMLElement>()
 const conditionDistRef = ref<HTMLElement>()
@@ -256,6 +312,7 @@ const damageDistRef = ref<HTMLElement>()
 useReportCharts(summary, charts, {
   trend: trendRef,
   lengthDist: lengthDistRef,
+  noTailDist: noTailDistRef,
   heightDist: heightDistRef,
   weightDist: weightDistRef,
   conditionDist: conditionDistRef,
@@ -291,6 +348,11 @@ const entryLinks = computed(() => {
 })
 
 function goReport(videoId: string) {
+  const task = tasks.value.find((v) => String(v.video_id) === videoId)
+  if (String(task?.status || '').toLowerCase() !== 'done') {
+    Message.warning('该任务仍在运行中，请稍后查看报表')
+    return
+  }
   router.push({
     path: `/admin/data-report/video/${encodeURIComponent(videoId)}`,
     query: { video_id: videoId },
@@ -298,6 +360,11 @@ function goReport(videoId: string) {
 }
 
 function goDashboard(videoId: string) {
+  const task = tasks.value.find((v) => String(v.video_id) === videoId)
+  if (String(task?.status || '').toLowerCase() !== 'done') {
+    Message.warning('该任务仍在运行中，请稍后查看结果大屏')
+    return
+  }
   router.push({
     path: '/',
     query: { mode: 'result', video_id: videoId },

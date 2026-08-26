@@ -79,6 +79,10 @@ def save_calibration_frame(frame_bytes: bytes) -> dict[str, Any]:
     filename = f"calibration_{stamp}_{short_uuid}.jpg"
     target_path = target_dir / filename
 
+    # Keep the captured JPEG pixels unchanged. The camera stream was requested
+    # at the configured resolution; re-encoding here can change edge pixels and
+    # make segmentation-derived calibration corners unstable.
+
     with open(target_path, "wb") as f:
         f.write(frame_bytes)
 
@@ -173,6 +177,7 @@ def run_capture_and_calibrate(
     height: Optional[int] = None,
     fps: Optional[int] = None,
     stop_after_capture: bool = True,
+    real_length_mm: Optional[float] = None,
 ) -> dict[str, Any]:
     """
     主入口：
@@ -195,11 +200,12 @@ def run_capture_and_calibrate(
     #   2. 否则以 calibration_only=True 启动树莓派推流，等待帧出现，保存图片；
     #   3. 拍摄后调用 stop_stream(queue_algorithm=False, remove_video_task=True)
     #      自动停止摄像头（不入队算法、不污染视频历史）。
+    camera_settings = camera_service_yzt.get_saved_settings()
     capture_result = capture_frame_via_camera_yzt(
         stream_url=stream_url,
-        width=width or 1920,
-        height=height or 1080,
-        fps=fps or 25,
+        width=width or camera_settings["width"],
+        height=height or camera_settings["height"],
+        fps=fps or camera_settings["fps"],
         timeout_seconds=25.0,
         stop_after_capture=stop_after_capture,
     )
@@ -235,6 +241,7 @@ def run_capture_and_calibrate(
         camera_id=camera_id,
         device=device,
         overwrite=overwrite,
+        real_length_mm=real_length_mm,
     )
 
     preview: dict[str, Any] = find_adjusted_preview()
@@ -278,8 +285,8 @@ def run_capture_and_calibrate(
 def capture_frame_via_camera_yzt(
     *,
     stream_url: Optional[str] = None,
-    width: int = 1920,
-    height: int = 1080,
+    width: int = 960,
+    height: int = 540,
     fps: int = 25,
     timeout_seconds: float = 25.0,
     stop_after_capture: bool = True,
@@ -311,12 +318,29 @@ def capture_frame_via_camera_yzt(
     )
 
     started_by_calibration = False
+    requested_width = int(width) if width else 960
+    requested_height = int(height) if height else 540
 
     # 1. 检查是否已经在运行
     already_running = camera_service_yzt.state in (
         CameraRuntimeState.STARTING,
         CameraRuntimeState.RUNNING,
     )
+
+    if already_running and (
+        camera_service_yzt.width != requested_width
+        or camera_service_yzt.height != requested_height
+    ):
+        # 当前会话可能是旧分辨率启动的，不能拿旧帧当作新设置的标定图。
+        camera_service_yzt.stop_stream(
+            queue_algorithm=False,
+            update_video_task=False,
+            remove_video_task=True,
+            reason="calibration_resolution_changed",
+            join_timeout=3,
+            raspberry_stop_timeout=3,
+        )
+        already_running = False
 
     # 2. 如果没有运行，启动推流（calibration_only 模式）
     if not already_running:
@@ -325,8 +349,8 @@ def capture_frame_via_camera_yzt(
             stream_cfg["stream_url"] = stream_url
         else:
             stream_cfg["stream_url"] = camera_service_yzt.stream_url or camera_service_yzt.DEFAULT_STREAM_URL
-        stream_cfg["width"] = int(width) if width else 1920
-        stream_cfg["height"] = int(height) if height else 1080
+        stream_cfg["width"] = requested_width
+        stream_cfg["height"] = requested_height
         stream_cfg["fps"] = int(fps) if fps else 25
 
         start_resp = camera_service_yzt.start_stream(
@@ -528,11 +552,14 @@ def capture_calibration_frame(
       - 探测到无流时，自动通知树莓派启动推流；不再要求用户手工启动
       - 错误信息以用户友好方式返回，不暴露 RTMP / IP / MediaMTX 等技术细节
     """
+    from app.services.camera_yzt.camera_yzt_service import camera_service_yzt
+
+    settings = camera_service_yzt.get_saved_settings()
     return capture_frame_via_camera_yzt(
         stream_url=stream_url,
-        width=1920,
-        height=1080,
-        fps=25,
+        width=settings["width"],
+        height=settings["height"],
+        fps=settings["fps"],
         timeout_seconds=max(8.0, timeout * 3),
         stop_after_capture=True,
     )

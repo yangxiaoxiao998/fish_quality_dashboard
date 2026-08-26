@@ -7,10 +7,11 @@
    - 默认使用 ``http://raspberrypi.local:9000``，绝不写死 IP。
    - 可通过环境变量 ``FISH_PI_BASE_URL`` 覆盖（上线阶段可改成固定 IP）。
 
-2. RTMP 推流地址
+    2. RTMP 推流地址
    - 默认必须是当前主机的局域网 IP，例如
      ``rtmp://192.168.0.111:1935/fish_camera``。
-   - 可通过环境变量 ``FISH_CAMERA_PUSH_URL`` 覆盖。
+    - 自动共享模式默认跟随当前主机出口地址；只有显式关闭
+      ``FISH_CAMERA_AUTO_PUSH_URL=0`` 时才使用 ``FISH_CAMERA_PUSH_URL``。
    - 如果两者都没设置，自动推断本机访问树莓派时的出口 IP。
    - 不允许使用 ``raspberrypi.local`` 当作 RTMP 目标。
 
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -40,13 +42,19 @@ from urllib.parse import urlparse
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_PI_BASE_URL = "http://raspberrypi.local:9000"
+DEFAULT_PI_BASE_URL = "http://10.42.0.2:9000"
 DEFAULT_RTMP_PORT = 1935
 DEFAULT_RTMP_PATH = "fish_camera"
 
 # 后端 OpenCV 在本机读取 MediaMTX 的默认地址。
 # 注意：必须使用 127.0.0.1，不要绕局域网 IP。
 DEFAULT_CAMERA_READ_URL = "rtmp://127.0.0.1:1935/fish_camera"
+
+
+def is_camera_push_url_automatic() -> bool:
+    """Return whether RTMP targets must follow the current host address."""
+    value = str(os.getenv("FISH_CAMERA_AUTO_PUSH_URL", "1")).strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +175,28 @@ def _guess_host_ip_by_default_route() -> str | None:
     return None
 
 
+def _guess_host_ip_by_interface_priority() -> str | None:
+    """Fallback order: wired switch/direct cable, then Wi-Fi/router."""
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        rows = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                rows.append((parts[1], parts[3].split("/", 1)[0]))
+        priority = ("enp3s0", "eno1", "enp2s0", "enp1s0", "wlo1", "wlp0s20f3")
+        for interface in priority:
+            for name, ip in rows:
+                if name == interface and ip and not ip.startswith("127."):
+                    return ip
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def guess_host_lan_ip(pi_base_url: str | None = None) -> str | None:
     """推断当前主机局域网 IP。
 
@@ -184,7 +214,7 @@ def guess_host_lan_ip(pi_base_url: str | None = None) -> str | None:
         return ip
 
     # 兜底走默认路由
-    return _guess_host_ip_by_default_route()
+    return _guess_host_ip_by_interface_priority() or _guess_host_ip_by_default_route()
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +230,7 @@ def get_camera_push_url() -> str:
         2. 自动推断主机局域网 IP，生成 ``rtmp://<host_ip>:1935/fish_camera``。
     """
     env_url = _strip_url(os.getenv("FISH_CAMERA_PUSH_URL"))
-    if env_url:
+    if env_url and not is_camera_push_url_automatic():
         return env_url
 
     host_ip = guess_host_lan_ip()
@@ -238,7 +268,7 @@ def get_pi_runtime_config() -> PiRuntimeConfig:
     pi_resolved_ip = resolve_host(pi_host)
     host_ip = guess_host_lan_ip(pi_base_url)
     push_env = _strip_url(os.getenv("FISH_CAMERA_PUSH_URL"))
-    if push_env:
+    if push_env and not is_camera_push_url_automatic():
         camera_push_url = push_env
     else:
         camera_push_url = (

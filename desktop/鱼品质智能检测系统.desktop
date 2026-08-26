@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=鱼品质智能检测系统
+Comment=鱼品质智能检测系统桌面启动器
+Exec=/home/dsl/Code/yangzt/fish_quality_dashboard/desktop/launch_fish_quality.sh
+Icon=/home/dsl/Code/yangzt/fish_quality_dashboard/frontend/src/assets/images/software_logo.png
+Terminal=false
+Categories=Science;
+StartupWMClass=鱼品质智能检测系统

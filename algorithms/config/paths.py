@@ -96,21 +96,26 @@ INPUT_VIDEOS_DIR: Path = DATA_ROOT / "input_videos"
 JOBS_DIR: Path = DATA_ROOT / "jobs"
 CALIBRATION_DIR: Path = DATA_ROOT / "calibration"
 MODEL_DIR: Path = ALGORITHMS_ROOT / "pth"
+ADJUST_CALIBRATION_MARGIN_CONFIG_PATH: Path = (
+    ALGORITHMS_ROOT / "config" / "adjust_calibration_margin.json"
+)
 
 LOGS_DIR: Path = DATA_ROOT / "logs"
 
-ALGORITHMS_GAOYUXI_DIR: Path = ALGORITHMS_ROOT / "algorithms" / "gaoyuxi"
-ALGORITHMS_DENGCHAO_DIR: Path = ALGORITHMS_ROOT / "algorithms" / "dengchao"
-ALGORITHMS_CUIYIFEI_DIR: Path = ALGORITHMS_ROOT / "algorithms" / "cuiyifei"
+VENDOR_DIR: Path = ALGORITHMS_ROOT / "vendor"
+ALGORITHMS_GAOYUXI_DIR: Path = VENDOR_DIR  # 兼容旧变量名，禁止指向历史 algorithms 目录
+ALGORITHMS_DENGCHAO_DIR: Path = VENDOR_DIR
+ALGORITHMS_CUIYIFEI_DIR: Path = VENDOR_DIR
 
 CALIBRATION_REPO_DIR: Path = ALGORITHMS_GAOYUXI_DIR
-GROUNDING_DINO_DIR: Path = ALGORITHMS_GAOYUXI_DIR / "GroundingDINO"
-GROUNDED_SAM_DIR: Path = ALGORITHMS_GAOYUXI_DIR / "Grounded-Segment-Anything"
+GROUNDING_DINO_DIR: Path = VENDOR_DIR / "GroundingDINO"
+GROUNDED_SAM_DIR: Path = VENDOR_DIR / "Grounded-Segment-Anything"
 SEGMENT_ANYTHING_DIR: Path = GROUNDED_SAM_DIR / "segment_anything"
-BERT_BASE_UNCASED_DIR: Path = ALGORITHMS_GAOYUXI_DIR / "bert-base-uncased"
+# BERT 权重统一从项目 pth 目录读取，避免落到旧 gaoyuxi 历史目录。
+BERT_BASE_UNCASED_DIR: Path = MODEL_DIR / "bert-base-uncased"
 
 GROUNDED_DINO_CONFIG_PATH: Path = (
-    ALGORITHMS_GAOYUXI_DIR / "grounding_dino_swin-t_finetune_8xb4_50e_fish.py"
+    GROUNDING_DINO_DIR / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py"
 )
 GROUNDING_DINO_CONFIG_PATH: Path = GROUNDED_DINO_CONFIG_PATH  # 向后兼容命名
 GROUNDING_DINO_CHECKPOINT: Path = MODEL_DIR / "groundingdino_swint_ogc.pth"
@@ -184,6 +189,12 @@ def video_measurements_dir(video_id: str) -> Path:
 
 def video_fish_condition_images_dir(video_id: str) -> Path:
     return video_measurements_dir(video_id) / "fish_condition_images"
+
+
+def video_arched_back_dir(video_id: str) -> Path:
+    """返回弓背指标的明细、中间数据和可视化输出目录。"""
+
+    return video_measurements_dir(video_id) / "arched_back"
 
 
 def video_long_height_csv(video_id: str) -> Path:
@@ -278,6 +289,10 @@ def result_long_height_csv(video_id: str) -> Path:
     return result_measurements_dir(video_id) / "long_height_weight_results.csv"
 
 
+def result_arched_back_dir(video_id: str) -> Path:
+    return result_fish_images_dir(video_id) / "arched_back"
+
+
 def result_reports_dir(video_id: str) -> Path:
     return result_dir(video_id) / "reports"
 
@@ -341,6 +356,7 @@ __all__ = [
     "RESULTS_DIR",
     "CALIBRATION_DIR",
     "MODEL_DIR",
+    "ADJUST_CALIBRATION_MARGIN_CONFIG_PATH",
     "LOGS_DIR",
     "ALGORITHMS_GAOYUXI_DIR",
     "ALGORITHMS_DENGCHAO_DIR",
@@ -378,6 +394,7 @@ __all__ = [
     "video_grounded_sam_video",
     "video_measurements_dir",
     "video_fish_condition_images_dir",
+    "video_arched_back_dir",
     "video_long_height_csv",
     "video_reports_dir",
     "video_pipeline_result_json",
@@ -394,6 +411,7 @@ __all__ = [
     "result_incomplete_match_dir",
     "result_measurements_dir",
     "result_long_height_csv",
+    "result_arched_back_dir",
     "result_reports_dir",
     "result_pipeline_result_json",
     "result_error_conclusion_txt",

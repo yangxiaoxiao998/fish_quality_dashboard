@@ -18,6 +18,13 @@ DATA_ROOT = Path(os.getenv("FISH_DATA_ROOT", str(PROJECT_ROOT / "data")))
 
 CALIBRATION_DIR = DATA_ROOT / "config" / "calibration"
 CALIBRATION_FILE = CALIBRATION_DIR / "current_camera_calibration.json"
+PROJECT_MARGIN_FILE = PROJECT_ROOT / "algorithms" / "config" / "adjust_calibration_margin.json"
+MARGIN_DEFAULTS = {
+    "side_margin_ratio": 0.13,
+    "vertical_margin_ratio": 0.05,
+    "tracking_start_ratio": 0.4,
+    "crop_save_ratio": 0.7,
+}
 
 
 def _now_str() -> str:
@@ -126,3 +133,30 @@ def load_transform_matrix() -> list[list[float]] | None:
         return None
 
     return matrix
+
+
+def get_margin_config() -> dict[str, float]:
+    data = dict(MARGIN_DEFAULTS)
+    try:
+        if PROJECT_MARGIN_FILE.exists():
+            raw = json.loads(PROJECT_MARGIN_FILE.read_text(encoding="utf-8"))
+            for key in data:
+                if key in raw:
+                    data[key] = float(raw[key])
+    except (OSError, ValueError, TypeError):
+        pass
+    return data
+
+
+def save_margin_config(payload: dict[str, Any]) -> dict[str, float]:
+    values = get_margin_config()
+    for key in values:
+        if key in payload:
+            values[key] = float(payload[key])
+    if not 0 <= values["side_margin_ratio"] <= 2 or not 0 <= values["vertical_margin_ratio"] <= 2:
+        raise ValueError("边缘比例必须在 0 到 2 之间")
+    if not 0 <= values["tracking_start_ratio"] < values["crop_save_ratio"] <= 1:
+        raise ValueError("跟踪开始比例必须小于裁剪保存比例，且两者在 0 到 1 之间")
+    PROJECT_MARGIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PROJECT_MARGIN_FILE.write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return values

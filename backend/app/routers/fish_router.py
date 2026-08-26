@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import zipfile
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -20,6 +22,101 @@ from app.utils.time_utils import to_beijing
 from app.paths import DATA_DIR
 
 router = APIRouter()
+_webm_jobs: set[tuple[str, bool]] = set()
+_webm_jobs_lock = threading.Lock()
+
+
+def _pipeline_metrics(video_id: str) -> dict[str, float | None]:
+    """读取视频最后发布的 pipeline 结果，保持列表与 PDF 统计口径一致。"""
+    result_path = DATA_DIR / "results" / video_id / "reports" / "pipeline_result.json"
+    if not result_path.is_file():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+    values: dict[str, list[float]] = {
+        "avg_body_length": [],
+        "avg_body_length_without_tail": [],
+        "avg_body_height": [],
+        "avg_body_weight": [],
+        "avg_condition_factor": [],
+        "avg_surface_damage_ratio": [],
+    }
+    complete_statuses = {"done", "complete"}
+    fish_records = [
+        fish for fish in (payload.get("fish") or [])
+        if isinstance(fish, dict)
+    ]
+    for fish in payload.get("fish") or []:
+        if not isinstance(fish, dict):
+            continue
+        if str(fish.get("status") or "").lower() not in complete_statuses:
+            continue
+        fields = {
+            "avg_body_length": fish.get("body_length_cm"),
+            "avg_body_length_without_tail": (
+                fish.get("body_length_no_tail_cm")
+                if fish.get("body_length_no_tail_cm") is not None
+                else fish.get("body_length_cm")
+            ),
+            "avg_body_height": fish.get("body_height_cm"),
+            "avg_body_weight": fish.get("pred_weight_g"),
+            "avg_condition_factor": fish.get("condition_factor"),
+            "avg_surface_damage_ratio": fish.get("surface_damage_ratio"),
+        }
+        for key, raw in fields.items():
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            values[key].append(value)
+
+    summary = payload.get("summary") or {}
+    result = {
+        "total_fish": summary.get("total_fish", len(fish_records)),
+        "complete_fish": summary.get(
+            "complete_fish",
+            sum(
+                str(fish.get("status") or "").lower() in complete_statuses
+                for fish in fish_records
+            ),
+        ),
+        "incomplete_fish": summary.get(
+            "incomplete_fish",
+            sum(
+                str(fish.get("status") or "").lower() == "incomplete"
+                for fish in fish_records
+            ),
+        ),
+        "failed_fish": summary.get(
+            "failed_fish",
+            sum(
+                str(fish.get("status") or "").lower() == "failed"
+                for fish in fish_records
+            ),
+        ),
+        "damaged_fish": summary.get("damaged_fish", 0),
+    }
+    result.update({
+        key: (sum(items) / len(items) if items else None)
+        for key, items in values.items()
+    })
+    return result
+
+
+def _canonical_source_path(video_id: str, stored_path: str | None) -> str | None:
+    """Use the retained H.264 source when the historical DB path was cleaned."""
+    try:
+        from app.services.video_playback_service import resolve_canonical_video_path
+
+        path = resolve_canonical_video_path(video_id, stored_path)
+        if path and path.is_file():
+            return to_data_relative(path)
+    except Exception:
+        pass
+    return stored_path
 
 
 def _normalize_damage_ratio(value) -> float | None:
@@ -145,6 +242,7 @@ def list_videos(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     keyword: Optional[str] = None,
+    aquaculture_bin: Optional[str] = None,
     only_algorithm_results: bool = False,
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
@@ -165,6 +263,9 @@ def list_videos(
     if keyword:
         kw = f"%{keyword.strip()}%"
         filters.append(VideoTask.video_id.ilike(kw))
+
+    if aquaculture_bin and aquaculture_bin.strip():
+        filters.append(VideoTask.aquaculture_bin.ilike(f"%{aquaculture_bin.strip()}%"))
 
     if only_algorithm_results:
         filters.append(VideoTask.pipeline_result_path.isnot(None))
@@ -196,10 +297,56 @@ def list_videos(
 
     videos = db.execute(stmt).scalars().all()
 
+    # 当前页 video_id 批量聚合鱼体四项指标 + 表面破损率，避免 N+1 查询
+    page_video_ids = [v.video_id for v in videos if v.video_id]
+    report_map: dict[str, dict[str, Any]] = {}
+    if page_video_ids:
+        from app.repositories.models import DetectionReport as _DetectionReport
+        report_rows = db.execute(
+            select(_DetectionReport)
+            .where(_DetectionReport.report_type == "video_fish_quality")
+            .where(_DetectionReport.video_id.in_(page_video_ids))
+            .order_by(_DetectionReport.created_at.desc())
+        ).scalars().all()
+        for report in report_rows:
+            report_map.setdefault(report.video_id, {
+                "report_id": report.report_id,
+                "report_name": report.report_name,
+            })
+    metric_map: dict[str, dict[str, float | None]] = {}
+    if page_video_ids:
+        from app.repositories.models import Fish as _Fish
+        metric_rows = db.execute(
+            select(
+                _Fish.video_id,
+                 func.avg(func.coalesce(_Fish.body_length_cm, _Fish.body_length)).label("avg_body_length"),
+                 func.avg(func.coalesce(_Fish.body_length_no_tail_cm, _Fish.body_length_without_tail)).label("avg_body_length_without_tail"),
+                 func.avg(func.coalesce(_Fish.body_height_cm, _Fish.body_height)).label("avg_body_height"),
+                 func.avg(func.coalesce(_Fish.pred_weight_g, _Fish.body_weight)).label("avg_body_weight"),
+                func.avg(_Fish.condition_factor).label("avg_condition_factor"),
+                func.avg(_Fish.surface_damage_ratio).label("avg_surface_damage_ratio_from_fish"),
+            )
+            .where(_Fish.video_id.in_(page_video_ids))
+            .group_by(_Fish.video_id)
+        ).all()
+        for r in metric_rows:
+            metric_map[r.video_id] = {
+                "avg_body_length": r.avg_body_length,
+                "avg_body_length_without_tail": r.avg_body_length_without_tail,
+                "avg_body_height": r.avg_body_height,
+                "avg_body_weight": r.avg_body_weight,
+                "avg_condition_factor": r.avg_condition_factor,
+                # Fish 表聚合的表面破损率（VideoTask 已有值时优先使用）
+                "avg_surface_damage_ratio_fish": r.avg_surface_damage_ratio_from_fish,
+            }
+
     items = []
     for v in videos:
-        playback_url = to_static_url(v.source_path)
-        abs_video_path = to_abs_data_path(v.source_path)
+        m = metric_map.get(v.video_id) or {}
+        pipeline_m = _pipeline_metrics(v.video_id)
+        source_path = _canonical_source_path(v.video_id, v.source_path)
+        playback_url = to_static_url(source_path)
+        abs_video_path = to_abs_data_path(source_path)
         video_exists = abs_video_path.exists() if abs_video_path else False
         # 与 detail 端点保持一致：done 且文件存在才给 play_url
         play_url = (
@@ -213,10 +360,21 @@ def list_videos(
         finished_at_bj = to_beijing(v.finished_at)
 
         # 视频文件真实时长
-        video_duration_seconds = _probe_video_duration_seconds(v.source_path)
+        video_duration_seconds = (
+            float(v.video_duration_seconds)
+            if v.video_duration_seconds is not None and float(v.video_duration_seconds) > 0
+            else _probe_video_duration_seconds(source_path)
+        )
+        duration_error = None
+        if video_duration_seconds is None:
+            duration_error = "视频文件不存在或无法读取媒体时长"
         # 检测耗时 = finished - started
-        duration_seconds: float | None = None
-        if started_at_bj is not None:
+        duration_seconds: float | None = (
+            float(v.processing_duration_seconds)
+            if v.processing_duration_seconds is not None
+            else None
+        )
+        if duration_seconds is None and started_at_bj is not None:
             from app.utils.time_utils import now_beijing
             end_for_calc = finished_at_bj if finished_at_bj is not None else now_beijing()
             try:
@@ -235,7 +393,10 @@ def list_videos(
         items.append(
             {
                 "id": v.video_id,
-                "video_id": v.video_id,
+                 "video_id": v.video_id,
+                 "aquaculture_bin": getattr(v, "aquaculture_bin", None),
+                 "report_id": (report_map.get(v.video_id) or {}).get("report_id"),
+                 "report_name": (report_map.get(v.video_id) or {}).get("report_name"),
                 "uploadTime": created_at_bj.strftime("%Y-%m-%d %H:%M")
                 if created_at_bj
                 else None,
@@ -243,7 +404,8 @@ def list_videos(
                 "duration": _format_hms(video_duration_seconds),
                 # 新增：检测耗时（独立字段）
                 "duration_seconds": duration_seconds,
-                "video_duration_seconds": video_duration_seconds,
+                 "video_duration_seconds": video_duration_seconds,
+                 "video_duration_error": duration_error,
                 "fishCount": v.total_fish or 0,
                 "status": v.status,
                 "playback_url": playback_url,
@@ -251,13 +413,26 @@ def list_videos(
                 "playable": v.status == "done" and video_exists,
                 "video_exists": video_exists,
                 "source_type": v.source_type,
+                "source_path": source_path,
                 # 算法新字段
                 "total_fish": v.total_fish or 0,
                 "complete_fish": getattr(v, "complete_fish", None) or 0,
                 "incomplete_fish": getattr(v, "incomplete_fish", None) or 0,
                 "failed_fish": getattr(v, "failed_fish", None) or 0,
                 "damaged_fish": getattr(v, "damaged_fish", None) or 0,
-                "avg_surface_damage_ratio": getattr(v, "avg_surface_damage_ratio", None),
+                 # 已发布的 pipeline 结果是最终版本，必须与 PDF 使用相同口径。
+                 # 只有历史任务没有 pipeline_result.json 时才回退到数据库聚合。
+                 "total_fish": pipeline_m.get("total_fish", v.total_fish or 0),
+                 "complete_fish": pipeline_m.get("complete_fish", getattr(v, "complete_fish", None) or 0),
+                 "incomplete_fish": pipeline_m.get("incomplete_fish", getattr(v, "incomplete_fish", None) or 0),
+                 "failed_fish": pipeline_m.get("failed_fish", getattr(v, "failed_fish", None) or 0),
+                 "damaged_fish": pipeline_m.get("damaged_fish", getattr(v, "damaged_fish", None) or 0),
+                 "avg_body_length": pipeline_m.get("avg_body_length") if pipeline_m.get("avg_body_length") is not None else m.get("avg_body_length") if m.get("avg_body_length") is not None else pipeline_m.get("avg_body_length"),
+                  "avg_body_length_without_tail": pipeline_m.get("avg_body_length_without_tail") if pipeline_m.get("avg_body_length_without_tail") is not None else m.get("avg_body_length_without_tail"),
+                 "avg_body_height": pipeline_m.get("avg_body_height") if pipeline_m.get("avg_body_height") is not None else m.get("avg_body_height"),
+                 "avg_body_weight": pipeline_m.get("avg_body_weight") if pipeline_m.get("avg_body_weight") is not None else m.get("avg_body_weight"),
+                 "avg_condition_factor": pipeline_m.get("avg_condition_factor") if pipeline_m.get("avg_condition_factor") is not None else m.get("avg_condition_factor"),
+                 "avg_surface_damage_ratio": pipeline_m.get("avg_surface_damage_ratio") if pipeline_m.get("avg_surface_damage_ratio") is not None else getattr(v, "avg_surface_damage_ratio", None) if getattr(v, "avg_surface_damage_ratio", None) is not None else m.get("avg_surface_damage_ratio_fish"),
                 "max_surface_damage_ratio": getattr(v, "max_surface_damage_ratio", None),
                 "pipeline_result_path": getattr(v, "pipeline_result_path", None),
                 "result_dir": getattr(v, "result_dir", None),
@@ -283,6 +458,111 @@ def list_videos(
     }
 
 
+@router.patch("/videos/{video_id}/aquaculture-bin")
+def update_aquaculture_bin(video_id: str, body: dict, db: Session = Depends(get_db)) -> dict:
+    value = body.get("aquaculture_bin")
+    if value is not None and not isinstance(value, str):
+        raise HTTPException(status_code=422, detail="aquaculture_bin must be text")
+    task = session_repo.update_video_task_aquaculture_bin(
+        db, video_id=video_id, aquaculture_bin=value,
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="video task not found")
+    return {"ok": True, "video_id": video_id, "aquaculture_bin": task.aquaculture_bin}
+
+
+@router.post("/videos/batch-delete")
+def batch_delete_videos(body: dict, db: Session = Depends(get_db)) -> dict:
+    video_ids = body.get("video_ids")
+    if not isinstance(video_ids, list) or not video_ids:
+        raise HTTPException(status_code=400, detail="video_ids must be a non-empty list")
+    import shutil
+    from app.paths import DATA_DIR
+    from app.repositories.models import DetectionReport, Fish, VideoTask
+    from app.services.path_service import to_abs_data_path
+    ids = list(dict.fromkeys(str(v).strip() for v in video_ids if str(v).strip()))
+    tasks = db.query(VideoTask).filter(VideoTask.video_id.in_(ids)).all()
+    found = {task.video_id for task in tasks}
+    if not found:
+        raise HTTPException(status_code=404, detail="video tasks not found")
+    affected_dates = {task.created_at.date() for task in tasks if task.created_at}
+    db.query(DetectionReport).filter(DetectionReport.video_id.in_(found)).delete(synchronize_session=False)
+    db.query(Fish).filter(Fish.video_id.in_(found)).delete(synchronize_session=False)
+    for task in tasks:
+        for stored_path in (task.source_path, task.result_dir):
+            path = to_abs_data_path(stored_path) if stored_path else None
+            if path and path.exists() and DATA_DIR in path.parents:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+        db.delete(task)
+    db.commit()
+    _refresh_daily_reports(db, affected_dates)
+    return {"ok": True, "deleted_video_ids": sorted(found), "deleted_count": len(found)}
+
+
+def _refresh_daily_reports(db: Session, dates: set) -> None:
+    """Rebuild existing daily reports after video data changes."""
+    from app.repositories.models import DetectionReport
+    from app.services.report_pdf_service import generate_daily_fish_quality_pdf
+    from app.services.report_stats_service import get_fish_quality_summary
+
+    for report_date in dates:
+        existing = (
+            db.query(DetectionReport)
+            .filter(
+                DetectionReport.report_date == report_date,
+                DetectionReport.report_type == "daily_fish_quality",
+            )
+            .order_by(DetectionReport.created_at.desc())
+            .first()
+        )
+        if existing is None:
+            continue
+        summary = get_fish_quality_summary(db, report_date=report_date.isoformat())
+        if summary.get("total_video", summary.get("video_total", 0)) <= 0:
+            continue
+        generate_daily_fish_quality_pdf(
+            db,
+            report_date=report_date,
+            summary=summary,
+            existing_report_id=existing.report_id,
+            save_history=True,
+        )
+
+
+@router.delete("/videos/{video_id}")
+def delete_video(video_id: str, db: Session = Depends(get_db)) -> dict:
+    import shutil
+    from app.paths import DATA_DIR
+    from app.repositories.models import DetectionReport, Fish, VideoTask
+    from app.services.path_service import to_abs_data_path
+
+    task = db.get(VideoTask, video_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="video task not found")
+    affected_dates = {task.created_at.date()} if task.created_at else set()
+    stored_paths = (task.source_path, task.result_dir)
+    db.query(DetectionReport).filter(
+        DetectionReport.video_id == video_id,
+    ).delete(synchronize_session=False)
+    db.query(Fish).filter(
+        Fish.video_id == video_id,
+    ).delete(synchronize_session=False)
+    db.delete(task)
+    db.commit()
+    _refresh_daily_reports(db, affected_dates)
+    for stored_path in stored_paths:
+        path = to_abs_data_path(stored_path) if stored_path else None
+        if path and path.exists() and DATA_DIR in path.parents:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+    return {"ok": True, "video_id": video_id, "deleted": True}
+
+
 @router.get("/videos/{video_id}")
 def get_video(video_id: str, db: Session = Depends(get_db)) -> dict:
     obj = session_repo.get_video_task(db, video_id=video_id)
@@ -293,7 +573,8 @@ def get_video(video_id: str, db: Session = Depends(get_db)) -> dict:
     if obj.total_fish and obj.total_fish > 0:
         progress = round(obj.processed_fish / obj.total_fish, 2)
 
-    playback_url = to_static_url(obj.source_path)
+    source_path = _canonical_source_path(video_id, obj.source_path)
+    playback_url = to_static_url(source_path)
 
     created_at_bj = to_beijing(obj.created_at)
     started_at_bj = to_beijing(obj.started_at)
@@ -323,12 +604,20 @@ def get_video(video_id: str, db: Session = Depends(get_db)) -> dict:
         )
 
     # 视频文件真实时长（通过 cv2 probe，失败回退 None）
-    video_duration_seconds = _probe_video_duration_seconds(obj.source_path)
+    video_duration_seconds = (
+        float(obj.video_duration_seconds)
+        if obj.video_duration_seconds is not None
+        else _probe_video_duration_seconds(obj.source_path)
+    )
 
     # 检测耗时：finished - started；进行中 = now - started
     from app.utils.time_utils import now_beijing
-    duration_seconds: float | None = None
-    if started_at_bj is not None:
+    duration_seconds: float | None = (
+        float(obj.processing_duration_seconds)
+        if obj.processing_duration_seconds is not None
+        else None
+    )
+    if duration_seconds is None and started_at_bj is not None:
         end_for_calc = finished_at_bj if finished_at_bj is not None else now_beijing()
         try:
             duration_seconds = round(
@@ -366,17 +655,26 @@ def get_video_detail(video_id: str, request: Request, db: Session = Depends(get_
         return {"status": "not_found", "video_id": video_id}
 
     base_url = str(request.base_url).rstrip("/")
-    playback_url = to_static_url(obj.source_path)
-    abs_video_path = to_abs_data_path(obj.source_path)
+    source_path = _canonical_source_path(video_id, obj.source_path)
+    playback_url = to_static_url(source_path)
+    abs_video_path = to_abs_data_path(source_path)
     video_exists = abs_video_path.exists() if abs_video_path else False
 
     created_at_bj = to_beijing(obj.created_at)
     started_at_bj = to_beijing(obj.started_at)
     finished_at_bj = to_beijing(obj.finished_at)
 
-    video_duration_seconds = _probe_video_duration_seconds(obj.source_path)
-    duration_seconds: float | None = None
-    if started_at_bj is not None:
+    video_duration_seconds = (
+        float(obj.video_duration_seconds)
+        if obj.video_duration_seconds is not None
+        else _probe_video_duration_seconds(source_path)
+    )
+    duration_seconds: float | None = (
+        float(obj.processing_duration_seconds)
+        if obj.processing_duration_seconds is not None
+        else None
+    )
+    if duration_seconds is None and started_at_bj is not None:
         from app.utils.time_utils import now_beijing
         end_for_calc = finished_at_bj if finished_at_bj is not None else now_beijing()
         try:
@@ -401,20 +699,20 @@ def get_video_detail(video_id: str, request: Request, db: Session = Depends(get_
         "video_exists": video_exists,
         "playable": obj.status == "done" and video_exists,
         "play_url": f"{base_url}/api/videos/{video_id}/play" if obj.status == "done" and video_exists else None,
-        "source_path": obj.source_path,
+        "source_path": source_path,
     }
 
 
 @router.get("/videos/{video_id}/play")
 def play_video(video_id: str, db: Session = Depends(get_db)):
     obj = session_repo.get_video_task(db, video_id=video_id)
-    if not obj or not obj.source_path:
+    if not obj:
         return JSONResponse(content={"error": "Video not found"}, status_code=404)
 
     if obj.status != "done":
         return JSONResponse(content={"error": "视频仍在处理中，请等待完成后播放"}, status_code=400)
 
-    abs_video_path = to_abs_data_path(obj.source_path)
+    abs_video_path = to_abs_data_path(source_path)
     if not abs_video_path or not os.path.exists(abs_video_path):
         return JSONResponse(content={"error": "Video file not found"}, status_code=404)
 
@@ -452,7 +750,7 @@ def get_video_playback(video_id: str, db: Session = Depends(get_db)):
     obj = session_repo.get_video_task(db, video_id=video_id)
     video_status = obj.status if obj else None
 
-    result = ensure_browser_playable_video(video_id)
+    result = ensure_browser_playable_video(video_id, stored_path=obj.source_path if obj else None)
     if not result.get("ok"):
         code = result.get("error_code") or "VIDEO_PLAYBACK_FAILED"
         if code == "VIDEO_FILE_NOT_FOUND":
@@ -487,6 +785,67 @@ def get_video_playback(video_id: str, db: Session = Depends(get_db)):
         "converted": bool(result.get("converted")),
         "cached": bool(result.get("cached")),
         "video_status": video_status,
+    }
+
+
+@router.get("/videos/{video_id}/webm")
+def get_video_webm(
+    video_id: str,
+    result_video: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """Return an open-codec WebM fallback for Chromium builds without H.264."""
+    from app.services.video_playback_service import ensure_video_id_webm
+
+    from app.services.video_playback_service import _resolve_webm_path
+
+    output = _resolve_webm_path(video_id, result_video=result_video)
+    if output.exists() and output.stat().st_size > 0:
+        result = {"ok": True, "path": output, "cached": True}
+    else:
+        job_key = (video_id, result_video)
+        with _webm_jobs_lock:
+            already_running = job_key in _webm_jobs
+            if not already_running:
+                _webm_jobs.add(job_key)
+        if already_running:
+            return JSONResponse(
+                status_code=202,
+                content={"ok": True, "processing": True, "video_id": video_id},
+            )
+
+        def run_webm_job() -> None:
+            try:
+                ensure_video_id_webm(video_id, result_video=result_video)
+            finally:
+                with _webm_jobs_lock:
+                    _webm_jobs.discard(job_key)
+
+        threading.Thread(
+            target=run_webm_job,
+            name=f"webm-fallback-{video_id}",
+            daemon=True,
+        ).start()
+        return JSONResponse(
+            status_code=202,
+            content={"ok": True, "processing": True, "video_id": video_id},
+        )
+    if not result.get("ok"):
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "video_id": video_id,
+                "error_message": result.get("error_message") or "WebM 转码失败",
+            },
+        )
+    path = result["path"]
+    rel = to_data_relative(path) or str(path)
+    return {
+        "ok": True,
+        "video_id": video_id,
+        "webm_url": to_static_url(path) or f"/static/{rel.removeprefix('data/')}",
+        "cached": bool(result.get("cached")),
     }
 
 
@@ -590,6 +949,7 @@ def list_fishes(
                 "body_length_no_tail_cm": getattr(f, "body_length_no_tail_cm", None),
                 "body_height_cm": getattr(f, "body_height_cm", None),
                 "pred_weight_g": getattr(f, "pred_weight_g", None),
+                "hex_color": getattr(f, "hex_color", None),
                 "condition_factor": getattr(f, "condition_factor", None),
                 "surface_damage_ratio": getattr(f, "surface_damage_ratio", None),
                 "error_message": getattr(f, "error_message", None) or getattr(f, "error_msg", None),

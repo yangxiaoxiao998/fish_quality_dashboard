@@ -82,8 +82,8 @@ DEFAULT_MODEL_CANDIDATES: list[tuple[str, str, Optional[str]]] = [
     ),
     (
         "bert_base_uncased",
-        "BERT base uncased (Deng Chao 模型)",
-        "algorithms/bert-base-uncased",
+        "BERT base uncased (GroundingDINO文本编码器)",
+        "algorithms/pth/bert-base-uncased",
     ),
 ]
 
@@ -106,13 +106,13 @@ ENV_MODEL_KEYS: dict[str, tuple[str, str]] = {
     ),
     "FISH_BERT_BASE_UNCASED_PATH": (
         "bert_base_uncased",
-        "algorithms/bert-base-uncased",
+        "algorithms/pth/bert-base-uncased",
     ),
 }
 
 DISPLAY_NAME_OVERRIDES: dict[str, str] = {
     "groundingdino": "GroundingDINO (best_coco_bbox_mAP_epoch_12)",
-    "bert_base_uncased": "BERT base uncased (Deng Chao 模型)",
+    "bert_base_uncased": "BERT base uncased (GroundingDINO文本编码器)",
 }
 
 
@@ -246,7 +246,7 @@ def _resolve_model_paths() -> list[dict[str, Any]]:
             or display_names.get(model_key)
             or model_key
         )
-        by_key[model_key] = {
+        entry: dict[str, Any] = {
             "key": model_key,
             "name": display_name,
             "path": str(path),
@@ -254,6 +254,7 @@ def _resolve_model_paths() -> list[dict[str, Any]]:
             "size_mb": _size_mb(path),
             "source": f"env:{env_key}" if env_value else "default",
         }
+        by_key[model_key] = entry
 
     # 2. 补齐默认候选但还没出现的 key
     for model_key, display_name, default_rel in DEFAULT_MODEL_CANDIDATES:
@@ -269,7 +270,34 @@ def _resolve_model_paths() -> list[dict[str, Any]]:
             "source": "default",
         }
 
-    # 3. 按 DEFAULT_MODEL_CANDIDATES 顺序输出
+    # 3. BERT 完整性：五个必需文件 + 全部非空才 complete
+    bert_required = (
+        "config.json",
+        "pytorch_model.bin",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "vocab.txt",
+    )
+    bert_entry = by_key.get("bert_base_uncased")
+    if bert_entry is not None:
+        bert_path = Path(bert_entry["path"])
+        missing_files: list[str] = [
+            name
+            for name in bert_required
+            if not (bert_path / name).is_file()
+        ]
+        empty_files: list[str] = [
+            name
+            for name in bert_required
+            if (bert_path / name).is_file()
+            and (bert_path / name).stat().st_size <= 0
+        ]
+        bert_entry["required_files"] = list(bert_required)
+        bert_entry["missing_files"] = missing_files
+        bert_entry["empty_files"] = empty_files
+        bert_entry["complete"] = not missing_files and not empty_files
+
+    # 4. 按 DEFAULT_MODEL_CANDIDATES 顺序输出
     out: list[dict[str, Any]] = []
     for model_key, _, _ in DEFAULT_MODEL_CANDIDATES:
         if model_key in by_key:

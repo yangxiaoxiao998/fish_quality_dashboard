@@ -9,9 +9,12 @@ and writes the visualized tracking video through two parallel CPU render workers
 2. bounding boxes;
 3. fish class, track ID, and confidence labels.
 
-The script also keeps the original first-seen-ID outputs: one BGR image crop and one
-crop-aligned binary mask for every newly confirmed track ID. Selected instance masks are
-resized to the full source-image resolution on the GPU and then copied to the CPU.
+The script keeps one BGR image crop and one crop-aligned binary mask for every
+confirmed track ID. Tracking/visualized segmentation starts only after the
+middle of the fish body passes the configured conveyor position, and the saved
+pair comes from the first frame where that middle passes the configured crop
+position. Selected instance masks are resized to the full source-image
+resolution on the GPU and then copied to the CPU.
 
 Saved outputs use exactly the same paths and names as
 ``grounded_sam_mmdet_batch.py``:
@@ -35,6 +38,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import lru_cache
+import json
 import re
 import shutil
 import subprocess
@@ -68,6 +72,7 @@ from config.naming import (
     make_fish_mask_name,
 )
 from config.paths import (
+    ADJUST_CALIBRATION_MARGIN_CONFIG_PATH,
     RFDETR_SEG_MEDIUM_FP16_ENGINE_PATH,
     ensure_dir,
     resolve_input_path,
@@ -100,6 +105,18 @@ ROI_MARGIN_PIXELS = 4
 GPU_MASK_RESIZE_CHUNK_SIZE = 32
 OPENCV_NUM_THREADS = 1
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+TRACKING_INPUT_CONFIDENCE_THRESHOLD = 0.6
+UNTRACKED_DETECTION_ID = -2
+UNCLIPPED_XYXY_DATA_KEY = "unclipped_xyxy"
+
+# ===========================================================================
+# Conveyor-position gates
+# ===========================================================================
+# Ratios are intentionally not CLI options. They are loaded together with the
+# adjusted-canvas margin from config/adjust_calibration_margin.json so all runs
+# use the same physical positions on the conveyor body.
+POSITION_GATE_VERSION = "conveyor_position_gate_v1_20260813"
+BEST_SAMPLE_CROP_SCALE = 1.20
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -174,7 +191,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # Keep the detector threshold low enough for ByteTrack's low-confidence stage.
+    # RF-DETR keeps lower-confidence segmentation results for visualization;
+    # ByteTrack receives only detections above TRACKING_INPUT_CONFIDENCE_THRESHOLD.
     parser.add_argument(
         "--model-threshold",
         "--conf",
@@ -182,8 +200,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--box_threshold",
         dest="model_threshold",
         type=float,
-        default=0.3,
-        help="RF-DETR prediction threshold; keep it no higher than --track-activation-threshold",
+        default=0.5,
+        help="RF-DETR segmentation prediction threshold",
+    )
+    parser.add_argument(
+        "--top-edge-ratio",
+        "--top_edge_ratio",
+        type=float,
+        default=0.0,
+        help="shrink the effective detection region from the top by this image-height ratio",
+    )
+    parser.add_argument(
+        "--bottom-edge-ratio",
+        "--bottom_edge_ratio",
+        type=float,
+        default=0.0,
+        help="shrink the effective detection region from the bottom by this image-height ratio",
+    )
+    parser.add_argument(
+        "--left-edge-ratio",
+        "--left_edge_ratio",
+        type=float,
+        default=0.0,
+        help="expand the allowed detection region beyond the left edge by this image-width ratio",
+    )
+    parser.add_argument(
+        "--right-edge-ratio",
+        "--right_edge_ratio",
+        type=float,
+        default=0.0,
+        help="expand the allowed detection region beyond the right edge by this image-width ratio",
     )
     parser.add_argument(
         "--track-activation-threshold",
@@ -214,6 +260,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.10,
         help="minimum IoU used for ByteTrack association",
+    )
+
+    parser.add_argument(
+        "--best-sample-mode",
+        choices=("position",),
+        default="position",
+        help=(
+            "fish crop selection strategy; the position is read from "
+            "adjust_calibration_margin.json"
+        ),
     )
 
     parser.add_argument(
@@ -294,20 +350,38 @@ def validate_args(args: argparse.Namespace) -> None:
         "--high-conf-threshold": args.high_conf_threshold,
         "--minimum-iou-threshold": args.minimum_iou_threshold,
         "--mask-alpha": args.mask_alpha,
+        "--top-edge-ratio": args.top_edge_ratio,
+        "--bottom-edge-ratio": args.bottom_edge_ratio,
+        "--left-edge-ratio": args.left_edge_ratio,
+        "--right-edge-ratio": args.right_edge_ratio,
     }
     for name, value in probability_fields.items():
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{name} must be in [0, 1], got {value}")
+
+    edge_ratios = {
+        "--top-edge-ratio": args.top_edge_ratio,
+        "--bottom-edge-ratio": args.bottom_edge_ratio,
+        "--left-edge-ratio": args.left_edge_ratio,
+        "--right-edge-ratio": args.right_edge_ratio,
+    }
+    for name, value in edge_ratios.items():
+        if value >= 1.0:
+            raise ValueError(f"{name} must be smaller than 1.0, got {value}")
+    if args.top_edge_ratio + args.bottom_edge_ratio >= 1.0:
+        raise ValueError(
+            "--top-edge-ratio plus --bottom-edge-ratio must be smaller than 1.0"
+        )
 
     if args.track_activation_threshold >= args.high_conf_threshold:
         raise ValueError(
             "--track-activation-threshold must be smaller than --high-conf-threshold "
             "so ByteTrack has separate low- and high-confidence stages."
         )
-    if args.model_threshold > args.track_activation_threshold:
+    if args.model_threshold > TRACKING_INPUT_CONFIDENCE_THRESHOLD:
         print(
-            "[WARN] --model-threshold is above --track-activation-threshold. "
-            "RF-DETR will discard some low-confidence detections before ByteTrack sees them.",
+            "[WARN] --model-threshold is above the tracker input threshold. "
+            "RF-DETR will discard some detections before they can reach ByteTrack.",
             file=sys.stderr,
         )
     if args.lost_track_buffer < 0:
@@ -326,6 +400,72 @@ def synchronize_cuda() -> None:
     """Synchronize CUDA so measured inference time includes completed GPU work."""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def load_conveyor_position_config(
+    config_path: Path = ADJUST_CALIBRATION_MARGIN_CONFIG_PATH,
+) -> dict[str, float]:
+    """Load canvas margin and conveyor-position gates from the shared JSON."""
+    try:
+        with config_path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Could not read conveyor position config: {config_path}: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"Conveyor position config must contain a JSON object: {config_path}"
+        )
+
+    required_keys = (
+        "vertical_margin_ratio",
+        "tracking_start_ratio",
+        "crop_save_ratio",
+    )
+    missing_keys = [key for key in required_keys if key not in payload]
+    if missing_keys:
+        raise RuntimeError(
+            f"Conveyor position config is missing {missing_keys}: {config_path}"
+        )
+
+    values: dict[str, float] = {}
+    for key in required_keys:
+        raw_value = payload[key]
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            raise RuntimeError(
+                f"Conveyor position config {key} must be numeric, got "
+                f"{raw_value!r}: {config_path}"
+            )
+        value = float(raw_value)
+        if not np.isfinite(value):
+            raise RuntimeError(
+                f"Conveyor position config {key} must be finite, got "
+                f"{raw_value!r}: {config_path}"
+            )
+        values[key] = value
+
+    vertical_margin_ratio = values["vertical_margin_ratio"]
+    if not 0.0 <= vertical_margin_ratio <= 2.0:
+        raise RuntimeError(
+            "Conveyor position config vertical_margin_ratio must be in [0, 2], "
+            f"got {vertical_margin_ratio}: {config_path}"
+        )
+
+    for key in ("tracking_start_ratio", "crop_save_ratio"):
+        if not 0.0 <= values[key] <= 1.0:
+            raise RuntimeError(
+                f"Conveyor position config {key} must be in [0, 1], "
+                f"got {values[key]}: {config_path}"
+            )
+
+    if values["tracking_start_ratio"] >= values["crop_save_ratio"]:
+        raise RuntimeError(
+            "Conveyor position config tracking_start_ratio must be smaller than "
+            f"crop_save_ratio: {config_path}"
+        )
+    return values
 
 
 def natural_image_sort_key(path: Path) -> tuple[Any, ...]:
@@ -753,8 +893,9 @@ class TensorRTRFDETRSegMedium:
         boxes_cxcywh: torch.Tensor,
         image_height: int,
         image_width: int,
+        clip: bool = True,
     ) -> torch.Tensor:
-        """Convert normalized cxcywh boxes to clipped pixel xyxy boxes on GPU."""
+        """Convert normalized cxcywh boxes to pixel xyxy boxes on GPU."""
         boxes = boxes_cxcywh.to(dtype=torch.float32)
         center_x, center_y, box_width, box_height = boxes.unbind(dim=1)
 
@@ -769,10 +910,15 @@ class TensorRTRFDETRSegMedium:
         )
         # Multiply columns directly to avoid allocating a new scale tensor on
         # every image.
-        boxes_xyxy[:, 0].mul_(float(image_width)).clamp_(0.0, float(image_width))
-        boxes_xyxy[:, 2].mul_(float(image_width)).clamp_(0.0, float(image_width))
-        boxes_xyxy[:, 1].mul_(float(image_height)).clamp_(0.0, float(image_height))
-        boxes_xyxy[:, 3].mul_(float(image_height)).clamp_(0.0, float(image_height))
+        boxes_xyxy[:, 0].mul_(float(image_width))
+        boxes_xyxy[:, 2].mul_(float(image_width))
+        boxes_xyxy[:, 1].mul_(float(image_height))
+        boxes_xyxy[:, 3].mul_(float(image_height))
+        if clip:
+            boxes_xyxy[:, 0].clamp_(0.0, float(image_width))
+            boxes_xyxy[:, 2].clamp_(0.0, float(image_width))
+            boxes_xyxy[:, 1].clamp_(0.0, float(image_height))
+            boxes_xyxy[:, 3].clamp_(0.0, float(image_height))
         return boxes_xyxy
 
     @staticmethod
@@ -787,6 +933,7 @@ class TensorRTRFDETRSegMedium:
             mask=np.empty((0, image_height, image_width), dtype=bool),
         )
         detections.data["class_name"] = np.empty(0, dtype=object)
+        detections.data[UNCLIPPED_XYXY_DATA_KEY] = np.empty((0, 4), dtype=np.float32)
         return detections
 
     @torch.inference_mode()
@@ -868,6 +1015,7 @@ class TensorRTRFDETRSegMedium:
         ).to(dtype=torch.int64)
 
         boxes_parts: list[torch.Tensor] = []
+        unclipped_boxes_parts: list[torch.Tensor] = []
         scores_parts: list[torch.Tensor] = []
         class_id_parts: list[torch.Tensor] = []
         mask_parts: list[torch.Tensor] = []
@@ -890,13 +1038,20 @@ class TensorRTRFDETRSegMedium:
             selected_masks_gpu = raw_masks[batch_index].index_select(
                 0, query_indexes_gpu
             )
-            boxes_xyxy_gpu = self._boxes_to_xyxy_gpu(
+            unclipped_boxes_xyxy_gpu = self._boxes_to_xyxy_gpu(
                 selected_boxes_gpu,
                 image_height=image_height,
                 image_width=image_width,
+                clip=False,
             )
+            boxes_xyxy_gpu = unclipped_boxes_xyxy_gpu.clone()
+            boxes_xyxy_gpu[:, 0].clamp_(0.0, float(image_width))
+            boxes_xyxy_gpu[:, 2].clamp_(0.0, float(image_width))
+            boxes_xyxy_gpu[:, 1].clamp_(0.0, float(image_height))
+            boxes_xyxy_gpu[:, 3].clamp_(0.0, float(image_height))
 
             boxes_parts.append(boxes_xyxy_gpu)
+            unclipped_boxes_parts.append(unclipped_boxes_xyxy_gpu)
             scores_parts.append(scores_gpu)
             class_id_parts.append(class_ids_gpu)
             mask_parts.append(selected_masks_gpu)
@@ -920,6 +1075,7 @@ class TensorRTRFDETRSegMedium:
 
         target_height, target_width = image_sizes[0]
         boxes_cpu = torch.cat(boxes_parts, dim=0).cpu().numpy()
+        unclipped_boxes_cpu = torch.cat(unclipped_boxes_parts, dim=0).cpu().numpy()
         scores_cpu = torch.cat(scores_parts, dim=0).cpu().numpy()
         class_ids_cpu = torch.cat(class_id_parts, dim=0).cpu().numpy()
 
@@ -963,6 +1119,7 @@ class TensorRTRFDETRSegMedium:
 
             next_offset = offset + selected_count
             boxes_xyxy = boxes_cpu[offset:next_offset]
+            unclipped_boxes_xyxy = unclipped_boxes_cpu[offset:next_offset]
             scores = scores_cpu[offset:next_offset]
             class_ids = class_ids_cpu[offset:next_offset]
             masks = masks_cpu[offset:next_offset]
@@ -982,6 +1139,10 @@ class TensorRTRFDETRSegMedium:
                     for class_id in detections.class_id
                 ],
                 dtype=object,
+            )
+            detections.data[UNCLIPPED_XYXY_DATA_KEY] = unclipped_boxes_xyxy.astype(
+                np.float32,
+                copy=False,
             )
             detections_batch.append(detections)
 
@@ -1010,6 +1171,130 @@ def build_tracker(args: argparse.Namespace, fps: float) -> ByteTrackTracker:
         minimum_iou_threshold=args.minimum_iou_threshold,
         high_conf_det_threshold=args.high_conf_threshold,
     )
+
+
+def filter_detections_by_effective_region(
+    detections: sv.Detections,
+    image_height: int,
+    image_width: int,
+    *,
+    top_ratio: float,
+    bottom_ratio: float,
+    left_ratio: float,
+    right_ratio: float,
+) -> sv.Detections:
+    """Keep boxes fully contained by the configured effective detection region.
+
+    Top and bottom ratios contract the region into the image. Left and right
+    ratios extend it beyond the image, using pre-clipping model boxes so an
+    extension can admit a prediction that slightly crosses a side boundary.
+    All-zero ratios disable this filter and preserve the original behavior.
+    """
+    if len(detections) == 0 or not any(
+        (top_ratio, bottom_ratio, left_ratio, right_ratio)
+    ):
+        return detections
+
+    boxes = np.asarray(
+        detections.data.get(UNCLIPPED_XYXY_DATA_KEY, detections.xyxy),
+        dtype=np.float32,
+    )
+    left = -float(left_ratio) * float(image_width)
+    right = (1.0 + float(right_ratio)) * float(image_width)
+    top = float(top_ratio) * float(image_height)
+    bottom = (1.0 - float(bottom_ratio)) * float(image_height)
+    keep = (
+        (boxes[:, 0] >= left)
+        & (boxes[:, 1] >= top)
+        & (boxes[:, 2] <= right)
+        & (boxes[:, 3] <= bottom)
+    )
+    return detections[keep]
+
+
+def conveyor_body_progress(
+    mask: Any,
+    image_height: int,
+    image_width: int,
+    *,
+    vertical_margin_ratio: float,
+) -> float | None:
+    """Return where the middle of a fish lies along the conveyor body.
+
+    Adjusted frames contain a top and bottom safety margin, each measured as
+    ``vertical_margin_ratio * belt_height``. Progress 0 is therefore the top of
+    the conveyor itself and progress 1 is its bottom, rather than the edges of
+    the full adjusted canvas.
+    """
+    mask_bool = ensure_2d_mask(mask, image_height, image_width)
+    ys = np.flatnonzero(np.any(mask_bool, axis=1))
+    if ys.size == 0:
+        return None
+
+    fish_middle_y = 0.5 * (float(ys[0]) + float(ys[-1]))
+    belt_height = float(image_height) / (1.0 + 2.0 * vertical_margin_ratio)
+    belt_top = vertical_margin_ratio * belt_height
+    return (fish_middle_y - belt_top) / belt_height
+
+
+def filter_detections_by_conveyor_progress(
+    detections: sv.Detections,
+    image_height: int,
+    image_width: int,
+    *,
+    minimum_progress_ratio: float,
+    vertical_margin_ratio: float,
+) -> sv.Detections:
+    """Keep fish whose body midpoint has passed the configured belt position."""
+    if len(detections) == 0:
+        return detections
+
+    if detections.mask is None:
+        raise RuntimeError(
+            "Conveyor position filtering requires instance-segmentation masks."
+        )
+
+    keep = np.zeros(len(detections), dtype=bool)
+    for index, mask in enumerate(detections.mask):
+        progress = conveyor_body_progress(
+            mask,
+            image_height,
+            image_width,
+            vertical_margin_ratio=vertical_margin_ratio,
+        )
+        # "Passed" is deliberately strict: a midpoint exactly on the line has
+        # not passed it yet.
+        keep[index] = progress is not None and progress > minimum_progress_ratio
+    return detections[keep]
+
+
+def split_detections_for_tracking(
+    detections: sv.Detections,
+) -> tuple[sv.Detections, sv.Detections]:
+    """Return ByteTrack candidates and segmentation-only detections."""
+    if detections.confidence is None:
+        tracking_mask = np.zeros(len(detections), dtype=bool)
+    else:
+        confidences = np.asarray(detections.confidence, dtype=np.float32)
+        tracking_mask = confidences > TRACKING_INPUT_CONFIDENCE_THRESHOLD
+
+    tracking_candidates = detections[tracking_mask]
+    untracked_detections = detections[~tracking_mask]
+    if len(untracked_detections) > 0:
+        untracked_detections.tracker_id = np.full(
+            len(untracked_detections),
+            UNTRACKED_DETECTION_ID,
+            dtype=np.int64,
+        )
+    return tracking_candidates, untracked_detections
+
+
+def merge_tracked_and_untracked_detections(
+    tracked_detections: sv.Detections,
+    untracked_detections: sv.Detections,
+) -> sv.Detections:
+    """Keep all segmentation results while retaining IDs only for tracked ones."""
+    return sv.Detections.merge([tracked_detections, untracked_detections])
 
 
 
@@ -1228,8 +1513,11 @@ def annotate_frame(
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
 
         class_name = class_name_for(model, int(class_id))
-        id_text = str(track_id) if track_id >= 0 else "pending"
-        label = f"{class_name}  ID:{id_text}  {float(confidence):.2f}"
+        if track_id == UNTRACKED_DETECTION_ID:
+            label = f"{class_name}  {float(confidence):.2f}"
+        else:
+            id_text = str(track_id) if track_id >= 0 else "pending"
+            label = f"{class_name}  ID:{id_text}  {float(confidence):.2f}"
 
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.55
@@ -1403,6 +1691,197 @@ def save_first_seen_id_samples_bgr(
         )
         crop_mask_path = output_root / make_fish_mask_name(int(track_id), frame_index)
         cv2.imwrite(str(crop_mask_path), crop_mask)
+
+
+
+class BestFishSampleSelector:
+    """Save the first crop/mask after a tracked fish passes the save position.
+
+    Updates run in the main sequential tracking thread before asynchronous
+    annotation, so the saved pixels are from the untouched source frame and
+    the first eligible frame is deterministic.
+    """
+
+    def __init__(
+        self,
+        output_root: Path | None,
+        *,
+        crop_scale: float = BEST_SAMPLE_CROP_SCALE,
+        save_progress_ratio: float,
+        vertical_margin_ratio: float,
+    ) -> None:
+        self.output_root = output_root
+        self.crop_scale = float(crop_scale)
+        self.save_progress_ratio = float(save_progress_ratio)
+        self.vertical_margin_ratio = float(vertical_margin_ratio)
+
+        self.best_scores: dict[int, float] = {}
+        self.best_frame_indexes: dict[int, int] = {}
+        self.best_paths: dict[int, tuple[Path, Path]] = {}
+        self.observation_counts: dict[int, int] = {}
+        self.confirmed_track_ids: set[int] = set()
+        self.saved_track_ids: set[int] = set()
+
+        if self.output_root is not None:
+            self.output_root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _mask_bounds(mask_bool: np.ndarray) -> tuple[int, int, int, int] | None:
+        ys, xs = np.where(mask_bool)
+        if ys.size == 0 or xs.size == 0:
+            return None
+        return (
+            int(xs.min()),
+            int(ys.min()),
+            int(xs.max()),
+            int(ys.max()),
+        )
+
+    def _expanded_crop_bounds(
+        self,
+        mask_bool: np.ndarray,
+        image_height: int,
+        image_width: int,
+    ) -> tuple[int, int, int, int] | None:
+        bounds = self._mask_bounds(mask_bool)
+        if bounds is None:
+            return None
+
+        x_min, y_min, x_max, y_max = bounds
+        fish_height = y_max - y_min + 1
+        fish_width = x_max - x_min + 1
+        center_y = y_min + fish_height / 2.0
+        center_x = x_min + fish_width / 2.0
+
+        crop_height = max(1, int(round(fish_height * self.crop_scale)))
+        crop_width = max(1, int(round(fish_width * self.crop_scale)))
+
+        crop_y_min = int(round(center_y - crop_height / 2.0))
+        crop_x_min = int(round(center_x - crop_width / 2.0))
+        crop_y_max = crop_y_min + crop_height - 1
+        crop_x_max = crop_x_min + crop_width - 1
+
+        crop_y_min = max(0, crop_y_min)
+        crop_x_min = max(0, crop_x_min)
+        crop_y_max = min(image_height - 1, crop_y_max)
+        crop_x_max = min(image_width - 1, crop_x_max)
+
+        if crop_x_max < crop_x_min or crop_y_max < crop_y_min:
+            return None
+        return crop_x_min, crop_y_min, crop_x_max, crop_y_max
+
+    def _save_candidate(
+        self,
+        *,
+        track_id: int,
+        frame_index: int,
+        image_bgr: np.ndarray,
+        mask_bool: np.ndarray,
+    ) -> tuple[Path, Path] | None:
+        if self.output_root is None:
+            return None
+
+        image_height, image_width = image_bgr.shape[:2]
+        crop_bounds = self._expanded_crop_bounds(
+            mask_bool,
+            image_height,
+            image_width,
+        )
+        if crop_bounds is None:
+            return None
+        x1, y1, x2, y2 = crop_bounds
+
+        crop_bgr = image_bgr[y1 : y2 + 1, x1 : x2 + 1]
+        crop_mask = (
+            mask_bool[y1 : y2 + 1, x1 : x2 + 1].astype(np.uint8) * 255
+        )
+
+        crop_path = self.output_root / make_fish_crop_name(
+            int(track_id),
+            int(frame_index),
+        )
+        mask_path = self.output_root / make_fish_mask_name(
+            int(track_id),
+            int(frame_index),
+        )
+
+        crop_ok = cv2.imwrite(
+            str(crop_path),
+            crop_bgr,
+            [cv2.IMWRITE_JPEG_QUALITY, 100],
+        )
+        mask_ok = cv2.imwrite(str(mask_path), crop_mask)
+        if not crop_ok or not mask_ok:
+            try:
+                crop_path.unlink(missing_ok=True)
+                mask_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"Could not save fish sample for track {track_id}"
+            )
+
+        return crop_path, mask_path
+
+    def update(
+        self,
+        *,
+        frame_index: int,
+        image_bgr: np.ndarray,
+        detections: sv.Detections,
+    ) -> None:
+        if detections.tracker_id is None or detections.mask is None:
+            return
+
+        tracker_ids = np.asarray(detections.tracker_id, dtype=np.int64)
+        image_height, image_width = image_bgr.shape[:2]
+
+        for index, raw_track_id in enumerate(tracker_ids):
+            track_id = int(raw_track_id)
+            if track_id < 0:
+                continue
+
+            self.confirmed_track_ids.add(track_id)
+            self.observation_counts[track_id] = (
+                self.observation_counts.get(track_id, 0) + 1
+            )
+
+            if track_id in self.saved_track_ids:
+                continue
+
+            mask_bool = ensure_2d_mask(
+                detections.mask[index],
+                image_height,
+                image_width,
+            )
+            progress = conveyor_body_progress(
+                mask_bool,
+                image_height,
+                image_width,
+                vertical_margin_ratio=self.vertical_margin_ratio,
+            )
+            if progress is None or progress <= self.save_progress_ratio:
+                continue
+
+            saved_paths = self._save_candidate(
+                track_id=track_id,
+                frame_index=int(frame_index),
+                image_bgr=image_bgr,
+                mask_bool=mask_bool,
+            )
+            if saved_paths is None:
+                continue
+
+            self.best_scores[track_id] = float(progress)
+            self.best_frame_indexes[track_id] = int(frame_index)
+            self.best_paths[track_id] = saved_paths
+            self.saved_track_ids.add(track_id)
+
+            print(
+                f"[SAMPLE] ID {track_id}: saved first frame past "
+                f"{self.save_progress_ratio:.1%} of conveyor, "
+                f"frame={frame_index}, progress={progress:.4f}"
+            )
 
 
 def save_grounded_sam_style_result(
@@ -1905,24 +2384,19 @@ class AsyncVisualizationWriter:
                 "The asynchronous visualization pipeline failed."
             ) from self.exception
 
-    def _claim_first_seen_indexes(self, tracked: sv.Detections) -> list[int]:
+    def _register_confirmed_track_ids(self, tracked: sv.Detections) -> None:
+        """Keep the historical track-count statistic without saving first frame."""
         raw_tracker_ids = tracked.tracker_id
         if raw_tracker_ids is None:
-            return []
-        claimed: list[int] = []
-        for index, raw_track_id in enumerate(
-            np.asarray(raw_tracker_ids, dtype=np.int64)
-        ):
+            return
+        for raw_track_id in np.asarray(raw_tracker_ids, dtype=np.int64):
             track_id = int(raw_track_id)
-            if track_id < 0 or track_id in self.seen_track_ids:
-                continue
-            self.seen_track_ids.add(track_id)
-            claimed.append(index)
-        return claimed
+            if track_id >= 0:
+                self.seen_track_ids.add(track_id)
 
     def submit(self, item: dict[str, Any]) -> None:
         self._raise_if_failed()
-        item["first_seen_indexes"] = self._claim_first_seen_indexes(item["tracked"])
+        self._register_confirmed_track_ids(item["tracked"])
         self.render_queue.put(item)
         self.submitted_frames += 1
         self._raise_if_failed()
@@ -1957,28 +2431,11 @@ class AsyncVisualizationWriter:
         frame_bgr: np.ndarray = item["frame_bgr"]
         tracked: sv.Detections = item["tracked"]
 
-        # Save first-seen samples before in-place annotation so crops contain
-        # the original source pixels, matching the previous frame-copy version.
+        # Position-based sample selection runs synchronously in the main
+        # tracking thread before this frame is submitted. This render worker
+        # must not write another first-seen crop.
         first_seen_start = time.perf_counter()
-        first_seen_indexes: list[int] = item["first_seen_indexes"]
-        if first_seen_indexes and self.args.first_match_output_dir is not None:
-            tracker_ids = np.asarray(tracked.tracker_id, dtype=np.int64)
-            if tracked.mask is None:
-                raise RuntimeError(
-                    "Tracked detections are missing full-resolution instance masks."
-                )
-            save_first_seen_id_samples_bgr(
-                output_root=self.args.first_match_output_dir,
-                frame_index=(
-                    extract_frame_index_from_path(item["image_path"])
-                    if extract_frame_index_from_path(item["image_path"]) is not None
-                    else int(item["frame_index"])
-                ),
-                image_bgr=frame_bgr,
-                masks=[tracked.mask[index] for index in first_seen_indexes],
-                track_ids=[int(tracker_ids[index]) for index in first_seen_indexes],
-            )
-        first_seen_end = time.perf_counter()
+        first_seen_end = first_seen_start
 
         visualization_start = first_seen_end
         annotated = annotate_frame(
@@ -2233,6 +2690,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.video_output = resolve_input_path(args.video_output)
 
     args.checkpoint = resolve_input_path(args.checkpoint)
+    position_config = load_conveyor_position_config()
 
     if args.input_image is not None and not args.input_image.is_file():
         raise FileNotFoundError(f"Input image not found: {args.input_image}")
@@ -2319,6 +2777,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         "total_ms": [],
     }
 
+    best_sample_selector = BestFishSampleSelector(
+        output_root=args.first_match_output_dir,
+        crop_scale=BEST_SAMPLE_CROP_SCALE,
+        save_progress_ratio=position_config["crop_save_ratio"],
+        vertical_margin_ratio=position_config["vertical_margin_ratio"],
+    )
+
     visualization_pipeline = AsyncVisualizationWriter(
         writer=writer,
         model=model,
@@ -2329,8 +2794,33 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     print(f"[INFO] Input directory:          {args.input_dir}")
     print(f"[INFO] TensorRT engine:          {args.checkpoint}")
+    print(f"[INFO] Segmentation threshold:   > {args.model_threshold:.3f}")
+    print(
+        "[INFO] Effective edge ratios:    "
+        f"top={args.top_edge_ratio:.3f}, "
+        f"bottom={args.bottom_edge_ratio:.3f}, "
+        f"left=+{args.left_edge_ratio:.3f}, "
+        f"right=+{args.right_edge_ratio:.3f}"
+    )
+    print(
+        "[INFO] Tracker input threshold: "
+        f"> {TRACKING_INPUT_CONFIDENCE_THRESHOLD:.3f}"
+    )
     print(f"[INFO] Annotated frames:         {args.annotated_output_dir}")
-    print(f"[INFO] First-seen ID output:     {args.first_match_output_dir}")
+    print(f"[INFO] Fish sample output:        {args.first_match_output_dir}")
+    print(
+        "[INFO] Conveyor position config:  "
+        f"{ADJUST_CALIBRATION_MARGIN_CONFIG_PATH}"
+    )
+    print(
+        "[INFO] Tracking/segmentation gate: fish midpoint > "
+        f"{position_config['tracking_start_ratio']:.1%} of conveyor"
+    )
+    print(
+        "[INFO] Fish sample selection:     first fish midpoint > "
+        f"{position_config['crop_save_ratio']:.1%} of conveyor "
+        f"({POSITION_GATE_VERSION})"
+    )
     print(f"[INFO] Output video:             {output_video}")
     if writer is not None:
         print(
@@ -2427,9 +2917,50 @@ def main(argv: Iterable[str] | None = None) -> int:
                         stop_all = True
                         break
 
+                    detections = filter_detections_by_effective_region(
+                        detections,
+                        image_height=record["image_height"],
+                        image_width=record["image_width"],
+                        top_ratio=args.top_edge_ratio,
+                        bottom_ratio=args.bottom_edge_ratio,
+                        left_ratio=args.left_edge_ratio,
+                        right_ratio=args.right_edge_ratio,
+                    )
+                    detections = filter_detections_by_conveyor_progress(
+                        detections,
+                        image_height=record["image_height"],
+                        image_width=record["image_width"],
+                        minimum_progress_ratio=(
+                            position_config["tracking_start_ratio"]
+                        ),
+                        vertical_margin_ratio=(
+                            position_config["vertical_margin_ratio"]
+                        ),
+                    )
+                    tracking_candidates, untracked_detections = (
+                        split_detections_for_tracking(detections)
+                    )
                     tracking_start = time.perf_counter()
-                    tracked = tracker.update(detections)
+                    tracked = tracker.update(tracking_candidates)
                     tracking_end = time.perf_counter()
+                    rendered_detections = merge_tracked_and_untracked_detections(
+                        tracked,
+                        untracked_detections,
+                    )
+
+                    # Save the first source crop past the configured conveyor
+                    # position before a render worker annotates frame_bgr.
+                    source_frame_number = extract_frame_index_from_path(
+                        record["image_path"]
+                    )
+                    if source_frame_number is None:
+                        source_frame_number = submitted_frames
+
+                    best_sample_selector.update(
+                        frame_index=int(source_frame_number),
+                        image_bgr=record["frame_bgr"],
+                        detections=rendered_detections,
+                    )
 
                     visualization_pipeline.submit(
                         {
@@ -2444,7 +2975,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                             "tracking_ms": (
                                 tracking_end - tracking_start
                             ) * 1000.0,
-                            "tracked": tracked,
+                            "tracked": rendered_detections,
                         }
                     )
                     submitted_frames += 1
@@ -2485,6 +3016,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     frame_count = visualization_pipeline.frames_written
     seen_track_ids = visualization_pipeline.seen_track_ids
+    best_saved_track_ids = best_sample_selector.saved_track_ids
     warmup = min(args.timing_warmup_frames, frame_count)
 
     metrics_steady_state = {
@@ -2506,7 +3038,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     if output_video is not None:
         print(f"video_output     : {output_video}")
     print(f"frame_count      : {frame_count}")
-    print(f"first_seen_ids   : {len(seen_track_ids)}")
+    print(f"confirmed_ids    : {len(seen_track_ids)}")
+    print(f"saved_samples    : {len(best_saved_track_ids)}")
+    print(
+        f"sample_position  : > "
+        f"{position_config['crop_save_ratio']:.1%} of conveyor"
+    )
     print(f"wall_time        : {processing_wall_seconds:.3f} s")
     print(
         f"wall_clock_speed : "

@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { Message } from '@arco-design/web-vue'
 import { http, toErrorMessage } from '@/api/http'
-import { captureCalibrationFrame, runAlgorithmCalibration } from '@/api/algorithm'
+import { captureCalibrationFrame, getCalibrationConfig, runAlgorithmCalibration, saveCalibrationConfig } from '@/api/algorithm'
 import { normalizeReportUrl } from '@/utils/reportPath'
 import { formatChinaDateTime } from '@/utils/time'
 import { logUserAction } from '@/utils/operationLogger'
@@ -64,8 +64,20 @@ function cleanCalibrationErrorMessage(message: string): string {
 
 const loading = ref(false)
 const actionLoading = ref(false)
+const realLengthMm = ref<number | null>(null)
+const realLengthSaving = ref(false)
 const status = ref<any | null>(null)
 const lastResult = ref<any | null>(null)
+const cameraWidth = ref(960)
+const cameraHeight = ref(540)
+const cameraFps = ref(25)
+const marginConfig = reactive({
+  side_margin_ratio: 0.13,
+  vertical_margin_ratio: 0.05,
+  tracking_start_ratio: 0.4,
+  crop_save_ratio: 0.7,
+})
+const marginSaving = ref(false)
 
 const calibrationForm = reactive<CalibrationFormState>({
   enabled: false,
@@ -262,6 +274,44 @@ function applyCalibrationData(payload: any) {
   )
 }
 
+async function loadCameraSettings() {
+  try {
+    const resp = await http.get('/api/camera_yzt/settings')
+    const settings = resp.data || {}
+    cameraWidth.value = Number(settings.width) || 960
+    cameraHeight.value = Number(settings.height) || 540
+    cameraFps.value = Number(settings.fps) || 25
+  } catch (err) {
+    // 摄像头设置读取失败时使用与后端一致的默认分辨率，保证页面仍可操作。
+    cameraWidth.value = 960
+    cameraHeight.value = 540
+    cameraFps.value = 25
+  }
+}
+
+async function loadMarginConfig(): Promise<void> {
+  try {
+    const resp = await http.get('/api/calibration/margin-config')
+    for (const key of Object.keys(marginConfig) as Array<keyof typeof marginConfig>) {
+      if (resp.data?.[key] !== undefined) marginConfig[key] = Number(resp.data[key])
+    }
+  } catch (err) {
+    console.warn('[VisualCalibration] load margin config failed:', err)
+  }
+}
+
+async function saveMarginConfig(): Promise<void> {
+  marginSaving.value = true
+  try {
+    await http.post('/api/calibration/margin-config', { ...marginConfig })
+    Message.success('检测区域参数已保存，后续算法将使用最新配置')
+  } catch (err) {
+    Message.error(toErrorMessage(err) || '检测区域参数保存失败')
+  } finally {
+    marginSaving.value = false
+  }
+}
+
 async function loadStatus(silent = false) {
   if (!silent) {
     logUserAction({
@@ -317,11 +367,16 @@ async function captureCalibration() {
   })
   actionLoading.value = true
   try {
+    // 抓拍前重新读取，确保刚在摄像头设置页保存的分辨率立即生效。
+    await loadCameraSettings()
     // 走 api 封装：内置 5 分钟 timeout，避免 http.ts 全局 15000ms 超时。
     // 后端会复用 camera_yzt 链路自动启动树莓派、通知推流、抓帧、停止。
     const resp = await captureCalibrationFrame({
       timeout: 30,
       stop_after_capture: true,
+      width: cameraWidth.value,
+      height: cameraHeight.value,
+      fps: cameraFps.value,
     })
     lastResult.value = resp.data || {}
     applyCalibrationData(lastResult.value)
@@ -388,6 +443,7 @@ async function runCalibration() {
       camera_id: 'default',
       device: 'cuda',
       overwrite: true,
+      real_length_mm: Number(realLengthMm.value),
     })
     lastResult.value = { ...(lastResult.value || {}), ...(resp.data || {}) }
     if (resp.data?.ok === false) {
@@ -461,7 +517,28 @@ function formatMatrixCell(cell: any): string {
 
 onMounted(() => {
   loadStatus(true)
+  loadCameraSettings()
+  loadMarginConfig()
+  getCalibrationConfig().then((resp) => { realLengthMm.value = resp.data.real_length_mm })
 })
+
+async function saveRealLength() {
+  const value = Number(realLengthMm.value)
+  if (!Number.isFinite(value) || value <= 0) {
+    Message.warning('请输入大于 0 的传送带真实长度')
+    return
+  }
+  realLengthSaving.value = true
+  try {
+    const resp = await saveCalibrationConfig(value)
+    realLengthMm.value = resp.data.real_length_mm
+    Message.success('传送带真实长度已保存')
+  } catch (err) {
+    Message.error('保存传送带真实长度失败：' + toErrorMessage(err))
+  } finally {
+    realLengthSaving.value = false
+  }
+}
 </script>
 
 <template>
@@ -545,8 +622,8 @@ onMounted(() => {
             <span>分辨率</span>
             <code>
               {{
-                calibrationForm.image_width && calibrationForm.image_height
-                  ? `${calibrationForm.image_width} × ${calibrationForm.image_height}`
+                cameraWidth && cameraHeight
+                  ? `${cameraWidth} × ${cameraHeight}`
                   : '--'
               }}
             </code>
@@ -583,6 +660,32 @@ onMounted(() => {
             刷新状态
           </a-button>
         </a-space>
+        <a-space wrap class="calibration-length-row">
+          <span class="calibration-input-label">请输入传送带长度</span>
+          <a-input-number
+            v-model="realLengthMm"
+            :min="0.01"
+            :precision="2"
+            :disabled="actionLoading"
+            placeholder="传送带长边真实长度"
+          />
+          <span>毫米</span>
+          <a-button
+            type="primary"
+            :loading="realLengthSaving"
+            :disabled="actionLoading"
+            @click="saveRealLength"
+          >确定</a-button>
+        </a-space>
+        <div class="calibration-margin-title">请输入检测区域 ratio</div>
+        <a-space wrap class="calibration-margin-row">
+          <a-input-number v-model="marginConfig.side_margin_ratio" :min="0" :max="2" :precision="4" placeholder="左右边缘比例" />
+          <a-input-number v-model="marginConfig.vertical_margin_ratio" :min="0" :max="2" :precision="4" placeholder="上下边缘比例" />
+          <a-input-number v-model="marginConfig.tracking_start_ratio" :min="0" :max="1" :precision="4" placeholder="跟踪开始比例" />
+          <a-input-number v-model="marginConfig.crop_save_ratio" :min="0" :max="1" :precision="4" placeholder="裁剪保存比例" />
+          <a-button type="primary" :loading="marginSaving" @click="saveMarginConfig">确定</a-button>
+        </a-space>
+        <div class="calibration-margin-hint">左右边缘比例、上下边缘比例、跟踪开始比例、裁剪保存比例</div>
       </a-card>
     </div>
 
@@ -619,6 +722,34 @@ onMounted(() => {
 
         <div class="calibration-image-card">
           <div class="calibration-image-head">
+            <span class="calibration-image-title">皮带 / 掩膜图</span>
+            <span class="calibration-image-tag">belt-mask</span>
+          </div>
+          <div
+            v-if="calibrationForm.belt_mask_path"
+            class="calibration-thumb-box"
+            title="双击打开大图"
+            @dblclick="openCalibrationImagePreviewByKey('belt-mask')"
+          >
+            <img
+              :src="
+                normalizeStaticUrl(
+                  calibrationForm.belt_mask_url ||
+                    calibrationForm.belt_mask_path,
+                )
+              "
+              alt="皮带 / 掩膜图"
+              class="calibration-thumb-img"
+            />
+          </div>
+          <a-empty v-else description="暂无皮带 / 掩膜图" />
+          <div class="calibration-image-path">
+            {{ calibrationForm.belt_mask_path || '--' }}
+          </div>
+        </div>
+
+        <div class="calibration-image-card">
+          <div class="calibration-image-head">
             <span class="calibration-image-title">矫正预览图</span>
             <span class="calibration-image-tag">rectified</span>
           </div>
@@ -645,33 +776,6 @@ onMounted(() => {
           </div>
         </div>
 
-        <div class="calibration-image-card">
-          <div class="calibration-image-head">
-            <span class="calibration-image-title">皮带 / 掩膜图</span>
-            <span class="calibration-image-tag">belt-mask</span>
-          </div>
-          <div
-            v-if="calibrationForm.belt_mask_path"
-            class="calibration-thumb-box"
-            title="双击打开大图"
-            @dblclick="openCalibrationImagePreviewByKey('belt-mask')"
-          >
-            <img
-              :src="
-                normalizeStaticUrl(
-                  calibrationForm.belt_mask_url ||
-                    calibrationForm.belt_mask_path,
-                )
-              "
-              alt="皮带 / 掩膜图"
-              class="calibration-thumb-img"
-            />
-          </div>
-          <a-empty v-else description="暂无皮带 / 掩膜图" />
-          <div class="calibration-image-path">
-            {{ calibrationForm.belt_mask_path || '--' }}
-          </div>
-        </div>
       </div>
     </a-card>
 
@@ -791,6 +895,14 @@ onMounted(() => {
   margin: 0;
   color: #86909c;
 }
+.calibration-input-label,
+.calibration-margin-title,
+.calibration-margin-hint {
+  color: #4e5969;
+  font-size: 13px;
+}
+.calibration-margin-title { margin-top: 12px; margin-bottom: 8px; font-weight: 600; }
+.calibration-margin-hint { margin-top: 6px; color: #86909c; }
 .card-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);

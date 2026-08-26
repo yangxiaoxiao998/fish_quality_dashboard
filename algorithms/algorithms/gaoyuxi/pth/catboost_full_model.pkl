@@ -1,1 +1,0 @@
-../algorithms/gaoyuxi/pth/catboost_full_model.pkl

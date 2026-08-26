@@ -12,6 +12,7 @@ from sqlalchemy import select, and_
 from app.repositories.db import get_db
 from app.repositories import stats_repo
 from app.repositories.models import Stats5Min, Fish
+from app.services.fish_distribution_service import build_fixed_distribution
 from app.utils.time_utils import to_beijing
 
 router = APIRouter()
@@ -226,8 +227,8 @@ def stats_distribution(
     normal_count = 0
 
     for f in fishes:
-        bl = _finite_positive(getattr(f, "body_length", None))
-        bw = _finite_positive(getattr(f, "body_weight", None))
+        bl = _finite_positive(getattr(f, "body_length_cm", None))
+        bw = _finite_positive(getattr(f, "pred_weight_g", None))
         cf = _finite_positive(getattr(f, "condition_factor", None))
         if bl is not None:
             lengths.append(bl)
@@ -245,10 +246,10 @@ def stats_distribution(
             normal_count += 1
 
     return {
-        "length_distribution": build_dynamic_distribution(lengths, bins=10, digits=2),
-        "weight_distribution": build_dynamic_distribution(weights, bins=10, digits=1),
-        "condition_distribution": build_dynamic_distribution(conditions, bins=8, digits=3),
-        "length_weight_ratio": build_dynamic_distribution(ratios, bins=10, digits=3),
+        "length_distribution": build_fixed_distribution(lengths, "body_length_cm"),
+        "weight_distribution": build_fixed_distribution(weights, "body_weight_g"),
+        "condition_distribution": build_fixed_distribution(conditions, "condition_factor"),
+        "length_weight_ratio": build_fixed_distribution(ratios, "length_weight_ratio"),
         "abnormal_distribution": {
             "normal": normal_count,
             "abnormal": abnormal_count,

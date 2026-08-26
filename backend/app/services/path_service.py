@@ -53,11 +53,16 @@ def to_abs_data_path(path: str | Path | None) -> Path | None:
     """
     将数据库中的相对路径转换为 DATA_DIR 下的绝对路径。
 
-    输入：
-        1. None                            -> None
-        2. 相对路径                        -> DATA_DIR / path
-        3. DATA_DIR 下的绝对路径           -> 原样返回（resolve）
-        4. 不属于 DATA_DIR 的绝对路径      -> None
+    输入（与 resolve_data_path 一致的多形态支持，避免重复拼接 data/）：
+        1. None                                     -> None
+        2. ``data/<rel>``                           -> ``DATA_DIR / <rel>``
+        3. ``/data/<rel>``                          -> ``DATA_DIR / <rel>``
+        4. ``results/<rel>`` / ``/results/<rel>``   -> ``DATA_DIR / results/<rel>``
+        5. ``uploads/<rel>`` / ``/uploads/<rel>``   -> ``DATA_DIR / uploads/<rel>``
+        6. ``/static/<rel>``                        -> ``DATA_DIR / <rel>``
+        7. 其他相对路径                              -> ``DATA_DIR / <rel>``
+        8. 已是 ``DATA_DIR`` 下的绝对路径             -> 原样返回
+        9. 不属于 ``DATA_DIR`` 的绝对路径            -> None（防止路径穿越）
     """
     if path is None:
         return None
@@ -66,6 +71,10 @@ def to_abs_data_path(path: str | Path | None) -> Path | None:
         return None
 
     p = Path(path)
+
+    # 防路径穿越：拒绝包含 ``..`` 段的相对或绝对路径。
+    if ".." in p.parts:
+        return None
 
     if p.is_absolute():
         try:
@@ -77,6 +86,27 @@ def to_abs_data_path(path: str | Path | None) -> Path | None:
     s = p.as_posix().lstrip("/")
     if not s:
         return None
+
+    # 兼容与 resolve_data_path 一致的形态：
+    # ``data/<rel>`` 视为相对于 DATA_DIR 子目录的相对路径，
+    # 不应继续拼到 DATA_DIR 上形成 ``DATA_DIR/data/<rel>``。
+    if s.startswith("data/"):
+        s = s[len("data/"):]
+        if not s:
+            return None
+
+    # 防路径穿越：再次校验（data/../xxx 已被剥离 data/ 后形成 ../xxx）
+    if ".." in Path(s).parts:
+        return None
+
+    # ``results/<rel>`` 直接挂在 DATA_DIR 下。
+    if s.startswith("results/"):
+        return DATA_DIR / s
+
+    # ``uploads/<rel>`` 也挂在 DATA_DIR 下。
+    if s.startswith("uploads/"):
+        return DATA_DIR / s
+
     return DATA_DIR / s
 
 

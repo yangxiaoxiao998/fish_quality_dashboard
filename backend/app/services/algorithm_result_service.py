@@ -55,6 +55,15 @@ def _maybe_str(value: Any) -> str | None:
     return str(value)
 
 
+def _measurement_length_fields(item: dict[str, Any], *, is_done: bool) -> tuple[float | None, float | None]:
+    """Keep full length and no-tail length as separate measurements."""
+    if not is_done:
+        return None, None
+    full_length = _maybe_float(item.get("body_length_cm"))
+    no_tail_length = _maybe_float(item.get("body_length_no_tail_cm"))
+    return full_length, no_tail_length
+
+
 def _set_if_has(obj: Any, field: str, value: Any) -> bool:
     if hasattr(obj, field):
         setattr(obj, field, value)
@@ -142,6 +151,10 @@ def pipeline_result_to_video_task_fields(payload: dict[str, Any]) -> dict[str, A
         # 算法新字段
         "original_input_video": _maybe_str(payload.get("original_input_video")),
         "input_video": _path_to_project_relative(payload.get("input_video")),
+        "video_duration_seconds": _maybe_float(payload.get("video_duration_seconds")),
+        "processing_duration_seconds": _maybe_float(
+            payload.get("processing_duration_seconds") or payload.get("processing_seconds")
+        ),
         "failed_stage": _maybe_str(payload.get("failed_stage")),
         "error_message": _maybe_str(payload.get("error_message")),
         "result_dir": _path_to_project_relative(result_dir),
@@ -177,6 +190,9 @@ def pipeline_result_to_video_task_fields(payload: dict[str, Any]) -> dict[str, A
             text = ""
         fields["last_error"] = text or fields["failed_stage"] or "algorithm task failed"
 
+    # Older pipeline results did not carry timing fields. Keep import
+    # compatible; the task status writer will fill processing duration.
+
     return fields
 
 
@@ -193,6 +209,13 @@ def upsert_video_task_from_payload(db: Session, payload: dict[str, Any]) -> Any:
         db.add(obj)
 
     for key, value in fields.items():
+        if key == "source_path" and getattr(obj, "source_path", None):
+            continue
+        # Older pipeline results do not contain timing fields. Do not erase
+        # values already captured by the task lifecycle in that case.
+        if key in {"video_duration_seconds", "processing_duration_seconds"}:
+            if value is None and getattr(obj, key, None) is not None:
+                continue
         _set_if_has(obj, key, value)
 
     return obj
@@ -204,11 +227,12 @@ def pipeline_fish_to_db_fields(item: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("fish item 缺少 video_id")
 
     status = _normalize_status(item.get("status"))
-    is_done = status == "done"
+    # pipeline 的结果文件使用 complete 表示完整鱼，数据库旧流程使用
+    # done；两者都代表已经完成五维测量。
+    is_done = status in {"done", "complete"}
 
-    body_length_cm = _maybe_float(item.get("body_length_cm")) if is_done else None
-    body_length_no_tail_cm = (
-        _maybe_float(item.get("body_length_no_tail_cm")) if is_done else None
+    body_length_cm, body_length_no_tail_cm = _measurement_length_fields(
+        item, is_done=is_done
     )
     body_height_cm = _maybe_float(item.get("body_height_cm")) if is_done else None
     pred_weight_g = _maybe_float(item.get("pred_weight_g")) if is_done else None
@@ -236,9 +260,12 @@ def pipeline_fish_to_db_fields(item: dict[str, Any]) -> dict[str, Any]:
         "body_length_no_tail_cm": body_length_no_tail_cm,
         "body_height_cm": body_height_cm,
         "pred_weight_g": pred_weight_g,
+        "hex_color": _maybe_str(item.get("hex_color")),
         "condition_factor": condition_factor,
         "surface_damage_ratio": surface_damage_ratio,
-        "status": status,
+        # 对外数据库状态统一为 done/incomplete/failed；pipeline 的
+        # complete 只保留在结果 JSON 中，避免旧查询只认 done 时漏统计。
+        "status": "done" if status == "complete" else status,
         "error_message": _maybe_str(item.get("error_message")) or "",
 
         # 旧模型兼容字段
@@ -293,7 +320,7 @@ def import_pipeline_result_payload_to_db(
     fish_imported = 0
     fish_skipped = 0
 
-    if status == "done":
+    if status in {"done", "complete"}:
         for item in payload.get("fish") or []:
             if not isinstance(item, dict):
                 fish_skipped += 1

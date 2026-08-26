@@ -3,13 +3,16 @@
     <!-- 顶部Header -->
     <div class="admin-header">
       <div class="header-right">
+        <button v-if="isAdministratorRole" class="nav-btn" @click="leaveAdministratorMode">
+          退出管理员
+        </button>
         <button 
           class="nav-btn" 
           :class="{ active: isDashboard }" 
           @click="goToDashboard"
         >
           <IconDesktop />
-          数据大屏
+           返回首页
         </button>
         <button 
           class="nav-btn" 
@@ -41,13 +44,14 @@
           </div>
           <div
             class="menu-item"
-            :class="{ active: currentRoute === 'AdminVideoHistory' }"
-            @click="goToPage('video-history')"
+            :class="{ active: currentRoute === 'AdminReportOverview' }"
+            @click="goToPage('report-overview')"
           >
-            <IconVideoCamera />
-            <span>视频历史记录</span>
+            <IconBarChart />
+            <span>报表总览</span>
           </div>
           <div
+            v-if="isAdministratorRole"
             class="menu-item"
             :class="{ active: currentRoute === 'AdminSystemOps' || currentRoute === 'AdminPlatformUsageReport' || currentRoute === 'AdminOperationLogReport' }"
             @click="goToPage('system-ops')"
@@ -56,6 +60,7 @@
             <span>系统运维</span>
           </div>
           <div
+            v-if="isAdministratorRole"
             class="menu-item"
             :class="{ active: currentRoute === 'AdminSystemSettings' }"
             @click="goToPage('system-settings')"
@@ -80,9 +85,9 @@ import { useRouter, useRoute } from 'vue-router'
 import {
   IconDesktop,
   IconSettings,
-  IconVideoCamera,
   IconBarChart
 } from '@arco-design/web-vue/es/icon'
+import { administratorRole, requestTechnicalDebugAccess, setAdministrator } from '@/utils/technicalDebugAuth'
 
 // 注：原代码使用了 <IconFish /> 但 arco-design/web-vue 并不导出该组件，
 // 容易在生产构建时出现 Vue 解析告警。这里改用 FontAwesome 的 fa-fish。
@@ -100,8 +105,14 @@ const router = useRouter()
 const route = useRoute()
 
 const currentRoute = computed(() => route.name as string)
-const isDashboard = computed(() => route.path === '/')
+const isDashboard = computed(() => route.path === '/dashboard')
 const isAdmin = computed(() => route.path.startsWith('/admin'))
+const isAdministratorRole = administratorRole
+
+function leaveAdministratorMode(): void {
+  setAdministrator(false)
+  window.location.reload()
+}
 
 function goToDashboard() {
   router.push('/')
@@ -112,7 +123,12 @@ function goToAdmin() {
 }
 
 function goToPage(page: string) {
-  router.push(`/admin/${page}`)
+  const target = `/admin/${page}`
+  if (page === 'system-ops' || page === 'system-settings') {
+    requestTechnicalDebugAccess(target)
+    return
+  }
+  router.push(target)
 }
 </script>
 

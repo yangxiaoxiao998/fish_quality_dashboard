@@ -81,6 +81,7 @@ CHART_KEYS = [
     "chart_body_weight_distribution",
     "chart_condition_factor_distribution",
     "chart_surface_damage_distribution",
+    "chart_large_yellow_croaker_body",
 ]
 
 
@@ -91,24 +92,16 @@ CHART_KEYS = [
 #  - 高度从 3.2 缩到 2.90，避免撑爆单元格
 #  - 安全边距 0.18 inch，确保图片四周留白
 REPORT_CHART_MAX_WIDTH_INCH = 5.30
-REPORT_CHART_MAX_HEIGHT_INCH = 2.90
+REPORT_CHART_MAX_HEIGHT_INCH = 3.20
 REPORT_CHART_CELL_PADDING_INCH = 0.18
+FIXED_BODY_DEMO_HEIGHT_INCH = 3.6 / 2.54
 
 
 # ----------------- 模板路径 -----------------
 
 def get_template_path() -> Path:
-    """日报模板路径。优先 docs/data_docs/report_word_template.docx，兜底 detection_daily_report_template.docx。"""
-    preferred = Path(__file__).resolve().parents[3] / "docs" / "data_docs" / "report_word_template.docx"
-    if preferred.exists():
-        return preferred
-    p = DATA_DIR / "reports" / "templates" / "detection_daily_report_template.docx"
-    if p.exists():
-        return p
-    alt = Path(__file__).resolve().parents[3] / "data" / "reports" / "templates" / "detection_daily_report_template.docx"
-    if alt.exists():
-        return alt
-    return preferred
+    """日报和视频报表共用的固定模板路径。"""
+    return PROJECT_ROOT / "backend" / "app" / "templates" / "report_word_template.docx"
 
 
 # ----------------- 图片尺寸工具 -----------------
@@ -343,7 +336,7 @@ def _iter_all_paragraphs(container) -> list:
     return result
 
 
-def _strip_chart_caption_paragraphs(doc) -> int:
+def _strip_chart_caption_paragraphs(doc, *, remove_fixed_caption: bool = True) -> int:
     """删除 docx 中 "图 N：xxx" 标题段落。
 
     模板里图片前后有形如 "图 1：鱼体长度分布图" 的标题段；
@@ -365,7 +358,7 @@ def _strip_chart_caption_paragraphs(doc) -> int:
             continue
         if not text:
             continue
-        if pat.match(text) or pat2.match(text):
+        if pat.match(text) or (remove_fixed_caption and pat2.match(text)):
             candidates.append(p)
     for table in doc.tables:
         for row in table.rows:
@@ -377,7 +370,7 @@ def _strip_chart_caption_paragraphs(doc) -> int:
                         continue
                     if not text:
                         continue
-                    if pat.match(text) or pat2.match(text):
+                    if pat.match(text) or (remove_fixed_caption and pat2.match(text)):
                         candidates.append(p)
     # 页眉 / 页脚 / 嵌套 cell 内的 caption 也都清理
     try:
@@ -385,14 +378,14 @@ def _strip_chart_caption_paragraphs(doc) -> int:
             for container in (section.header, section.footer):
                 for p in list(container.paragraphs):
                     text = "".join(r.text or "" for r in p.runs).strip()
-                    if pat.match(text) or pat2.match(text):
+                    if pat.match(text) or (remove_fixed_caption and pat2.match(text)):
                         candidates.append(p)
                 for table in container.tables:
                     for row in table.rows:
                         for cell in row.cells:
                             for p in list(cell.paragraphs):
                                 text = "".join(r.text or "" for r in p.runs).strip()
-                                if pat.match(text) or pat2.match(text):
+                                if pat.match(text) or (remove_fixed_caption and pat2.match(text)):
                                     candidates.append(p)
     except Exception:
         pass
@@ -433,6 +426,8 @@ def render_report_docx(
     shutil.copy2(str(template_path), str(out_path))
     doc = Document(str(out_path))
 
+    report_name = str(context.get("report_name") or "").strip()
+
     # 文字替换（递归所有段落）
     def replace_text_in_paragraph(paragraph) -> None:
         for run in paragraph.runs:
@@ -442,6 +437,8 @@ def render_report_docx(
                     run.text = run.text.replace(token, str(v))
         # 跨 run 残留处理：把整段 join 替换后再写回第一个 run
         full_text = "".join(r.text for r in paragraph.runs)
+        if report_name and "鱼质检测分析系统" in full_text:
+            full_text = full_text.replace("鱼质检测分析系统", report_name)
         for k, v in context.items():
             token = "{{" + k + "}}"
             if token in full_text:
@@ -460,7 +457,7 @@ def render_report_docx(
 
     # 1.5) 删除模板中 "图 N：xxx" 标题段落（caption），避免挤占图片空间
     try:
-        removed = _strip_chart_caption_paragraphs(doc)
+        removed = _strip_chart_caption_paragraphs(doc, remove_fixed_caption=False)
         logger.info(f"[docx] 已删除 caption 段落 {removed} 个")
     except Exception as exc:
         logger.warning(f"[docx] 删除 caption 段落失败: {exc}")
@@ -469,6 +466,8 @@ def render_report_docx(
     for key, chart_path in chart_paths.items():
         token = "{{" + key + "}}"
         replaced_count = _replace_chart_placeholder(doc, token, chart_path)
+        if replaced_count == 0 and key == "chart_large_yellow_croaker_body":
+            replaced_count = _replace_fixed_demo_caption(doc, chart_path)
         if replaced_count == 0:
             logger.warning(f"[docx] 未找到图片占位符 {token}")
 
@@ -481,6 +480,36 @@ def render_report_docx(
         logger.warning(f"[docx] 保存前删除 caption 段落失败: {exc}")
 
     doc.save(str(out_path))
+
+
+def _replace_fixed_demo_caption(doc: Document, image_path: Path) -> int:
+    """模板旧版固定图单元格只有 caption 时，直接把该 cell 作为图片占位区。"""
+    if not image_path or not Path(image_path).exists():
+        return 0
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if "大黄鱼形体指标测量示意图" not in cell.text:
+                    continue
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.text = ""
+                paragraph = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _allow_chart_cell_row_to_expand(cell)
+                # Keep the fixed demo image identical to the video report:
+                # 5.8in wide with a fixed 3.6cm row height.
+                width, _ = calc_fit_image_size(
+                    Path(image_path),
+                    5.8,
+                    FIXED_BODY_DEMO_HEIGHT_INCH,
+                )
+                height = round(FIXED_BODY_DEMO_HEIGHT_INCH, 3)
+                paragraph.add_run().add_picture(
+                    str(image_path), width=Inches(width), height=Inches(height)
+                )
+                return 1
+    return 0
 
 
 def _allow_chart_cell_row_to_expand(cell) -> None:
@@ -802,13 +831,19 @@ def _daily_fish_dicts(
 
     out: list[dict] = []
     for f in rows:
+        body_length = getattr(f, "body_length_cm", None)
+        no_tail_length = getattr(f, "body_length_no_tail_cm", None)
+        body_height = getattr(f, "body_height_cm", None)
         out.append(
             {
-                "body_length_cm": getattr(f, "body_length_cm", None),
-                "body_length_no_tail_cm": getattr(f, "body_length_without_tail", None),
+                "body_length_cm": body_length,
+                "body_length_no_tail_cm": no_tail_length,
+                "body_height_cm": body_height,
                 "pred_weight_g": getattr(f, "pred_weight_g", None),
                 "condition_factor": getattr(f, "condition_factor", None),
                 "surface_damage_ratio": getattr(f, "surface_damage_ratio", None),
+                "fish_id": getattr(f, "fish_id", None),
+                "track_id": getattr(f, "track_id", None),
                 "status": getattr(f, "status", None),
                 "video_id": getattr(f, "video_id", None),
             }
@@ -837,7 +872,7 @@ def generate_daily_fish_quality_docx_and_pdf(
     template_path = get_template_path()
     if not template_path.exists():
         raise FileNotFoundError(
-            f"日报模板不存在：{template_path}（请放入 data/reports/templates/detection_daily_report_template.docx）"
+            f"日报模板不存在：{template_path}"
         )
 
     placeholders_in_template = check_template_placeholders(template_path)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import date, datetime, time
 from typing import Any
 
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.repositories.models import Fish, VideoTask
 from app.services.path_service import to_static_url
+from app.services.path_service import to_abs_data_path
 from app.services.fish_id_service import (
     derive_fish_display_id,
     derive_fish_short_id,
@@ -19,6 +21,7 @@ from app.services.report_format_utils import (
     has_surface_damage,
     normalize_ratio_percent,
 )
+from app.services.fish_distribution_service import build_fixed_distribution
 from app.utils.time_utils import BEIJING_TZ
 from app.utils.timezone import format_china_datetime
 from app.paths import DATA_DIR, RESULTS_DIR
@@ -106,22 +109,19 @@ def _avg(values: list[Any]) -> float | None:
 
 
 def _fish_length_cm(f: Fish) -> float | None:
-    return getattr(f, "body_length_cm", None) or getattr(f, "body_length", None)
+    return getattr(f, "body_length_cm", None)
 
 
 def _fish_length_no_tail_cm(f: Fish) -> float | None:
-    return (
-        getattr(f, "body_length_no_tail_cm", None)
-        or getattr(f, "body_length_without_tail", None)
-    )
+    return getattr(f, "body_length_no_tail_cm", None)
 
 
 def _fish_height_cm(f: Fish) -> float | None:
-    return getattr(f, "body_height_cm", None) or getattr(f, "body_height", None)
+    return getattr(f, "body_height_cm", None)
 
 
 def _fish_weight_g(f: Fish) -> float | None:
-    return getattr(f, "pred_weight_g", None) or getattr(f, "body_weight", None)
+    return getattr(f, "pred_weight_g", None)
 
 
 def _fish_error_message(f: Fish) -> str | None:
@@ -149,17 +149,19 @@ _NORMAL_DAMAGE_KEYS = {"无", "正常", "none", "None", "", "无明显破损"}
 
 
 def _is_abnormal(fish: Fish) -> bool:
-    """判定一条鱼"异常"——优先 surface_damage_ratio > 0，兼容旧字符串字段。"""
+    """异常鱼定义为破损占比超过 50%。"""
     if fish is None:
         return False
     pct = normalize_ratio_percent(fish.surface_damage_ratio)
-    if pct is not None and pct > 0:
-        return True
-    # 兼容旧数据：字符串字段标记为异常
-    sd = fish.surface_damage
-    if sd and sd not in _NORMAL_DAMAGE_KEYS:
+    if pct is not None and pct > 50.0:
         return True
     return False
+
+
+def _record_is_abnormal(record: dict) -> bool:
+    """JSON 算法结果的异常鱼判定，与数据库口径保持一致。"""
+    pct = normalize_ratio_percent(record.get("surface_damage_ratio"))
+    return pct is not None and pct > 50.0
 
 
 def _is_partial(fish: Fish) -> bool:
@@ -229,32 +231,43 @@ def get_fish_quality_summary(
 
     # 计算汇总
     total_video = len(video_ids)
+    total_video_duration = round(
+        sum(
+            float(v.video_duration_seconds or 0)
+            for v in video_tasks
+            if v.video_duration_seconds is not None
+        ),
+        2,
+    )
+    if total_video_duration <= 0:
+        total_video_duration = _query_video_total_duration(db, video_tasks)
     total_fish = len(fishes)
-    valid_fish = len([f for f in fishes if (f.status or "") == "done"])
+    valid_fish = len([f for f in fishes if (f.status or "").lower() in {"done", "complete"}])
     abnormal_fish = sum(1 for f in fishes if _is_abnormal(f))
     surface_damage_fish_total = sum(1 for f in fishes if has_surface_damage(f.surface_damage_ratio))
 
-    # 整合 DB Fish + JSON fish records 做均值计算（更准确）
+    # 优先使用 pipeline_result.json，避免数据库旧字段与最终算法结果重复或不一致。
     all_records: list[dict] = []
-    for f in fishes:
-        all_records.append(
-            {
-                "body_length_cm": _fish_length_cm(f),
-                "body_length_no_tail_cm": _fish_length_no_tail_cm(f),
-                "body_height_cm": _fish_height_cm(f),
-                "body_weight_g": _fish_weight_g(f),
-                "condition_factor": getattr(f, "condition_factor", None),
-                "surface_damage_ratio": getattr(f, "surface_damage_ratio", None),
-            }
-        )
-    for vid, info in cache.items():
-        for rec in info.get("fish_records", []):
-            all_records.append(rec)
+    if cache:
+        for info in cache.values():
+            all_records.extend(info.get("fish_records", []))
+    else:
+        for f in fishes:
+            all_records.append(
+                {
+                    "body_length_cm": _fish_length_cm(f),
+                    "body_length_no_tail_cm": _fish_length_no_tail_cm(f),
+                    "body_height_cm": _fish_height_cm(f),
+                    "body_weight_g": _fish_weight_g(f),
+                    "condition_factor": getattr(f, "condition_factor", None),
+                    "surface_damage_ratio": getattr(f, "surface_damage_ratio", None),
+                }
+            )
 
     # 如果 DB 完全没有 fish 但 JSON 有，total_fish/complete/incomplete/failed 来自 JSON
     db_fish_count = len(fishes)
     json_fish_count = sum(len(v.get("fish_records", [])) for v in cache.values())
-    if db_fish_count == 0 and json_fish_count > 0:
+    if json_fish_count > 0:
         total_fish = json_fish_count
         valid_fish = sum(
             1
@@ -278,17 +291,28 @@ def get_fish_quality_summary(
             1
             for v in cache.values()
             for r in v.get("fish_records", [])
-            if (r.get("surface_damage_ratio") or 0) > 0
+            if normalize_ratio_percent(r.get("surface_damage_ratio")) not in (None, 0)
+        )
+        abnormal_fish = sum(
+            1 for v in cache.values() for r in v.get("fish_records", [])
+            if _record_is_abnormal(r)
         )
 
     metric_complete_rate = (valid_fish / total_fish) if total_fish else 0.0
+    if json_fish_count > 0:
+        abnormal_fish = sum(
+            1 for v in cache.values() for r in v.get("fish_records", [])
+            if _record_is_abnormal(r)
+        )
+    else:
+        abnormal_fish = sum(1 for f in fishes if _is_abnormal(f))
     abnormal_fish_rate = (abnormal_fish / total_fish) if total_fish else 0.0
     surface_damage_rate = (
         surface_damage_fish_total / total_fish if total_fish else 0.0
     )
 
     # 修复 incomplete_fish / failed_fish 字段（之前没计算）
-    if db_fish_count > 0:
+    if db_fish_count > 0 and json_fish_count == 0:
         incomplete_fish = sum(1 for f in fishes if (f.status or "") == "incomplete")
         failed_fish = sum(1 for f in fishes if (f.status or "") == "failed")
     # 兜底：db_fish_count=0 且 json_fish_count=0 时上面两个分支都不会跑，
@@ -297,16 +321,19 @@ def get_fish_quality_summary(
         incomplete_fish = 0
     if "failed_fish" not in locals():
         failed_fish = 0
+    if json_fish_count == 0:
+        abnormal_fish = sum(1 for f in fishes if _is_abnormal(f))
 
     return {
         "total_video": total_video,
+        "total_video_duration": total_video_duration,
         "total_fish": total_fish,
         "valid_fish": valid_fish,
         "abnormal_fish": abnormal_fish,
         "complete_fish": locals().get("valid_fish", 0),  # 兼容：valid_fish == complete_fish
         "incomplete_fish": incomplete_fish,
         "failed_fish": failed_fish,
-        "surface_damage_count": abnormal_fish,
+        "surface_damage_count": surface_damage_fish_total,
         "surface_damage_fish_total": surface_damage_fish_total,
         "surface_damage_rate": surface_damage_rate,
         "metric_complete_rate": metric_complete_rate,
@@ -392,58 +419,26 @@ def get_fish_quality_charts(
     for v_info in json_cache.values():
         for r in v_info.get("fish_records", []):
             extra_records.append(r)
-    all_records_for_charts = []
-    for f in fishes:
-        all_records_for_charts.append(
+    if extra_records:
+        all_records_for_charts = extra_records
+    else:
+        all_records_for_charts = [
             {
-                "body_length_cm": f.body_length_cm,
-                "body_length_no_tail_cm": f.body_length_no_tail_cm,
+                "body_length_cm": _fish_length_cm(f),
+                "body_length_no_tail_cm": _fish_length_no_tail_cm(f),
                 "body_height_cm": f.body_height_cm,
                 "body_weight_g": f.pred_weight_g,
                 "condition_factor": f.condition_factor,
                 "surface_damage_ratio": f.surface_damage_ratio,
             }
-        )
-    for r in extra_records:
-        all_records_for_charts.append(r)
+            for f in fishes
+        ]
 
     length_values = [float(r.get("body_length_cm")) for r in all_records_for_charts if r.get("body_length_cm") is not None]
     no_tail_values = [float(r.get("body_length_no_tail_cm")) for r in all_records_for_charts if r.get("body_length_no_tail_cm") is not None]
     height_values = [float(r.get("body_height_cm")) for r in all_records_for_charts if r.get("body_height_cm") is not None]
     weight_values = [float(r.get("body_weight_g")) for r in all_records_for_charts if r.get("body_weight_g") is not None]
     condition_values = [float(r.get("condition_factor")) for r in all_records_for_charts if r.get("condition_factor") is not None]
-
-    length_buckets = [
-        (0, 15, "<15"),
-        (15, 20, "15-20"),
-        (20, 25, "20-25"),
-        (25, 30, "25-30"),
-        (30, 35, "30-35"),
-        (35, 40, "35-40"),
-        (40, 10**9, "40+"),
-    ]
-    height_buckets = [
-        (0, 5, "<5"),
-        (5, 10, "5-10"),
-        (10, 15, "10-15"),
-        (15, 20, "15-20"),
-        (20, 10**9, "20+"),
-    ]
-    weight_buckets = [
-        (0, 500, "<500"),
-        (500, 1000, "500-1000"),
-        (1000, 1500, "1000-1500"),
-        (1500, 2000, "1500-2000"),
-        (2000, 3000, "2000-3000"),
-        (3000, 10**9, "3000+"),
-    ]
-    condition_buckets = [
-        (0, 0.5, "<0.5"),
-        (0.5, 1.0, "0.5-1.0"),
-        (1.0, 1.5, "1.0-1.5"),
-        (1.5, 2.0, "1.5-2.0"),
-        (2.0, 10**9, "2.0+"),
-    ]
 
     damage_pcts: list[float] = []
     for f in fishes:
@@ -454,14 +449,6 @@ def get_fish_quality_charts(
         pct = normalize_ratio_percent(r.get("surface_damage_ratio"))
         if pct is not None:
             damage_pcts.append(pct)
-
-    damage_buckets = [
-        (0.0, 1.0, "0-1%"),
-        (1.0, 5.0, "1-5%"),
-        (5.0, 10.0, "5-10%"),
-        (10.0, 20.0, "10-20%"),
-        (20.0, 10**9, "20%+"),
-    ]
 
     video_rank: dict[str, int] = {}
     for f in fishes:
@@ -478,13 +465,13 @@ def get_fish_quality_charts(
 
     return {
         "fish_count_trend": fish_count_trend,
-        "body_length_distribution": _bucket(length_values, length_buckets),
-        "body_length_without_tail_distribution": _bucket(no_tail_values, length_buckets),
-        "body_height_distribution": _bucket(height_values, height_buckets),
-        "body_weight_distribution": _bucket(weight_values, weight_buckets),
-        "condition_factor_distribution": _bucket(condition_values, condition_buckets),
+        "body_length_distribution": build_fixed_distribution(length_values, "body_length_cm"),
+        "body_length_without_tail_distribution": build_fixed_distribution(height_values, "body_height_cm"),
+        "body_height_distribution": build_fixed_distribution(height_values, "body_height_cm"),
+        "body_weight_distribution": build_fixed_distribution(weight_values, "body_weight_g"),
+        "condition_factor_distribution": build_fixed_distribution(condition_values, "condition_factor"),
         # 第五张图：体表损伤占比分布（按百分比档）
-        "surface_damage_distribution": _bucket(damage_pcts, damage_buckets),
+        "surface_damage_distribution": build_fixed_distribution(damage_pcts, "surface_damage_percent"),
         "video_fish_rank": [
             {"video_id": k, "count": v}
             for k, v in sorted(video_rank.items(), key=lambda x: x[1], reverse=True)[:20]
@@ -526,8 +513,19 @@ def get_fish_quality_fishes(
         ).scalars().all()
     )
 
+    json_by_fish_id: dict[str, dict] = {}
+    if video_id:
+        payload = _read_pipeline_result_json(video_id) or {}
+        for record in payload.get("fish") or payload.get("fishes") or []:
+            if isinstance(record, dict):
+                key = record.get("fish_uid") or record.get("fish_id")
+                if key:
+                    json_by_fish_id[str(key)] = record
+
     items = []
     for f in fishes:
+        record = json_by_fish_id.get(str(f.fish_id), {})
+        crop_path = record.get("crop_image_path") or f.crop_image_path
         items.append({
             "fish_id": f.fish_id,
             "fish_display_id": derive_fish_display_id(f.fish_id),
@@ -535,13 +533,24 @@ def get_fish_quality_fishes(
             "video_id": f.video_id,
             "video_display_id": derive_video_display_id(f.video_id),
             "created_at": f.created_at.isoformat() if f.created_at else None,
-            "body_length": f.body_length,
-            "body_length_without_tail": f.body_length_without_tail,
-            "body_height": f.body_height,
-            "body_weight": f.body_weight,
-            "condition_factor": f.condition_factor,
+            "body_length": record.get("body_length_cm") if record else f.body_length_cm,
+            "body_length_without_tail": record.get("body_length_no_tail_cm") if record else f.body_length_no_tail_cm,
+            "body_height": record.get("body_height_cm") if record else f.body_height_cm,
+            "body_weight": record.get("pred_weight_g") if record else f.pred_weight_g,
+            "condition_factor": record.get("condition_factor") if record else f.condition_factor,
             "surface_damage": f.surface_damage,
-            "status": f.status,
+            "surface_damage_ratio": record.get("surface_damage_ratio") if record else f.surface_damage_ratio,
+            "hex_color": record.get("hex_color") or getattr(f, "hex_color", None),
+            "status": record.get("status") or f.status,
+            "track_id": record.get("track_id") if record else f.track_id,
+            "fish_uid": record.get("fish_uid") or f.fish_uid,
+            "frame_index": record.get("frame_index") if record else f.frame_index,
+            "crop_image_path": crop_path,
+            "crop_image_url": to_static_url(crop_path),
+            "body_length_cm": record.get("body_length_cm") if record else f.body_length_cm,
+            "body_length_no_tail_cm": record.get("body_length_no_tail_cm") if record else f.body_length_no_tail_cm,
+            "body_height_cm": record.get("body_height_cm") if record else f.body_height_cm,
+            "pred_weight_g": record.get("pred_weight_g") if record else f.pred_weight_g,
             "original_image_url": to_static_url(f.original_image_path),
             "corrected_image_url": to_static_url(f.corrected_image_path),
         })
@@ -569,17 +578,62 @@ def get_videos_by_date(db: Session, *, report_date: str) -> list[dict]:
     )
     rows = list(db.execute(stmt).scalars().all())
 
-    return [
-        {
-            "video_id": v.video_id,
-            "video_display_id": derive_video_display_id(v.video_id),
-            "source_type": v.source_type,
-            "status": v.status,
-            "total_fish": v.total_fish,
-            "created_at": v.created_at.isoformat() if v.created_at else None,
-        }
-        for v in rows
-    ]
+    items: list[dict] = []
+    for v in rows:
+        pipeline = _read_pipeline_result_json(v.video_id) or {}
+        video_duration = v.video_duration_seconds
+        if video_duration is None or float(video_duration) <= 0:
+            try:
+                video_duration = float(pipeline.get("video_duration_seconds"))
+            except (TypeError, ValueError):
+                video_duration = None
+        if video_duration is None or float(video_duration) <= 0:
+            source = pipeline.get("original_input_video") or pipeline.get("input_video")
+            path = to_abs_data_path(source) if source else None
+            if path and path.exists():
+                try:
+                    probe = subprocess.run(
+                        [
+                            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+                        ], capture_output=True, text=True, timeout=20, check=False,
+                    )
+                    video_duration = float(probe.stdout.strip())
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    video_duration = None
+        processing_duration = v.processing_duration_seconds
+        if processing_duration is None:
+            try:
+                processing_duration = float(
+                    pipeline.get("processing_duration_seconds")
+                    or pipeline.get("processing_seconds")
+                )
+            except (TypeError, ValueError):
+                processing_duration = None
+        items.append(
+            {
+                "video_id": v.video_id,
+                "video_display_id": derive_video_display_id(v.video_id),
+                "source_type": v.source_type,
+                "status": v.status,
+                "total_fish": v.total_fish,
+                "video_duration_seconds": video_duration,
+                "processing_duration_seconds": processing_duration,
+                "avg_body_length": _avg([
+                    r.get("body_length_cm")
+                    for r in (pipeline.get("fish") or [])
+                    if isinstance(r, dict)
+                    and str(r.get("status") or "").lower() in {"done", "complete"}
+                ]),
+                "avg_body_height": _avg([
+                    r.get("body_height_cm") for r in (pipeline.get("fish") or [])
+                    if isinstance(r, dict)
+                    and str(r.get("status") or "").lower() in {"done", "complete"}
+                ]),
+                "created_at": v.created_at.isoformat() if v.created_at else None,
+            }
+        )
+    return items
 
 
 # ----------------- pipeline_result.json 兜底读取 -----------------
@@ -669,25 +723,19 @@ def _get_or_load_pipeline_results(video_ids: list[str]) -> dict[str, dict]:
                 for r in raw_fish:
                     if not isinstance(r, dict):
                         continue
-                    # 鱼字段统一映射（多种命名）
+                    # 算法结果统一使用当前字段口径。
                     rec = {
-                        "body_length_cm": (
-                            r.get("body_length_cm")
-                            or r.get("body_length")
-                        ),
-                        "body_length_no_tail_cm": (
-                            r.get("body_length_no_tail_cm")
-                            or r.get("body_length_no_tail")
-                        ),
-                        "pred_weight_g": (
-                            r.get("pred_weight_g")
-                            or r.get("body_weight_g")
-                            or r.get("body_weight")
-                        ),
+                        "body_length_cm": r.get("body_length_cm"),
+                        "body_length_no_tail_cm": r.get("body_length_no_tail_cm"),
+                        "body_height_cm": r.get("body_height_cm"),
+                        "pred_weight_g": r.get("pred_weight_g"),
+                        "body_weight_g": r.get("pred_weight_g"),
                         "condition_factor": r.get("condition_factor"),
                         "surface_damage_ratio": r.get("surface_damage_ratio"),
                         "status": r.get("status"),
                         "video_id": r.get("video_id") or vid,
+                        "fish_id": r.get("fish_id") or r.get("fish_uid"),
+                        "track_id": r.get("track_id"),
                     }
                     fish_records.append(rec)
 
@@ -757,6 +805,7 @@ ALL_REPORT_PLACEHOLDERS: list[str] = [
     # 基础
     "report_date_cn", "report_no", "generated_at", "system_name",
     "report_type_name", "report_status_name",
+    "aquaculture_bin",
     # 视频任务概况
     "video_total", "upload_video_total", "rtsp_video_total",
     "done_video_total", "failed_video_total", "no_fish_video_total",
@@ -779,10 +828,11 @@ ALL_REPORT_PLACEHOLDERS: list[str] = [
     "chart_body_weight_distribution",
     "chart_condition_factor_distribution",
     "chart_surface_damage_distribution",
+    "chart_large_yellow_croaker_body",
     # 视频任务明细 1~5
     *[f"video_index_{i}" for i in range(1, 6)],
     *[f"video_id_{i}" for i in range(1, 6)],
-    *[f"video_source_type_{i}" for i in range(1, 6)],
+    *[f"aquaculture_bin_{i}" for i in range(1, 6)],
     *[f"video_status_{i}" for i in range(1, 6)],
     *[f"video_total_fish_{i}" for i in range(1, 6)],
     *[f"video_processed_fish_{i}" for i in range(1, 6)],
@@ -867,40 +917,81 @@ def _compute_video_total_duration_seconds(videos: list) -> float:
 
 
 def _query_video_total_duration(db: Session, videos: list) -> float:
-    """所有当天视频 frame_time_ms 最大值之和（秒）。"""
+    """计算当天视频文件时长总和，优先使用视频文件元数据。"""
     if not videos:
         return 0.0
-    from app.repositories.models import VideoFrame
-
-    video_ids = [v.video_id for v in videos if v.video_id]
-    if not video_ids:
-        return 0.0
-    max_ms_rows = list(
-        db.execute(
-            select(func.max(VideoFrame.frame_time_ms))
-            .where(VideoFrame.video_id.in_(video_ids))
-        ).all()
-    )
-    total_ms = 0
-    for (ms,) in max_ms_rows:
-        if ms is not None:
-            total_ms += int(ms)
-    return round(total_ms / 1000.0, 2)
+    total = 0.0
+    for video in videos:
+        source = to_abs_data_path(getattr(video, "source_path", None))
+        if source is None or not source.exists():
+            continue
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", str(source),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            value = float(result.stdout.strip())
+            if value > 0:
+                total += value
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+    return round(total, 2)
 
 
 def _query_avg_processing_seconds(videos: list) -> float:
-    """平均处理时长 = avg(finished_at - started_at) 秒。"""
+    """平均处理时长，过滤旧数据中的结束时间早于开始时间记录。"""
     pairs: list[float] = []
     for v in videos:
-        if v.started_at and v.finished_at:
-            delta = (v.finished_at - v.started_at).total_seconds()
+        end = v.finished_at or v.updated_at
+        if end is None:
+            continue
+        for start in (v.started_at, v.created_at):
+            if start is None:
+                continue
+            delta = (end - start).total_seconds()
             if delta > 0:
                 pairs.append(delta)
+                break
     return round(sum(pairs) / len(pairs), 2) if pairs else 0.0
 
 
 def _query_avg_fps(videos: list) -> float:
+    """读取任务 FPS；旧任务缺字段时从源视频流元数据补算。"""
     fps_list = [float(v.fps_estimate) for v in videos if v.fps_estimate is not None]
+    for video in videos:
+        if video.fps_estimate is not None:
+            continue
+        source = to_abs_data_path(getattr(video, "source_path", None))
+        if source is None or not source.exists():
+            continue
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=r_frame_rate",
+                    "-of", "default=noprint_wrappers=1:nokey=1", str(source),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            value = result.stdout.strip()
+            if "/" in value:
+                numerator, denominator = value.split("/", 1)
+                fps = float(numerator) / float(denominator)
+            else:
+                fps = float(value)
+            if fps > 0:
+                fps_list.append(fps)
+        except (OSError, ValueError, ZeroDivisionError, subprocess.TimeoutExpired):
+            continue
     return round(sum(fps_list) / len(fps_list), 2) if fps_list else 0.0
 
 
@@ -979,8 +1070,32 @@ def build_daily_report_context(
     summary["done_video_total"] = len(done_videos)
     summary["failed_video_total"] = len(failed_videos)
     summary["no_fish_video_total"] = len(no_fish_videos)
-    summary["total_video_duration"] = _query_video_total_duration(db, video_rows)
-    summary["avg_processing_seconds"] = _query_avg_processing_seconds(done_videos + failed_videos)
+    summary["total_video_duration"] = round(
+        sum(
+            float(v.video_duration_seconds or 0)
+            for v in video_rows
+            if v.video_duration_seconds is not None
+        ),
+        2,
+    )
+    if summary["total_video_duration"] <= 0:
+        summary["total_video_duration"] = _query_video_total_duration(db, video_rows)
+    summary["avg_processing_seconds"] = round(
+        sum(
+            float(v.processing_duration_seconds)
+            for v in done_videos + failed_videos
+            if v.processing_duration_seconds is not None
+        )
+        / max(
+            1,
+            sum(
+                1
+                for v in done_videos + failed_videos
+                if v.processing_duration_seconds is not None
+            ),
+        ),
+        2,
+    ) if any(v.processing_duration_seconds is not None for v in done_videos + failed_videos) else _query_avg_processing_seconds(done_videos + failed_videos)
     summary["avg_fps"] = _query_avg_fps(video_rows)
     summary["video_total"] = len(video_rows)
     summary["task_success_rate"] = (
@@ -996,9 +1111,29 @@ def build_daily_report_context(
             .order_by(Fish.created_at.desc())
         ).scalars().all()
     )
+    report_video_ids = [v.video_id for v in video_rows if v.video_id]
+    report_cache = _get_or_load_pipeline_results(report_video_ids)
+    records_by_id = {
+        str(record.get("fish_id")): record
+        for data in report_cache.values()
+        for record in data.get("fish_records", [])
+        if record.get("fish_id")
+    }
+    records_by_track = {
+        (str(record.get("video_id")), str(record.get("track_id"))): record
+        for data in report_cache.values()
+        for record in data.get("fish_records", [])
+        if record.get("track_id") is not None
+    }
+    for fish in fish_rows:
+        record = records_by_id.get(str(fish.fish_id)) or records_by_track.get(
+            (str(fish.video_id), str(fish.track_id))
+        )
+        if record and record.get("surface_damage_ratio") is not None:
+            fish.surface_damage_ratio = record["surface_damage_ratio"]
     total_fish = len(fish_rows)
-    valid_fish = [f for f in fish_rows if f.status == "done"]
-    partial_fish = [f for f in fish_rows if f.status == "processing"]
+    valid_fish = [f for f in fish_rows if str(f.status or "").lower() in {"done", "complete"}]
+    partial_fish = [f for f in fish_rows if str(f.status or "").lower() == "incomplete"]
     abnormal_fish_list = [f for f in fish_rows if _is_abnormal(f)]
     surface_damage_fish = [f for f in fish_rows if has_surface_damage(f.surface_damage_ratio)]
 
@@ -1019,11 +1154,46 @@ def build_daily_report_context(
     )
 
     # 核心指标
-    body_length = [float(f.body_length) for f in valid_fish if f.body_length is not None]
-    body_length_no_tail = [float(f.body_length_without_tail) for f in valid_fish if f.body_length_without_tail is not None]
-    body_height = [float(f.body_height) for f in valid_fish if f.body_height is not None]
-    body_weight = [float(f.body_weight) for f in valid_fish if f.body_weight is not None]
-    condition_factor = [float(f.condition_factor) for f in valid_fish if f.condition_factor is not None]
+    report_records = [
+        record
+        for video_data in report_cache.values()
+        for record in video_data.get("fish_records", [])
+    ]
+    if report_records:
+        record_statuses = [str(r.get("status") or "").lower() for r in report_records]
+        total_fish = len(report_records)
+        valid_count = sum(s in {"done", "complete"} for s in record_statuses)
+        partial_count = sum(s == "processing" for s in record_statuses)
+        abnormal_count = sum(_record_is_abnormal(r) for r in report_records)
+        damaged_count = sum(
+            normalize_ratio_percent(r.get("surface_damage_ratio")) not in (None, 0)
+            for r in report_records
+        )
+        summary["total_fish"] = total_fish
+        summary["fish_total"] = total_fish
+        summary["valid_fish_total"] = valid_count
+        summary["partial_fish_total"] = sum(s == "incomplete" for s in record_statuses)
+        summary["abnormal_fish_total"] = abnormal_count
+        summary["surface_damage_fish_total"] = damaged_count
+        summary["metric_complete_rate"] = valid_count / total_fish if total_fish else 0.0
+        summary["abnormal_fish_rate"] = abnormal_count / total_fish if total_fish else 0.0
+        summary["surface_damage_rate"] = damaged_count / total_fish if total_fish else 0.0
+        valid_fish = [f for f in valid_fish if f.status in {"done", "complete"}]
+    metric_records = [r for r in report_records if str(r.get("status") or "").lower() in {"done", "complete"}] or [
+        {
+            "body_length_cm": f.body_length_cm,
+            "body_length_no_tail_cm": f.body_length_no_tail_cm,
+            "body_height_cm": f.body_height_cm,
+            "pred_weight_g": f.pred_weight_g,
+            "condition_factor": f.condition_factor,
+        }
+        for f in valid_fish
+    ]
+    body_length = [float(r["body_length_cm"]) for r in metric_records if r.get("body_length_cm") is not None]
+    body_length_no_tail = [float(r["body_length_no_tail_cm"]) for r in metric_records if r.get("body_length_no_tail_cm") is not None]
+    body_height = [float(r["body_height_cm"]) for r in metric_records if r.get("body_height_cm") is not None]
+    body_weight = [float(r["pred_weight_g"]) for r in metric_records if r.get("pred_weight_g") is not None]
+    condition_factor = [float(r["condition_factor"]) for r in metric_records if r.get("condition_factor") is not None]
 
     metric_block = {
         "body_length": body_length,
@@ -1038,7 +1208,8 @@ def build_daily_report_context(
         db.execute(
             select(func.count())
             .select_from(__import__("app.repositories.models", fromlist=["DetectionReport"]).DetectionReport)
-            .where(__import__("app.repositories.models", fromlist=["DetectionReport"]).DetectionReport.report_date == report_date)
+        .where(__import__("app.repositories.models", fromlist=["DetectionReport"]).DetectionReport.report_date == report_date)
+        .where(__import__("app.repositories.models", fromlist=["DetectionReport"]).DetectionReport.report_type == "daily_fish_quality")
         ).scalar()
         or 0
     )
@@ -1068,7 +1239,7 @@ def build_daily_report_context(
         "done_video_total": summary["done_video_total"],
         "failed_video_total": summary["failed_video_total"],
         "no_fish_video_total": summary["no_fish_video_total"],
-        "total_video_duration": f"{summary['total_video_duration']:.2f}",
+        "total_video_duration": format_duration_with_unit(summary["total_video_duration"]),
         "avg_processing_seconds": f"{summary['avg_processing_seconds']:.2f}",
         "avg_fps": f"{summary['avg_fps']:.2f}",
         "task_success_rate": format_percent(
@@ -1108,6 +1279,7 @@ def build_daily_report_context(
         "chart_body_weight_distribution": "{{chart_body_weight_distribution}}",
         "chart_condition_factor_distribution": "{{chart_condition_factor_distribution}}",
         "chart_surface_damage_distribution": "{{chart_surface_damage_distribution}}",
+        "chart_large_yellow_croaker_body": "{{chart_large_yellow_croaker_body}}",
 
         # 视频任务明细 1~5
         **_build_video_rows_context(_query_top_videos(db, fish_rows, video_rows)),
@@ -1126,8 +1298,20 @@ def build_daily_report_context(
     return ensure_all_placeholders(ctx)
 
 
+def format_duration_with_unit(seconds: float | int | None) -> str:
+    value = float(seconds or 0)
+    if value < 60:
+        return f"{value:.2f}秒"
+    total = round(value)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}小时{minutes}分{secs}秒"
+    return f"{minutes}分{secs}秒"
+
+
 def _build_daily_conclusion(summary: dict, metric_block: dict) -> str:
-    """简单版本：基于核心指标自动生成 2~3 句结论。"""
+    """生成包含任务、指标质量和高破损风险的业务结论。"""
     fish_total = summary.get("fish_total", 0)
     if not fish_total:
         return "当日无检测数据，无可生成结论。"
@@ -1135,22 +1319,45 @@ def _build_daily_conclusion(summary: dict, metric_block: dict) -> str:
     abnormal_rate = summary.get("abnormal_fish_rate", 0.0)
     damage_rate = summary.get("surface_damage_rate", 0.0)
     valid_rate = summary.get("metric_complete_rate", 0.0)
+    video_total = summary.get("video_total", 0)
+    done_video_total = summary.get("done_video_total", 0)
+    duration = float(summary.get("total_video_duration", 0.0) or 0.0)
+    processing = float(summary.get("avg_processing_seconds", 0.0) or 0.0)
+
+    def format_duration(seconds: float) -> str:
+        hours, remainder = divmod(max(0, round(seconds)), 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}小时{minutes}分钟"
+        if minutes:
+            return f"{minutes}分钟{secs}秒"
+        return f"{secs}秒"
+
+    avg_height = _avg(metric_block.get("body_height") or [])
+    avg_weight = _avg(metric_block.get("body_weight") or [])
+    avg_condition = _avg(metric_block.get("condition_factor") or [])
     body_length = metric_block.get("body_length") or []
     avg_length = sum(body_length) / len(body_length) if body_length else 0.0
 
     parts: list[str] = []
     parts.append(
-        f"当日共检测鱼 {fish_total} 条，"
-        f"有效指标完整率 {valid_rate * 100:.2f}%，"
-        f"平均全长 {avg_length:.2f} cm。"
+        f"本日报覆盖 {video_total} 个视频任务，完成 {done_video_total} 个，"
+        f"累计视频时长 {format_duration(duration)}，平均处理耗时 {format_duration(processing)}。"
+    )
+    parts.append(
+        f"共检测鱼体 {fish_total} 条，测量指标完整率 {valid_rate * 100:.2f}%，"
+        f"平均无尾体长 {avg_length:.2f} cm，平均体高 {_fmt_or_dash(avg_height, 2)} cm，"
+        f"平均体重 {_fmt_or_dash(avg_weight, 2)} g，平均肥满度 {_fmt_or_dash(avg_condition, 3)}。"
     )
     if abnormal_rate > 0:
         parts.append(
-            f"异常鱼占比 {abnormal_rate * 100:.2f}%，"
-            f"其中体表损伤占比 {damage_rate * 100:.2f}%。"
+            f"破损占比超过 50% 的异常鱼占比 {abnormal_rate * 100:.2f}%，"
+            f"存在高破损风险，应优先复核异常鱼明细。"
         )
     else:
-        parts.append("当日未检出异常鱼，鱼体品质整体良好。")
+        parts.append(
+            f"未检出破损占比超过 50% 的异常鱼；所有鱼体中出现体表破损的比例为 {damage_rate * 100:.2f}%。"
+        )
 
     return " ".join(parts)
 
@@ -1164,7 +1371,7 @@ def _build_video_rows_context(top_videos: list) -> dict:
     for i in range(1, 6):
         out[f"video_index_{i}"] = "--"
         out[f"video_id_{i}"] = "--"
-        out[f"video_source_type_{i}"] = "--"
+        out[f"aquaculture_bin_{i}"] = "--"
         out[f"video_status_{i}"] = "--"
         out[f"video_total_fish_{i}"] = "--"
         out[f"video_processed_fish_{i}"] = "--"
@@ -1176,7 +1383,7 @@ def _build_video_rows_context(top_videos: list) -> dict:
         out[f"video_id_{idx}"] = v.video_id or "--"
         from app.services.report_format_utils import video_source_cn, video_status_cn
         from app.services.fish_id_service import derive_video_display_id
-        out[f"video_source_type_{idx}"] = video_source_cn(v.source_type)
+        out[f"aquaculture_bin_{idx}"] = getattr(v, "aquaculture_bin", None) or "未填写"
         out[f"video_status_{idx}"] = video_status_cn(v.status)
         out[f"video_total_fish_{idx}"] = str(v.total_fish or 0)
         out[f"video_processed_fish_{idx}"] = str(v.processed_fish or 0)
@@ -1214,17 +1421,17 @@ def _build_abnormal_rows_context(top_abnormal: list) -> dict:
         out[f"abnormal_fish_no_{idx}"] = derive_fish_short_id(f.fish_id) or "--"
         out[f"abnormal_video_id_{idx}"] = derive_video_display_id(f.video_id) or "--"
         out[f"abnormal_body_length_{idx}"] = (
-            f"{f.body_length:.2f}" if f.body_length is not None else "--"
+            f"{f.body_length_cm:.2f}" if f.body_length_cm is not None else "--"
         )
         out[f"abnormal_body_length_without_tail_{idx}"] = (
-            f"{f.body_length_without_tail:.2f}"
-            if f.body_length_without_tail is not None else "--"
+            f"{f.body_length_no_tail_cm:.2f}"
+            if f.body_length_no_tail_cm is not None else "--"
         )
         out[f"abnormal_body_height_{idx}"] = (
-            f"{f.body_height:.2f}" if f.body_height is not None else "--"
+            f"{f.body_height_cm:.2f}" if f.body_height_cm is not None else "--"
         )
         out[f"abnormal_body_weight_{idx}"] = (
-            f"{f.body_weight:.2f}" if f.body_weight is not None else "--"
+            f"{f.pred_weight_g:.2f}" if f.pred_weight_g is not None else "--"
         )
         out[f"abnormal_condition_factor_{idx}"] = (
             f"{f.condition_factor:.3f}" if f.condition_factor is not None else "--"

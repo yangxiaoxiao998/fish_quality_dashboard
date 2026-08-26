@@ -72,7 +72,7 @@ def get_camera_read_url() -> str:
 
 
 def get_camera_size() -> dict[str, int]:
-    """传给树莓派的 width/height/fps，默认 1920x1080 / 25fps。"""
+    """传给树莓派的 width/height/fps，默认 1920*1080 / 25fps。"""
     def _int(name: str, default: int) -> int:
         v = os.getenv(name)
         if v is None:

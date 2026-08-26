@@ -99,8 +99,8 @@ const metricCards = computed(() => {
       { title: '任务失败率', value: '--', unit: '%' },
       { title: '总检测鱼数量', value: '--', unit: '条' },
       { title: '平均每个视频检测鱼数量', value: '--', unit: '条' },
-      { title: '总视频时长', value: '--', unit: 's' },
-      { title: '平均处理耗时', value: '--', unit: 's' },
+      { title: '总视频时长', value: '--', unit: '秒' },
+      { title: '平均处理耗时', value: '--', unit: '秒' },
       { title: '平均 FPS', value: '--', unit: '' },
       { title: '摄像头开启次数', value: '--', unit: '次' }
     ]
@@ -116,8 +116,8 @@ const metricCards = computed(() => {
     { title: '任务失败率', value: Number((s.failure_rate * 100).toFixed(2)), unit: '%' },
     { title: '总检测鱼数量', value: s.total_fish, unit: '条' },
     { title: '平均每个视频检测鱼数量', value: s.avg_fish_per_video, unit: '条' },
-    { title: '总视频时长', value: s.total_video_duration, unit: 's' },
-    { title: '平均处理耗时', value: s.avg_processing_duration, unit: 's' },
+    { title: '总视频时长', value: formatDurationPrecise(s.total_video_duration), unit: '' },
+    { title: '平均处理耗时', value: formatDurationPrecise(s.avg_processing_duration), unit: '' },
     { title: '平均 FPS', value: s.avg_fps, unit: '' },
     { title: '摄像头开启次数', value: s.camera_start_count, unit: '次' }
   ]
@@ -139,6 +139,17 @@ function formatDurationCn(seconds: number): string {
   if (hours <= 0) return `${minutes}分钟`
   if (minutes <= 0) return `${hours}小时`
   return `${hours}小时${minutes}分钟`
+}
+
+function formatDurationPrecise(seconds: number | null | undefined): string {
+  const n = Number(seconds)
+  if (!Number.isFinite(n) || n < 0) return '--'
+  if (n < 60) return `${n.toFixed(2)}秒`
+  const total = Math.round(n)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return h ? `${h}小时${m}分${s}秒` : m ? `${m}分${s}秒` : `${s}秒`
 }
 
 function statusLabel(status: string): string {

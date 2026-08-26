@@ -204,6 +204,8 @@ def run_fish_extra_metric_migration() -> None:
 # ---------------------------------------------------------------------------
 
 VIDEO_TASK_ALGO_FIELDS: dict[str, str] = {
+    "video_duration_seconds": "DOUBLE PRECISION",
+    "processing_duration_seconds": "DOUBLE PRECISION",
     "original_input_video": "TEXT",
     "input_video": "TEXT",
     "failed_stage": "TEXT",
@@ -231,6 +233,7 @@ FISH_ALGO_FIELDS: dict[str, str] = {
     "body_length_no_tail_cm": "DOUBLE PRECISION",
     "body_height_cm": "DOUBLE PRECISION",
     "pred_weight_g": "DOUBLE PRECISION",
+    "hex_color": "VARCHAR(32)",
     "surface_damage_ratio": "DOUBLE PRECISION",
     "error_message": "TEXT",
 }
@@ -299,6 +302,10 @@ VIDEO_TASK_TIMED_RECORDING_FIELDS: dict[str, str] = {
     "auto_stop_triggered": "BOOLEAN DEFAULT FALSE",
 }
 
+VIDEO_TASK_REPORT_FIELDS: dict[str, str] = {
+    "aquaculture_bin": "VARCHAR(255)",
+}
+
 VIDEO_TASK_TIMED_RECORDING_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_video_task_scheduled_stop "
     "ON video_task(status, scheduled_stop_at)",
@@ -335,6 +342,31 @@ def run_video_task_timed_recording_migration() -> None:
             f"[migration] video_task timed recording migration failed: {e}"
         )
         print(f"[DB][WARN] video_task timed recording migration failed: {e}")
+
+
+def run_video_task_report_migration() -> None:
+    """为视频报表元数据增加养鱼仓字段，兼容已有 video_task 数据。"""
+    try:
+        with engine.begin() as conn:
+            for col, ddl in VIDEO_TASK_REPORT_FIELDS.items():
+                conn.execute(text(
+                    f"ALTER TABLE video_task ADD COLUMN IF NOT EXISTS {col} {ddl}"
+                ))
+        print("[DB] video_task report migration: OK")
+    except Exception as e:
+        logger.error("[migration] video_task report migration failed: %s", e)
+        print(f"[DB][WARN] video_task report migration failed: {e}")
+
+
+def run_camera_schedule_integrity_migration() -> None:
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE camera_record_schedule ADD COLUMN IF NOT EXISTS force_all_complete BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
+        print("[DB] camera schedule integrity migration: OK")
+    except Exception as e:
+        logger.error("[migration] camera schedule integrity migration failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -390,4 +422,62 @@ def run_detection_report_video_report_migration() -> None:
         )
         print(
             f"[DB][WARN] detection_report video report migration failed: {e}"
+        )
+
+
+def run_camera_record_schedule_migration() -> None:
+    """幂等创建 future 录制计划表 + 索引。
+
+    - CREATE TABLE IF NOT EXISTS：反复运行不会失败
+    - CREATE INDEX IF NOT EXISTS：启动多次无副作用
+    - 不影响现有 video_task / fish / report 等任何字段
+    """
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS camera_record_schedule (
+                        schedule_id       VARCHAR(64) PRIMARY KEY,
+                        status            VARCHAR(16) NOT NULL DEFAULT 'pending',
+                        planned_start_at  TIMESTAMPTZ NOT NULL,
+                        planned_end_at    TIMESTAMPTZ NOT NULL,
+                        duration_minutes  INTEGER NOT NULL,
+                        video_id          VARCHAR(64),
+                        actual_start_at   TIMESTAMPTZ,
+                        actual_stop_at    TIMESTAMPTZ,
+                        claimed_at        TIMESTAMPTZ,
+                        claim_token       VARCHAR(64),
+                        cancelled_at      TIMESTAMPTZ,
+                        error_message     TEXT,
+                        stop_reason       TEXT,
+                        stop_source       TEXT,
+                        created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_camera_record_schedule_due
+                    ON camera_record_schedule (status, planned_start_at)
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_camera_record_schedule_video
+                    ON camera_record_schedule (video_id)
+                    """
+                )
+            )
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        # migration 失败不能让后端无法启动；记录并继续
+        logger.warning(
+            "[camera_schedule_migration] failed: %r",
+            exc,
         )

@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,13 @@ ALGORITHM_PYTHON = os.getenv("ALGORITHM_PYTHON") or sys.executable
 
 CALIBRATION_DIR = DATA_DIR / "calibration"
 CALIBRATION_JSON = CALIBRATION_DIR / "current_calibration.json"
+CALIBRATION_CONFIG_JSON = CALIBRATION_DIR / "calibration_config.json"
 
 RESULTS_DIR = DATA_DIR / "results"
 ALGO_CLI_LOG_DIR = DATA_DIR / "logs" / "algorithm_cli"
+DEFAULT_PIPELINE_TIMEOUT_SECONDS = int(
+    os.getenv("ALGORITHM_PIPELINE_TIMEOUT_SECONDS", str(8 * 60 * 60))
+)
 
 def extract_real_error(
     stdout: str = "",
@@ -201,10 +206,6 @@ def _build_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         str(algo_dir / "GroundingDINO"),
     ]
 
-    old_pythonpath = env.get("PYTHONPATH")
-    if old_pythonpath:
-        pythonpath_items.append(old_pythonpath)
-
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_items)
 
     env.setdefault("FISH_PROJECT_ROOT", str(PROJECT_ROOT))
@@ -218,12 +219,31 @@ def _build_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env.setdefault(
         "FISH_GROUNDING_DINO_CHECKPOINT", str(pth_dir / "groundingdino_swint_ogc.pth")
     )
-    env.setdefault(
-        "FISH_BERT_BASE_UNCASED_PATH", str(algo_dir / "bert-base-uncased")
+    # BERT 唯一目录：algorithms/pth/bert-base-uncased。
+    # 强制覆盖（不用 setdefault），避免 shell 残留旧值继续指向错误位置。
+    bert_dir = (algo_dir / "pth" / "bert-base-uncased").resolve()
+    required_bert_files = (
+        "config.json",
+        "pytorch_model.bin",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "vocab.txt",
     )
+    missing_bert_files = [
+        name
+        for name in required_bert_files
+        if not (bert_dir / name).is_file()
+    ]
+    if missing_bert_files:
+        raise FileNotFoundError(
+            "BERT模型目录文件不完整："
+            f"{bert_dir}；缺少：{', '.join(missing_bert_files)}"
+        )
 
-    env.setdefault("TRANSFORMERS_OFFLINE", "1")
-    env.setdefault("HF_HUB_OFFLINE", "1")
+    env["FISH_BERT_BASE_UNCASED_PATH"] = str(bert_dir)
+    env["GDINO_BERT_PATH"] = str(bert_dir)
+    env["TRANSFORMERS_OFFLINE"] = "1"
+    env["HF_HUB_OFFLINE"] = "1"
 
     # 注意：不再设置 FISH_ALGO_MODE，不再支持 mock / real 切换。
 
@@ -277,25 +297,81 @@ def _write_cli_log(
 def _run_cli(
     command: list[str],
     *,
-    timeout: int = 7200,
+    timeout: int = DEFAULT_PIPELINE_TIMEOUT_SECONDS,
     log_name: str,
     extra_log: dict[str, Any] | None = None,
+    cancel_check: Any | None = None,
+    force_all_complete: bool = False,
 ) -> dict[str, Any]:
     _ensure_dirs()
 
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=str(PROJECT_ROOT),
             env=_build_env(),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             shell=False,
+            start_new_session=True,
         )
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
-        returncode = int(completed.returncode)
+        started_at = time.monotonic()
+        cancelled = False
+        stdout = ""
+        stderr = ""
+        while True:
+            if cancel_check and cancel_check():
+                cancelled = True
+                try:
+                    import os
+                    import signal
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    import os
+                    import signal
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                stdout, stderr = process.communicate()
+                break
+            if time.monotonic() - started_at >= timeout:
+                try:
+                    import os
+                    import signal
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+        stdout = stdout or ""
+        stderr = stderr or ""
+        returncode = int(process.returncode)
+        if cancelled:
+            log_path = _write_cli_log(
+                name=log_name,
+                command=command,
+                returncode=returncode,
+                stdout=stdout or "",
+                stderr=stderr or "",
+                extra={**(extra_log or {}), "cancelled": True},
+            )
+            return {
+                "returncode": -2,
+                "stdout": stdout or "",
+                "stderr": stderr or "",
+                "log_path": log_path,
+                "cancelled": True,
+                "error_message": "任务已被运维取消",
+            }
 
         log_path = _write_cli_log(
             name=log_name,
@@ -314,8 +390,23 @@ def _run_cli(
         }
 
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
+        # TimeoutExpired is raised before communicate() drains the pipes. Kill
+        # the whole process group and reap it, otherwise ffmpeg/OpenCV children
+        # can keep running and the pipeline may end with BrokenPipeError.
+        try:
+            import os
+            import signal
+
+            os.killpg(process.pid, signal.SIGKILL)
+        except (NameError, ProcessLookupError):
+            pass
+        try:
+            stdout_after, stderr_after = process.communicate(timeout=10)
+            stdout = stdout_after or exc.stdout or ""
+            stderr = stderr_after or exc.stderr or ""
+        except subprocess.TimeoutExpired:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
         if isinstance(stdout, bytes):
             stdout = stdout.decode("utf-8", errors="replace")
         if isinstance(stderr, bytes):
@@ -435,6 +526,7 @@ def run_calibration_cli(
     camera_id: str = "default",
     device: str = "cuda",
     overwrite: bool = True,
+    real_length_mm: float | None = None,
     timeout: int = 1800,
 ) -> dict[str, Any]:
     _ensure_dirs()
@@ -478,6 +570,18 @@ def run_calibration_cli(
         "--device",
         str(device),
     ]
+
+    if real_length_mm is None:
+        real_length_mm = 1376.0
+        if CALIBRATION_CONFIG_JSON.exists():
+            try:
+                config = json.loads(CALIBRATION_CONFIG_JSON.read_text(encoding="utf-8"))
+                real_length_mm = float(config.get("real_length_mm", real_length_mm))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+    if real_length_mm <= 0:
+        return {"ok": False, "returncode": -1, "error_message": "传送带真实长度必须大于 0 毫米。"}
+    command.extend(["--real-length-mm", str(real_length_mm)])
 
     if overwrite:
         command.append("--overwrite")
@@ -548,8 +652,10 @@ def run_video_pipeline_cli(
     device: str = "cuda",
     video_fps: int = 25,
     overwrite: bool = True,
-    timeout: int = 7200,
+    timeout: int = DEFAULT_PIPELINE_TIMEOUT_SECONDS,
     video_id: str | None = None,
+    cancel_check: Any | None = None,
+    force_all_complete: bool = False,
 ) -> dict[str, Any]:
     _ensure_dirs()
 
@@ -607,6 +713,8 @@ def run_video_pipeline_cli(
 
     if video_id:
         command.extend(["--video-id", str(video_id)])
+    if force_all_complete:
+        command.append("--force-all-complete")
 
     result = _run_cli(
         command,
@@ -618,6 +726,7 @@ def run_video_pipeline_cli(
             "camera_id": camera_id,
             "video_fps": video_fps,
         },
+        cancel_check=cancel_check,
     )
 
     video_id = _resolve_video_id_after_pipeline(result["stdout"], result["stderr"])
@@ -673,6 +782,7 @@ def run_video_pipeline_cli(
         "stdout": result["stdout"],
         "stderr": result["stderr"],
         "log_path": result["log_path"],
+        "cancelled": bool(result.get("cancelled")),
     }
 
     if not ok:

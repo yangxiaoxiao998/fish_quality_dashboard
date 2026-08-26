@@ -10,7 +10,7 @@
     <div class="data-section">
       <h4>检测数据</h4>
       <div class="data-item">
-        <span>鱼编号 (track_id):</span>
+        <span>序号:</span>
         <span>{{ displayId ?? '--' }}</span>
       </div>
       <div class="data-item">

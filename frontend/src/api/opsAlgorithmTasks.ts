@@ -248,10 +248,11 @@ export function markOpsAlgorithmTaskFailed(
 export function retryOpsAlgorithmTask(
   videoId: string,
   force = false,
+  forceAllComplete = false,
 ) {
   return http.post<{ ok: boolean; video_id: string; status: string; job_id: string; input_video: string }>(
     `/api/ops/algorithm-tasks/${encodeURIComponent(videoId)}/retry`,
-    { force },
+    { force, force_all_complete: forceAllComplete },
   )
 }
 

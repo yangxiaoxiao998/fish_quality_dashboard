@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
 from app.repositories import report_repo
@@ -14,6 +14,187 @@ from app.services.operation_log_service import log_operation
 from app.services.path_service import to_abs_data_path
 
 router = APIRouter(prefix="/reports")
+
+
+def _safe_report_download_name(name: str | None, fallback: str, suffix: str = ".pdf") -> str:
+    import re
+
+    value = str(name or fallback).strip()
+    value = re.sub(r'[\\/:*?"<>|\r\n]+', "_", value).strip(" .") or fallback
+    if not value.lower().endswith(suffix):
+        value += suffix
+    return value
+
+
+@router.post("/history/batch-download")
+def batch_download_reports(body: dict, db: Session = Depends(get_db)):
+    """按报表名称下载一个或多个已生成报表。多个报表打包为 ZIP。"""
+    import io
+    import zipfile
+    from urllib.parse import quote
+
+    raw_ids = body.get("report_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(status_code=400, detail="report_ids must be a non-empty list")
+    report_ids = list(dict.fromkeys(int(value) for value in raw_ids if str(value).isdigit()))
+    if not report_ids:
+        raise HTTPException(status_code=400, detail="report_ids must contain valid report IDs")
+
+    reports = [report_repo.get_report(db, report_id) for report_id in report_ids]
+    reports = [report for report in reports if report is not None and report.file_path]
+    if len(reports) != len(report_ids):
+        raise HTTPException(status_code=404, detail="one or more reports not found")
+
+    files: list[tuple[str, object]] = []
+    used_names: set[str] = set()
+    for report in reports:
+        path = to_abs_data_path(report.file_path)
+        if path is None or not path.exists():
+            raise HTTPException(status_code=404, detail=f"report file not found: {report.report_id}")
+        name = _safe_report_download_name(report.report_name, f"report_{report.report_id}")
+        stem, suffix = name.rsplit(".", 1)
+        candidate = name
+        index = 2
+        while candidate in used_names:
+            candidate = f"{stem}_{index}.{suffix}"
+            index += 1
+        used_names.add(candidate)
+        files.append((candidate, path))
+
+    if len(files) == 1:
+        name, path = files[0]
+        return FileResponse(
+            str(path),
+            media_type="application/pdf",
+            filename=name,
+        )
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for name, path in files:
+            output.write(path, arcname=name)
+    archive.seek(0)
+    download_name = "fish_quality_reports.zip"
+    return Response(
+        content=archive.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename=reports.zip; filename*=UTF-8''{quote(download_name)}",
+        },
+    )
+
+
+@router.post("/custom-pdf/generate")
+def generate_custom_pdf(body: dict, db: Session = Depends(get_db)) -> dict:
+    """生成所选视频的只读合并报表 PDF。"""
+    from datetime import datetime
+    import uuid
+    from app.paths import DATA_DIR
+    from app.repositories.models import DetectionReport, VideoTask
+
+    raw_ids = body.get("video_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(status_code=400, detail="video_ids must be a non-empty list")
+    video_ids = list(dict.fromkeys(str(v).strip() for v in raw_ids if str(v).strip()))
+    report_name = str(body.get("report_name") or "").strip()
+    if not report_name:
+        raise HTTPException(status_code=400, detail="report_name is required")
+    rows = db.query(VideoTask).filter(VideoTask.video_id.in_(video_ids)).all()
+    if not rows:
+        raise HTTPException(status_code=404, detail="video tasks not found")
+
+    from app.services.video_report_pdf_service import generate_video_pdf_report
+    from app.services.path_service import to_abs_data_path
+    if len(rows) == 1:
+        result = generate_video_pdf_report(rows[0].video_id, report_name=report_name)
+        if not result.get("ok"):
+            raise HTTPException(status_code=500, detail=result.get("error") or "report generation failed")
+        report = db.query(DetectionReport).filter(
+            DetectionReport.report_type == "video_fish_quality",
+            DetectionReport.video_id == rows[0].video_id,
+        ).order_by(DetectionReport.created_at.desc()).first()
+        if report is not None:
+            report.report_name = report_name
+            db.commit()
+        result["report_name"] = report_name
+        return result
+
+    report_dir = DATA_DIR / "reports" / "custom"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        from app.services.video_report_pdf_service import generate_combined_video_pdf_report
+        result = generate_combined_video_pdf_report(video_ids, report_dir / stamp, report_name)
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or "合并报表生成失败")
+        pdf_path = to_abs_data_path(result.get("file_path"))
+        if pdf_path is None or not pdf_path.exists():
+            raise RuntimeError("合并报表 PDF 未生成")
+        file_name = pdf_path.name
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"生成合并 PDF 失败：{exc}") from exc
+
+    report_date = min((row.created_at.date() for row in rows if row.created_at), default=datetime.now().date())
+    from app.repositories.models import DetectionReport
+    report = DetectionReport(
+        report_date=report_date,
+        report_type="custom_video_fish_quality",
+        report_no=f"CUSTOM-{stamp}-{uuid.uuid4().hex[:8].upper()}",
+        report_name=report_name,
+        file_name=file_name,
+        file_path=str(pdf_path.relative_to(DATA_DIR)),
+        file_size=pdf_path.stat().st_size,
+        total_video=len(rows),
+        total_fish=sum(int(row.total_fish or 0) for row in rows),
+        status="generated",
+        summary_json={"video_ids": video_ids},
+    )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    return {
+        "ok": True,
+        "report_id": report.report_id,
+        "file_name": file_name,
+        "preview_url": f"/api/reports/history/{report.report_id}/preview",
+        "download_url": f"/api/reports/history/{report.report_id}/download",
+    }
+
+
+@router.get("/video-overview/export")
+def export_video_overview(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """导出视频报表列表为 Excel 可直接打开的 UTF-8 CSV。"""
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+    from app.repositories.models import VideoTask
+    from sqlalchemy import select
+
+    stmt = select(VideoTask).order_by(VideoTask.created_at.desc())
+    if start_date:
+        stmt = stmt.where(VideoTask.created_at >= date.fromisoformat(start_date[:10]))
+    if end_date:
+        stmt = stmt.where(VideoTask.created_at < date.fromordinal(date.fromisoformat(end_date[:10]).toordinal() + 1))
+    rows = db.execute(stmt).scalars().all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["序号", "视频编号", "养鱼仓", "状态", "总鱼数", "完整鱼数", "不完整鱼数", "创建时间"])
+    for index, row in enumerate(rows, 1):
+        writer.writerow([
+            index, row.video_id, row.aquaculture_bin or "", row.status,
+            row.total_fish or 0, row.complete_fish or 0, row.incomplete_fish or 0,
+            row.created_at.isoformat() if row.created_at else "",
+        ])
+    content = "\ufeff" + output.getvalue()
+    return StreamingResponse(
+        iter([content.encode("utf-8")]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=video_reports.csv"},
+    )
 
 
 @router.get("/health")
@@ -129,21 +310,19 @@ def generate_daily_pdf(
 
     from app.services.report_pdf_service import generate_daily_fish_quality_pdf
 
-    # 日报覆盖：同 report_date + report_type='daily_fish_quality' 已存在时
-    # 传 existing_report_id 给 service，让其更新原记录而不是新增一条。
-    # 避免同一天多次点"生成日报"出现重复多条 detection_report 记录。
+    # 当天日报采用单条记录覆盖，保证任务完成后前端能读到最新版本。
     existing_id: int | None = None
+    existing_rows = []
     try:
         from sqlalchemy import select as _select
         from app.repositories.models import DetectionReport as _DR
-        existing_row = db.execute(
+        existing_rows = list(db.execute(
             _select(_DR)
             .where(_DR.report_date == report_date)
             .where(_DR.report_type == "daily_fish_quality")
             .order_by(_DR.created_at.desc())
-        ).scalars().first()
-        if existing_row is not None:
-            existing_id = existing_row.report_id
+        ).scalars().all())
+        existing_id = existing_rows[0].report_id if existing_rows else None
     except Exception:
         # 查不到 existing 不影响生成；让 service 走新建分支
         existing_id = None
@@ -154,6 +333,7 @@ def generate_daily_pdf(
             report_date=report_date,
             summary=summary,
             existing_report_id=existing_id,
+            save_history=True,
         )
     except Exception as e:
         log_operation(
@@ -305,6 +485,37 @@ def report_detail(report_id: int, db: Session = Depends(get_db)):
     obj = report_repo.get_report(db, report_id)
     if obj is None:
         raise HTTPException(status_code=404, detail="report not found")
+    return report_repo.report_to_dict(obj)
+
+
+@router.patch("/history/{report_id}/name")
+def report_rename(report_id: int, body: dict, db: Session = Depends(get_db)):
+    name = str(body.get("report_name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="report_name is required")
+    obj = report_repo.get_report(db, report_id)
+    if obj is None:
+        raise HTTPException(status_code=404, detail="report not found")
+    obj.report_name = name
+    db.commit()
+    db.refresh(obj)
+    if obj.report_type == "custom_video_fish_quality":
+        video_ids = (obj.summary_json or {}).get("video_ids", [])
+        if isinstance(video_ids, list) and video_ids:
+            from app.paths import DATA_DIR
+            from app.services.video_report_pdf_service import generate_combined_video_pdf_report
+            refreshed = generate_combined_video_pdf_report(
+                [str(value) for value in video_ids],
+                DATA_DIR / "reports" / "custom" / f"rename_{obj.report_id}",
+                name,
+            )
+            if refreshed.get("ok") and refreshed.get("file_path"):
+                obj.file_path = refreshed["file_path"]
+                obj.file_name = refreshed.get("file_name")
+                abs_path = to_abs_data_path(obj.file_path)
+                obj.file_size = abs_path.stat().st_size if abs_path and abs_path.exists() else obj.file_size
+                db.commit()
+                db.refresh(obj)
     return report_repo.report_to_dict(obj)
 
 

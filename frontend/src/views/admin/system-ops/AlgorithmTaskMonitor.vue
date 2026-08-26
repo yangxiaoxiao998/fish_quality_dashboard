@@ -382,15 +382,24 @@ async function submitMarkFailed() {
 
 function confirmRetry(record: OpsAlgorithmTaskItem) {
   Modal.confirm({
-    title: '确认重新入队？',
+    title: '重新入队完整性设置',
     content:
-      '此操作会清理 data/jobs/<video_id> 残留目录、重新调用算法 CLI，并覆盖已有中间结果。',
-    okText: '确认',
-    cancelText: '取消',
+      '点击“确认”表示需要检测完整性；点击“取消”表示本次不检测完整性并使用 --force-all-complete。',
+    okText: '需要检测',
+    cancelText: '不检测',
     onOk: () => {
+      void retryWithIntegrity(record, false)
+    },
+    onCancel: () => {
+      void retryWithIntegrity(record, true)
+    },
+  })
+}
+
+async function retryWithIntegrity(record: OpsAlgorithmTaskItem, forceAllComplete: boolean): Promise<void> {
       void (async () => {
         try {
-          const resp = await retryOpsAlgorithmTask(record.video_id)
+          const resp = await retryOpsAlgorithmTask(record.video_id, false, forceAllComplete)
           if (resp.data?.ok) {
             Message.success('已重新入队，job_id=' + (resp.data.job_id || '--'))
             // 该任务已变为 queued。若当前状态筛选会把它过滤掉，
@@ -411,8 +420,6 @@ function confirmRetry(record: OpsAlgorithmTaskItem) {
           )
         }
       })()
-    },
-  })
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +700,11 @@ onBeforeUnmount(() => {
               {{ fmtElapsed(record.elapsed_seconds) }}
             </template>
           </a-table-column>
+          <a-table-column title="视频时长" :width="110">
+            <template #cell="{ record }">
+              {{ fmtElapsed(record.video_duration_seconds) }}
+            </template>
+          </a-table-column>
           <a-table-column title="预计剩余" :width="120">
             <template #cell="{ record }">
               <span v-if="record.eta_seconds != null">
@@ -774,6 +786,7 @@ onBeforeUnmount(() => {
                   v-if="
                     record.display_status === 'failed' ||
                     record.display_status === 'stuck' ||
+                    record.display_status === 'done' ||
                     record.is_stuck
                   "
                   type="text"

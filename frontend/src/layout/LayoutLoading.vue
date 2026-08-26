@@ -1,7 +1,7 @@
 <!-- 1.Template 部分 -->
    <!-- layout-loading是你在 style 里写的样式选择器，用来让这个层全屏覆盖并居中显示 -->
-  <!-- animate animate__slideInDown：这是配合 animate.css 的动画 class，让 加载loading 层出现时有一个“从上滑入”的动效 -->
-    
+  <!-- animate animate-slide-down：自定义入场动画，让 加载loading 层出现时有一个“从上滑入”的动效 -->
+
     <!--外层 v-if="loading.isLoading"：只有当 loading.isLoading = true 时，这整个 loading 组件才会被创建出来；
       当它变成 false 时，这个 div 会被 Vue 从 DOM 中彻底移除。 -->
     <!-- v-if：元素会被创建/销毁 -->
@@ -9,7 +9,7 @@
           销毁后它不会再占 DOM，也不会挡住点击（更“干净”） -->
 <template>
   <div
-    class="layout-loading animate animate__slideInDown"
+    class="layout-loading animate animate-slide-down"
     v-if="loading.isLoading"
   >
   <!-- class="loading-gif"用 CSS 背景图显示 GIF,这样写的好处：背景图可以用 background-size: 100% 100% 强制铺满固定区域，控制更直接 -->
@@ -43,7 +43,7 @@ interface PropsType {
   }
 }
 // const props:<script setup> 的标准写法：声明这个组件的 props
-// 这里的 props 变量本身其实没被用到（只是调用 defineProps 的返回值存了一下），即使写成 defineProps<PropsType>() 也行。
+// 这里的 props 变量本身没被用到（只是调用 defineProps 的返回值存了一下），即使写成 defineProps<PropsType>() 也行。
 // 作者保留 props 多半是习惯写法或后续要用。
 const props = defineProps<PropsType>()
 </script>
@@ -89,10 +89,23 @@ const props = defineProps<PropsType>()
   .loading-tip {
     // 让提示文字用 DouyuFont、斜体、加粗，颜色是蓝绿色
     // font-family: DOUYUFont;
-
     // font-style: italic;
     // font-weight: bolder;
     color: #5fb9c7;
+  }
+}
+.animate-slide-down {
+  animation: loading-slide-down 0.45s ease-out both;
+}
+
+@keyframes loading-slide-down {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
   }
 }
 </style>

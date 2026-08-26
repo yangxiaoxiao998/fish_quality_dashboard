@@ -12,7 +12,8 @@
 ``batch``
     按帧序号读取 ``--input-dir`` 下的图片（兼容 6 位 / 12 位命名），
     使用 ``current_calibration.json`` 或 ``--calibration-json`` 提供的
-    透视变换矩阵矫正，写入 ``--output-dir``，输出全部使用 12 位命名。
+    透视变换矩阵与最终画布尺寸矫正，写入 ``--output-dir``，
+    输出全部使用 12 位命名。
     默认情况下，矫正成功后通过 ``config.cleanup`` 安全删除 raw/，
     传入 ``--keep-raw-frames`` 时保留。
 
@@ -96,7 +97,6 @@ def _bootstrap_dependencies() -> None:
     for path in [
         str(GROUNDING_DINO_DIR),
         str(SEGMENT_ANYTHING_DIR),
-        str(GROUNDED_SAM_DIR),
     ]:
         if path not in sys.path:
             sys.path.insert(0, path)
@@ -105,10 +105,10 @@ def _bootstrap_dependencies() -> None:
 def _ensure_dependencies() -> tuple:
     _bootstrap_dependencies()
     try:
-        import GroundingDINO.groundingdino.datasets.transforms as T  # type: ignore  # noqa: E402
-        from GroundingDINO.groundingdino.models import build_model  # type: ignore  # noqa: E402
-        from GroundingDINO.groundingdino.util.slconfig import SLConfig  # type: ignore  # noqa: E402
-        from GroundingDINO.groundingdino.util.utils import clean_state_dict  # type: ignore  # noqa: E402
+        import groundingdino.datasets.transforms as T  # type: ignore  # noqa: E402
+        from groundingdino.models import build_model  # type: ignore  # noqa: E402
+        from groundingdino.util.slconfig import SLConfig  # type: ignore  # noqa: E402
+        from groundingdino.util.utils import clean_state_dict  # type: ignore  # noqa: E402
         from segment_anything import (  # type: ignore  # noqa: E402
             SamPredictor,
             sam_hq_model_registry,
@@ -130,6 +130,19 @@ TEXT_PROMPT = "conveyor belt."
 SAM_VERSION = "vit_h"
 USE_SAM_HQ = True
 DEVICE = "cuda"
+
+# ===========================================================================
+# MODIFIED VERSION
+# ===========================================================================
+# 本版本不再：
+#   1) 把输出紧裁到传送带本体；
+#   2) 也不再为了保留整幅原图而建立超大的完整透视画布。
+#
+# 当前策略：
+#   传送带标准矩形 + 左右安全边界 + 少量上下安全边界。
+#
+# 该版本标记可用于确认服务器实际加载的是修改后的 adjust.py。
+ADJUST_CANVAS_VERSION = "belt_margin_v3_20260811"
 
 
 # ---------------------------------------------------------------------------
@@ -275,49 +288,222 @@ def _move_points_inside_image(points, image_shape):
     return adjusted.astype(np.float32)
 
 
-def rectify_conveyor_belt(image_bgr, mask_np):
-    contours, _ = _cv2().findContours(
-        mask_np.astype(_np().uint8), _cv2().RETR_EXTERNAL, _cv2().CHAIN_APPROX_SIMPLE
+DEFAULT_SIDE_MARGIN_RATIO = 0.25
+DEFAULT_VERTICAL_MARGIN_RATIO = 0.05
+
+
+def _validate_margin_ratio(value: float, name: str) -> float:
+    """校验安全边界比例。"""
+
+    value = float(value)
+    if value < 0:
+        raise ValueError(f"{name} 不能小于 0，当前值为 {value}")
+    if value > 2.0:
+        raise ValueError(
+            f"{name}={value} 过大；该比例是相对于矫正后传送带尺寸，"
+            "通常建议使用 0~1 范围。"
+        )
+    return value
+
+
+def _validate_margin_px(value: int | None, name: str) -> int | None:
+    """校验显式像素安全边界。"""
+
+    if value is None:
+        return None
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{name} 不能小于 0，当前值为 {value}")
+    return value
+
+
+def _resolve_canvas_margins(
+    belt_width: int,
+    belt_height: int,
+    *,
+    side_margin_ratio: float = DEFAULT_SIDE_MARGIN_RATIO,
+    vertical_margin_ratio: float = DEFAULT_VERTICAL_MARGIN_RATIO,
+    margin_left_px: int | None = None,
+    margin_right_px: int | None = None,
+    margin_top_px: int | None = None,
+    margin_bottom_px: int | None = None,
+) -> tuple[int, int, int, int]:
+    """计算传送带四周的安全边界。
+
+    默认左右各保留 ``belt_width * 0.25``，上下各保留
+    ``belt_height * 0.05``。若某一侧显式传入像素值，则该侧使用像素值。
+    """
+
+    side_margin_ratio = _validate_margin_ratio(
+        side_margin_ratio, "side_margin_ratio"
+    )
+    vertical_margin_ratio = _validate_margin_ratio(
+        vertical_margin_ratio, "vertical_margin_ratio"
+    )
+
+    margin_left_px = _validate_margin_px(margin_left_px, "margin_left_px")
+    margin_right_px = _validate_margin_px(margin_right_px, "margin_right_px")
+    margin_top_px = _validate_margin_px(margin_top_px, "margin_top_px")
+    margin_bottom_px = _validate_margin_px(margin_bottom_px, "margin_bottom_px")
+
+    auto_side = int(round(float(belt_width) * side_margin_ratio))
+    auto_vertical = int(round(float(belt_height) * vertical_margin_ratio))
+
+    left = auto_side if margin_left_px is None else margin_left_px
+    right = auto_side if margin_right_px is None else margin_right_px
+    top = auto_vertical if margin_top_px is None else margin_top_px
+    bottom = auto_vertical if margin_bottom_px is None else margin_bottom_px
+
+    return int(left), int(right), int(top), int(bottom)
+
+
+def rectify_conveyor_belt(
+    image_bgr,
+    mask_np,
+    *,
+    side_margin_ratio: float = DEFAULT_SIDE_MARGIN_RATIO,
+    vertical_margin_ratio: float = DEFAULT_VERTICAL_MARGIN_RATIO,
+    margin_left_px: int | None = None,
+    margin_right_px: int | None = None,
+    margin_top_px: int | None = None,
+    margin_bottom_px: int | None = None,
+):
+    """透视矫正传送带，并在传送带四周保留安全边界。
+
+    旧实现把传送带四边形直接映射到一个紧贴传送带的矩形，
+    ``warpPerspective`` 的输出尺寸也等于该矩形，因此传送带左右边缘
+    的完整鱼可能被裁成不完整鱼。
+
+    另一种“保留整幅原图透视结果”的做法虽然不会裁鱼，但会生成过大的
+    画布和大量黑色三角区域，使鱼在后续模型输入中被过度缩小。
+
+    本实现采用折中且更适合鱼类分割的策略：
+
+        传送带标准矩形 + 左右较大的安全边界 + 少量上下安全边界
+
+    ``vertical_distance`` / ``pixel_length`` 仍表示传送带本体的矫正后
+    高度和宽度，用于 ``mm_per_pixel``；最终输出尺寸由安全边界决定。
+    """
+
+    np = _np()
+    cv2 = _cv2()
+
+    contours, _ = cv2.findContours(
+        mask_np.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
     )
     if not contours:
         return None, 0, 0, None, None, None
-    c = max(contours, key=_cv2().contourArea)
-    epsilon = 0.02 * _cv2().arcLength(c, True)
-    approx = _cv2().approxPolyDP(c, epsilon, True)
+
+    contour = max(contours, key=cv2.contourArea)
+    epsilon = 0.02 * cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+
     if len(approx) == 4:
         pts = approx.reshape(4, 2)
     else:
-        rect = _cv2().minAreaRect(c)
-        pts = _cv2().boxPoints(rect)
+        rect = cv2.minAreaRect(contour)
+        pts = cv2.boxPoints(rect)
 
-    # 防止 minAreaRect 的角点超出原图，避免透视矫正后出现黑边。
+    # 防止 minAreaRect 角点落到原图外。
     pts = _move_points_inside_image(pts, image_bgr.shape)
 
-    rect_pts = order_points(pts)
-    src_pts = _np().array(rect_pts, dtype="float32")
-    (tl, tr, br, bl) = rect_pts
-    widthA = _np().sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = _np().sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-    heightA = _np().sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = _np().sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-    dst = _np().array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1],
-    ], dtype="float32")
-    M = _cv2().getPerspectiveTransform(src_pts, dst)
-    M_inv = _cv2().getPerspectiveTransform(dst, src_pts)
-    warped_img = _cv2().warpPerspective(
-        image_bgr,
-        M,
-        (maxWidth, maxHeight),
-        flags=_cv2().INTER_LINEAR,
-        borderMode=_cv2().BORDER_REPLICATE,
+    rect_pts = order_points(np.asarray(pts, dtype=np.float32))
+    src_pts = np.asarray(rect_pts, dtype=np.float32)
+    tl, tr, br, bl = rect_pts
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+
+    # 使用 ceil，避免 int() 向下取整导致边界再损失 1~2 像素。
+    belt_width = max(2, int(np.ceil(max(width_a, width_b))))
+    belt_height = max(2, int(np.ceil(max(height_a, height_b))))
+
+    left, right, top, bottom = _resolve_canvas_margins(
+        belt_width,
+        belt_height,
+        side_margin_ratio=side_margin_ratio,
+        vertical_margin_ratio=vertical_margin_ratio,
+        margin_left_px=margin_left_px,
+        margin_right_px=margin_right_px,
+        margin_top_px=margin_top_px,
+        margin_bottom_px=margin_bottom_px,
     )
-    return warped_img, maxHeight, maxWidth, M, src_pts, dst
+
+    # 传送带本体先映射到从 (0, 0) 开始的标准矩形。
+    belt_dst = np.asarray(
+        [
+            [0.0, 0.0],
+            [float(belt_width - 1), 0.0],
+            [float(belt_width - 1), float(belt_height - 1)],
+            [0.0, float(belt_height - 1)],
+        ],
+        dtype=np.float32,
+    )
+
+    base_transform = cv2.getPerspectiveTransform(src_pts, belt_dst)
+
+    # 再通过固定平移把传送带放入带安全边界的最终画布中。
+    translation = np.asarray(
+        [
+            [1.0, 0.0, float(left)],
+            [0.0, 1.0, float(top)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    transform_matrix = (
+        translation
+        @ np.asarray(base_transform, dtype=np.float64)
+    )
+
+    output_width = int(belt_width + left + right)
+    output_height = int(belt_height + top + bottom)
+
+    if output_width <= 0 or output_height <= 0:
+        raise RuntimeError(
+            f"计算得到无效输出画布：{output_width}x{output_height}"
+        )
+
+    # 防止错误 margin 参数造成异常大的内存分配。
+    image_height, image_width = image_bgr.shape[:2]
+    max_width = max(int(image_width) * 4, 4096)
+    max_height = max(int(image_height) * 4, 4096)
+    if output_width > max_width or output_height > max_height:
+        raise RuntimeError(
+            "安全边界导致输出画布异常大："
+            f"{output_width}x{output_height}；原图为 "
+            f"{image_width}x{image_height}。请减小 margin。"
+        )
+
+    # 目标四角必须记录在“最终画布坐标系”中。
+    target_points = cv2.perspectiveTransform(
+        src_pts.reshape(-1, 1, 2),
+        transform_matrix,
+    ).reshape(-1, 2).astype(np.float32)
+
+    warped_img = cv2.warpPerspective(
+        image_bgr,
+        transform_matrix,
+        (output_width, output_height),
+        flags=cv2.INTER_LINEAR,
+        # 输出画布中若有源图像没有覆盖的位置，使用黑色填充。
+        # 不使用 BORDER_REPLICATE，避免复制边缘鱼形成假目标。
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+
+    return (
+        warped_img,
+        belt_height,
+        belt_width,
+        transform_matrix,
+        src_pts,
+        target_points,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +529,21 @@ class CalibrationResult:
     adjusted_preview: Path
     note: str = ""
 
+    # 最终矫正图画布尺寸。旧字段 pixel_length / vertical_distance
+    # 仍只表示传送带本体尺寸，不能再作为 batch 输出尺寸。
+    output_width: int | None = None
+    output_height: int | None = None
+
+    # 画布安全边界元数据，便于历史追溯。
+    canvas_mode: str = "belt_margin"
+    canvas_margin_left_px: int = 0
+    canvas_margin_right_px: int = 0
+    canvas_margin_top_px: int = 0
+    canvas_margin_bottom_px: int = 0
+    canvas_side_margin_ratio: float = DEFAULT_SIDE_MARGIN_RATIO
+    canvas_vertical_margin_ratio: float = DEFAULT_VERTICAL_MARGIN_RATIO
+    canvas_version: str = ADJUST_CANVAS_VERSION
+
     def to_dict(self) -> dict:
         return {
             "calibration_id": self.calibration_id,
@@ -350,12 +551,42 @@ class CalibrationResult:
             "created_at": self.created_at,
             "image_width": int(self.image_width),
             "image_height": int(self.image_height),
-            "transform_matrix": _np().asarray(self.transform_matrix, dtype=float).tolist(),
-            "inverse_transform_matrix": _np().asarray(self.inverse_transform_matrix, dtype=float).tolist(),
-            "source_points": _np().asarray(self.source_points, dtype=float).tolist(),
-            "target_points": _np().asarray(self.target_points, dtype=float).tolist(),
-            "vertical_distance": None if self.vertical_distance is None else int(self.vertical_distance),
-            "pixel_length": None if self.pixel_length is None else int(self.pixel_length),
+            "output_width": (
+                None if self.output_width is None else int(self.output_width)
+            ),
+            "output_height": (
+                None if self.output_height is None else int(self.output_height)
+            ),
+            "transform_matrix": _np().asarray(
+                self.transform_matrix, dtype=float
+            ).tolist(),
+            "inverse_transform_matrix": _np().asarray(
+                self.inverse_transform_matrix, dtype=float
+            ).tolist(),
+            "source_points": _np().asarray(
+                self.source_points, dtype=float
+            ).tolist(),
+            "target_points": _np().asarray(
+                self.target_points, dtype=float
+            ).tolist(),
+            "vertical_distance": (
+                None
+                if self.vertical_distance is None
+                else int(self.vertical_distance)
+            ),
+            "pixel_length": (
+                None
+                if self.pixel_length is None
+                else int(self.pixel_length)
+            ),
+            "canvas_mode": self.canvas_mode,
+            "canvas_margin_left_px": int(self.canvas_margin_left_px),
+            "canvas_margin_right_px": int(self.canvas_margin_right_px),
+            "canvas_margin_top_px": int(self.canvas_margin_top_px),
+            "canvas_margin_bottom_px": int(self.canvas_margin_bottom_px),
+            "canvas_side_margin_ratio": float(self.canvas_side_margin_ratio),
+            "canvas_vertical_margin_ratio": float(self.canvas_vertical_margin_ratio),
+            "canvas_version": str(self.canvas_version),
             "source_image": to_project_relative(self.source_image),
             "belt_mask": to_project_relative(self.belt_mask),
             "adjusted_preview": to_project_relative(self.adjusted_preview),
@@ -374,12 +605,21 @@ def run_calibration(
     calibration_id: str | None = None,
     real_length_mm: float = 1376.0,
     note: str = "",
+    side_margin_ratio: float = DEFAULT_SIDE_MARGIN_RATIO,
+    vertical_margin_ratio: float = DEFAULT_VERTICAL_MARGIN_RATIO,
+    margin_left_px: int | None = None,
+    margin_right_px: int | None = None,
+    margin_top_px: int | None = None,
+    margin_bottom_px: int | None = None,
 ) -> CalibrationResult:
     """读取 ``source_image``，执行标定，并把会话写入 sessions 目录。
 
     - ``source_image`` 可以是绝对路径或相对于项目根的相对路径。
-    - 原始图片**不会被删除或移动**；本函数只在 ``data/calibration/sessions/<id>/``
-      下生成 ``source.jpg`` 副本，便于隔离历史会话。
+    - 原始图片**不会被删除或移动**；本函数只在
+      ``data/calibration/sessions/<id>/`` 下生成 ``source.jpg`` 副本。
+    - 标定画布采用“传送带 + 安全边界”策略。
+    - ``pixel_length`` / ``vertical_distance`` 仍表示传送带本体尺寸；
+      ``output_width`` / ``output_height`` 表示最终矫正图尺寸。
     - 同时刷新 ``data/calibration/current_calibration.json``。
     """
 
@@ -407,63 +647,160 @@ def run_calibration(
     height, width = image_bgr.shape[:2]
 
     # 加载 GroundingDINO + SAM
-    (_, build_model, SLConfig, clean_state_dict,
-     SamPredictor, sam_hq_model_registry, sam_model_registry) = _ensure_dependencies()
+    (
+        _,
+        build_model,
+        SLConfig,
+        clean_state_dict,
+        SamPredictor,
+        sam_hq_model_registry,
+        sam_model_registry,
+    ) = _ensure_dependencies()
+
     model = load_model(
         GROUNDING_DINO_CONFIG_PATH,
         GROUNDING_DINO_CHECKPOINT,
         BERT_BASE_UNCASED_DIR,
         DEVICE,
     )
+
     if USE_SAM_HQ and sam_hq_model_registry is not None:
         predictor = SamPredictor(
-            sam_hq_model_registry[SAM_VERSION](checkpoint=str(SAM_HQ_VIT_H_CHECKPOINT)).to(DEVICE)
+            sam_hq_model_registry[SAM_VERSION](
+                checkpoint=str(SAM_HQ_VIT_H_CHECKPOINT)
+            ).to(DEVICE)
         )
     else:
         predictor = SamPredictor(
-            sam_model_registry[SAM_VERSION](checkpoint=str(SAM_VIT_H_CHECKPOINT)).to(DEVICE)
+            sam_model_registry[SAM_VERSION](
+                checkpoint=str(SAM_VIT_H_CHECKPOINT)
+            ).to(DEVICE)
         )
 
     image_pil, image_tensor = load_image(session_source)
-    boxes_filt = get_boxes_only(model, image_tensor, TEXT_PROMPT, BOX_THRESHOLD, DEVICE)
+    boxes_filt = get_boxes_only(
+        model,
+        image_tensor,
+        TEXT_PROMPT,
+        BOX_THRESHOLD,
+        DEVICE,
+    )
     if len(boxes_filt) == 0:
-        raise RuntimeError("标定失败：未在图片中检测到传送带，请重新拍摄或更换角度。")
+        raise RuntimeError(
+            "标定失败：未在图片中检测到传送带，请重新拍摄或更换角度。"
+        )
 
-    image_rgb = _cv2().cvtColor(image_bgr, _cv2().COLOR_BGR2RGB)
+    image_rgb = _cv2().cvtColor(
+        image_bgr,
+        _cv2().COLOR_BGR2RGB,
+    )
     predictor.set_image(image_rgb)
 
     H, W = image_pil.size[1], image_pil.size[0]
     boxes_filt = boxes_filt.clone()
     for i in range(boxes_filt.size(0)):
-        boxes_filt[i] = boxes_filt[i] * _torch_Tensor([W, H, W, H])
+        boxes_filt[i] = boxes_filt[i] * _torch_Tensor(
+            [W, H, W, H]
+        )
         boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
         boxes_filt[i][2:] += boxes_filt[i][:2]
 
     transformed_boxes = predictor.transform.apply_boxes_torch(
-        boxes_filt.cpu(), image_rgb.shape[:2]
+        boxes_filt.cpu(),
+        image_rgb.shape[:2],
     ).to(DEVICE)
+
     masks, _, _ = predictor.predict_torch(
         point_coords=None,
         point_labels=None,
         boxes=transformed_boxes,
         multimask_output=False,
     )
-    best_mask = masks[0][0].cpu().numpy().astype(_np().uint8) * 255
-
-    warped_belt, vertical_distance, pixel_length, transform_matrix, source_points, target_points = rectify_conveyor_belt(
-        image_bgr, best_mask
+    best_mask = (
+        masks[0][0]
+        .cpu()
+        .numpy()
+        .astype(_np().uint8)
+        * 255
     )
+
+    (
+        warped_belt,
+        vertical_distance,
+        pixel_length,
+        transform_matrix,
+        source_points,
+        target_points,
+    ) = rectify_conveyor_belt(
+        image_bgr,
+        best_mask,
+        side_margin_ratio=side_margin_ratio,
+        vertical_margin_ratio=vertical_margin_ratio,
+        margin_left_px=margin_left_px,
+        margin_right_px=margin_right_px,
+        margin_top_px=margin_top_px,
+        margin_bottom_px=margin_bottom_px,
+    )
+
     if warped_belt is None:
-        raise RuntimeError("标定失败：无法从掩码中提取传送带多边形，请重新拍摄。")
-    inverse_matrix = _cv2().getPerspectiveTransform(
-        _np().asarray(target_points, dtype="float32"),
-        _np().asarray(source_points, dtype="float32"),
+        raise RuntimeError(
+            "标定失败：无法从掩码中提取传送带多边形，请重新拍摄。"
+        )
+
+    # 最终画布不再等于 pixel_length x vertical_distance。
+    output_height, output_width = warped_belt.shape[:2]
+
+    print(
+        "[adjust] canvas_version="
+        f"{ADJUST_CANVAS_VERSION}, "
+        f"belt={int(pixel_length)}x{int(vertical_distance)}, "
+        f"output={int(output_width)}x{int(output_height)}"
+    )
+
+    # 对最终矩阵直接求逆，确保逆矩阵与“透视 + margin 平移”完全一致。
+    try:
+        inverse_matrix = _np().linalg.inv(
+            _np().asarray(
+                transform_matrix,
+                dtype=_np().float64,
+            )
+        )
+    except _np().linalg.LinAlgError as exc:
+        raise RuntimeError(
+            "标定失败：最终透视矩阵不可逆。"
+        ) from exc
+
+    # 从最终 target_points 反推实际安全边界。
+    # 这样即使外部入口临时替换 rectify_conveyor_belt，也能记录真实 margin。
+    target_arr = _np().asarray(
+        target_points,
+        dtype=_np().float64,
+    )
+    target_left = int(round(float(_np().min(target_arr[:, 0]))))
+    target_top = int(round(float(_np().min(target_arr[:, 1]))))
+
+    actual_left = max(0, target_left)
+    actual_top = max(0, target_top)
+    actual_right = max(
+        0,
+        int(output_width) - int(pixel_length) - actual_left,
+    )
+    actual_bottom = max(
+        0,
+        int(output_height) - int(vertical_distance) - actual_top,
     )
 
     belt_mask_path = session_dir / "belt_mask.png"
     preview_path = session_dir / "adjusted_preview.jpg"
-    _cv2().imwrite(str(belt_mask_path), best_mask)
-    _cv2().imwrite(str(preview_path), warped_belt)
+
+    if not _cv2().imwrite(str(belt_mask_path), best_mask):
+        raise RuntimeError(
+            f"无法写入传送带掩码：{belt_mask_path}"
+        )
+    if not _cv2().imwrite(str(preview_path), warped_belt):
+        raise RuntimeError(
+            f"无法写入矫正预览图：{preview_path}"
+        )
 
     result = CalibrationResult(
         calibration_id=calibration_id,
@@ -481,26 +818,64 @@ def run_calibration(
         belt_mask=belt_mask_path,
         adjusted_preview=preview_path,
         note=note,
+        output_width=int(output_width),
+        output_height=int(output_height),
+        canvas_mode="belt_margin",
+        canvas_margin_left_px=int(actual_left),
+        canvas_margin_right_px=int(actual_right),
+        canvas_margin_top_px=int(actual_top),
+        canvas_margin_bottom_px=int(actual_bottom),
+        canvas_side_margin_ratio=float(side_margin_ratio),
+        canvas_vertical_margin_ratio=float(vertical_margin_ratio),
+        canvas_version=ADJUST_CANVAS_VERSION,
     )
 
     # 写 calibration.json 与 current_calibration.json
     ensure_dir(CALIBRATION_DIR)
     calibration_payload = result.to_dict()
-    calibration_payload["mm_per_pixel"] = _mm_per_pixel(vertical_distance, pixel_length, real_length_mm)
+
+    # 物理尺度继续仅由“传送带本体宽度”计算，不受安全边界影响。
+    calibration_payload["mm_per_pixel"] = _mm_per_pixel(
+        vertical_distance,
+        pixel_length,
+        real_length_mm,
+    )
+
     calibration_json_path = session_dir / "calibration.json"
-    with open(calibration_json_path, "w", encoding="utf-8") as fp:
-        json.dump(calibration_payload, fp, ensure_ascii=False, indent=2)
+    with open(
+        calibration_json_path,
+        "w",
+        encoding="utf-8",
+    ) as fp:
+        json.dump(
+            calibration_payload,
+            fp,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     current_payload = {
         **calibration_payload,
         "source_image": calibration_payload["source_image"],
         "belt_mask": calibration_payload["belt_mask"],
         "adjusted_preview": calibration_payload["adjusted_preview"],
-        "calibration_json": to_project_relative(calibration_json_path),
+        "calibration_json": to_project_relative(
+            calibration_json_path
+        ),
     }
+
     ensure_dir(CALIBRATION_CURRENT_JSON.parent)
-    with open(CALIBRATION_CURRENT_JSON, "w", encoding="utf-8") as fp:
-        json.dump(current_payload, fp, ensure_ascii=False, indent=2)
+    with open(
+        CALIBRATION_CURRENT_JSON,
+        "w",
+        encoding="utf-8",
+    ) as fp:
+        json.dump(
+            current_payload,
+            fp,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     return result
 
@@ -556,7 +931,8 @@ def _warp_with_transform(
         transform_matrix,
         output_size,
         flags=_cv2().INTER_LINEAR,
-        borderMode=_cv2().BORDER_REPLICATE,
+        borderMode=_cv2().BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
     )
 
 
@@ -586,8 +962,52 @@ def rectify_image_folder(
 
     with open(calibration_json, "r", encoding="utf-8") as fp:
         payload = json.load(fp)
-    M = _np().array(payload["transform_matrix"], dtype=_np().float32)
-    output_size = (int(payload["pixel_length"]), int(payload["vertical_distance"]))
+    M = _np().array(
+        payload["transform_matrix"],
+        dtype=_np().float64,
+    )
+
+    # 新版标定 JSON：使用最终“传送带 + 安全边界”画布尺寸。
+    # 旧版 JSON 没有 output_width/output_height 时，退回旧字段以保持兼容。
+    output_width = payload.get("output_width")
+    output_height = payload.get("output_height")
+
+    if output_width is None or output_height is None:
+        output_width = payload.get("pixel_length")
+        output_height = payload.get("vertical_distance")
+        print(
+            "[WARN] 当前 calibration.json 为旧格式，缺少 "
+            "output_width/output_height；将使用 "
+            "pixel_length/vertical_distance 作为输出尺寸。"
+            "若要保留传送带边缘完整鱼，请重新执行一次标定。"
+        )
+
+    if output_width is None or output_height is None:
+        raise ValueError(
+            "标定文件同时缺少 output_width/output_height 和 "
+            "pixel_length/vertical_distance，无法确定输出尺寸。"
+        )
+
+    output_width = int(output_width)
+    output_height = int(output_height)
+    if output_width <= 0 or output_height <= 0:
+        raise ValueError(
+            f"标定文件中的输出尺寸无效："
+            f"{output_width}x{output_height}"
+        )
+
+    output_size = (
+        output_width,
+        output_height,
+    )
+
+    print(
+        "[adjust batch] "
+        f"canvas_version={payload.get('canvas_version', 'legacy')}, "
+        f"output_size={output_width}x{output_height}, "
+        f"belt_size={payload.get('pixel_length')}x"
+        f"{payload.get('vertical_distance')}"
+    )
 
     ensure_dir(output_dir)
     frames = _sorted_input_frames(input_dir)

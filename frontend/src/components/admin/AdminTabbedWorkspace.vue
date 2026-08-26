@@ -8,8 +8,9 @@
 // 行为：
 //   - 首页 tab 不可关闭
 //   - 子页面 tab 可切换、可关闭
-//   - 子页面内容由调用方通过 componentTabs / activeComponent 传入，
-//     渲染在 admin-tab-content 内，绝不外溢。
+//   - 支持每个 tab 独立传入 component + componentProps
+//   - 关闭非当前 tab：仅移除该 tab，不改变当前激活 tab
+//   - 关闭当前 tab：优先激活左侧相邻 tab；左侧不存在则激活右侧；再无则回到 home
 
 import { computed, ref, watch } from 'vue'
 import type { Component } from 'vue'
@@ -19,6 +20,7 @@ interface TabItem {
   title: string
   closable?: boolean
   component?: Component | null
+  componentProps?: Record<string, unknown>
 }
 
 const props = withDefaults(
@@ -47,10 +49,18 @@ watch(
 
 const visibleTabs = computed(() => internalTabs.value)
 
+const activeTab = computed<TabItem | null>(() => {
+  return visibleTabs.value.find((t) => t.key === props.activeKey) || null
+})
+
 const activeComponent = computed<Component | null>(() => {
-  const tab = internalTabs.value.find((t) => t.key === props.activeKey)
+  const tab = activeTab.value
   if (tab?.component) return tab.component
   return props.componentTabs?.[props.activeKey] || null
+})
+
+const activeComponentProps = computed<Record<string, unknown>>(() => {
+  return activeTab.value?.componentProps || {}
 })
 
 function activate(key: string) {
@@ -58,7 +68,32 @@ function activate(key: string) {
 }
 
 function closeTab(key: string) {
+  const idx = internalTabs.value.findIndex((t) => t.key === key)
+  if (idx < 0) return
+  const isActive = props.activeKey === key
+
+  // 计算关闭后要激活的下一个 tab
+  let nextKey: string | null = null
+  if (isActive) {
+    const remaining = internalTabs.value.filter((t) => t.key !== key)
+    if (remaining.length) {
+      const leftCandidate = idx - 1 >= 0 ? remaining[idx - 1] : undefined
+      const rightCandidate = idx < remaining.length ? remaining[idx] : undefined
+      const next = leftCandidate || rightCandidate || remaining[0]
+      nextKey = next ? next.key : 'home'
+    } else {
+      nextKey = 'home'
+    }
+  }
+
+  // 先 emit close：父组件必须真正从 openTabs 删除该 key 并设置新的 activeKey
   emit('close', key)
+  // 子组件内部列表同步删除（仅用于显示渲染，prop watcher 会再次同步）
+  internalTabs.value = internalTabs.value.filter((t) => t.key !== key)
+  // emit update:activeKey：通知父组件切换 activeKey
+  if (isActive && nextKey) {
+    emit('update:activeKey', nextKey)
+  }
 }
 </script>
 
@@ -84,7 +119,12 @@ function closeTab(key: string) {
       </div>
     </div>
     <div class="admin-tab-content">
-      <component :is="activeComponent" v-if="activeComponent" />
+      <component
+        :is="activeComponent"
+        v-if="activeComponent"
+        :key="activeTab?.key || activeKey"
+        v-bind="activeComponentProps"
+      />
       <slot v-else />
     </div>
   </div>
@@ -174,6 +214,12 @@ function closeTab(key: string) {
      子页面若需要白底展示表单/图表，自行在自己的根容器上设置 background: #fff 即可。 */
   background: transparent;
   box-sizing: border-box;
+}
+.admin-tab-content > .data-report-page {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
 }
 .admin-tab-content > * {
   width: 100%;

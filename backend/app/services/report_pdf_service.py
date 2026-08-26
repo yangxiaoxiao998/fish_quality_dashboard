@@ -58,10 +58,12 @@ def generate_daily_fish_quality_pdf(
     report_date: date,
     summary: dict,
     existing_report_id: int | None = None,
+    save_history: bool = True,
 ) -> dict:
     """生成每日鱼品质检测报告（docx 模板 → PDF）。
 
-    - 默认行为：新建一条 detection_report 记录，report_no 自增。
+    - 默认不写入 detection_report，日报只作为当前日期的文件生成。
+    - save_history=True 时才写入/更新一条日报记录。
     - 如果传入 existing_report_id，则视为"重新生成"：覆盖同一记录的
       file_path / file_size / summary_json / status / daily_conclusion 等字段，
       保留 report_no 与主键不变，避免 unique 冲突。
@@ -99,6 +101,8 @@ def generate_daily_fish_quality_pdf(
             context[k] = v
     context["report_file_name"] = file_name
     context["report_file_path"] = str(out_dir / file_name)
+    context["report_name"] = context.get("report_name") or f"鱼质检测日报_{date_str}"
+    context["system_name"] = context["report_name"]
 
     # 2) docx + PDF
     result = generate_daily_fish_quality_docx_and_pdf(
@@ -115,7 +119,22 @@ def generate_daily_fish_quality_pdf(
     file_name_final = final_pdf_path.name
     size = final_pdf_path.stat().st_size if final_pdf_path.exists() else 0
 
-    # 3) 写 detection_report
+    # 3) 可选写 detection_report。日报当前页面不依赖历史表，因此默认不保存。
+    if not save_history:
+        return {
+            "status": "generated",
+            "report_id": None,
+            "report_date": report_date.isoformat(),
+            "report_name": f"鱼质检测日报_{date_str}",
+            "file_name": file_name_final,
+            "file_path": rel_path,
+            "file_size": size,
+            "docx_path": str(docx_path) if docx_path else None,
+            "pdf_path": str(pdf_path) if pdf_path else None,
+            "leftover_placeholders": result.get("leftover_placeholders") or [],
+        }
+
+    # 4) 写 detection_report（仅兼容需要保留历史的调用方）
     if existing_report_id is not None:
         obj = db.get(DetectionReport, existing_report_id)
         if obj is None:
@@ -179,9 +198,9 @@ def generate_daily_fish_quality_pdf(
 
 
 def generate_video_report_no(video_id: str) -> str:
-    """视频报表编号：R<video_id_8>NNNN 简化形式。"""
-    short = video_id[:8] if video_id else "video"
-    return f"VR{short}"
+    """视频报表编号：按完整 video_id 生成，确保不同视频编号不冲突。"""
+    normalized = (video_id or "video").strip()
+    return f"VR{normalized}"
 
 
 def _safe_video_report_date(video: VideoTask) -> date:
