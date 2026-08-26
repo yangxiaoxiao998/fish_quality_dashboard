@@ -12,12 +12,14 @@
    ``first_match/``、``videos/grounded_sam.mp4``。
 5. ``core.filter_complete_fish``：分完整鱼到 ``complete_match/``、不完整鱼到
    ``incomplete_match/``。
-6. ``core.fish_condition``：计算体长、体高、体重、肥满度，输出
-   ``measurements/long_height_weight_results.csv``。
-7. ``publish_results``：把上述**长期可交付**产物从 ``data/jobs/<video_id>/``
+6. ``core.fish_condition``：计算含尾全长、体长、体高、体重、肥满度，输出
+   ``measurements/long_height_weight_results.csv`` 和测量可视化图片。
+7. ``core/arched-back.py``：读取已对齐的完整鱼 crop/mask 对，将
+   ``arched_back_ratio`` 回填到上述测量 CSV。
+8. ``publish_results``：把上述**长期可交付**产物从 ``data/jobs/<video_id>/``
    发布到 ``data/results/<video_id>/``，使用 ``<video_id>.partial/`` 临时目录。
-8. 默认清理 jobs 中间过程（raw / adjusted / annotated_frames / first_match /
-   fish_condition_images），保留 CSV、JSON、标注视频、complete_match、
+9. 默认清理 jobs 中间过程（raw / adjusted / annotated_frames / first_match），
+   保留测量可视化图片、CSV、JSON、标注视频、complete_match、
    incomplete_match、输入副本。
 
 video_id 规则：
@@ -39,6 +41,7 @@ import csv
 import datetime as _dt
 import json
 import os
+import runpy
 import shutil
 import sys
 from pathlib import Path
@@ -46,8 +49,14 @@ from typing import Iterable
 
 THIS_DIR = Path(__file__).resolve().parent
 ALGORITHMS_ROOT = THIS_DIR.parent
-if str(ALGORITHMS_ROOT) not in sys.path:
-    sys.path.insert(0, str(ALGORITHMS_ROOT))
+PROJECT_DIR = ALGORITHMS_ROOT.parent
+
+# 该脚本既支持在 ``algorithms/tools/`` 中直接执行，也支持从项目根目录以
+# ``python -m`` 启动。前者需要项目根目录才能解析 ``algorithms.*``，而各
+# 阶段保留的 ``from config ...`` 导入仍需要 ``algorithms/`` 本身在搜索路径中。
+for import_root in (PROJECT_DIR, ALGORITHMS_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 from config.cleanup import remove_dir, remove_dir_contents  # noqa: E402
 from config.paths import (  # noqa: E402
@@ -60,6 +69,7 @@ from config.paths import (  # noqa: E402
     generate_video_id,
     job_dir,
     resolve_input_path,
+    result_arched_back_dir,
     result_complete_match_dir,
     result_dir,
     result_error_conclusion_txt,
@@ -68,13 +78,13 @@ from config.paths import (  # noqa: E402
     result_incomplete_match_dir,
     result_input_dir,
     result_long_height_csv,
-    result_measurements_dir,
     result_partial_dir,
     result_pipeline_result_json,
     result_reports_dir,
     result_videos_dir,
     to_project_relative,
     video_annotated_frames_dir,
+    video_arched_back_dir,
     video_complete_match_dir,
     video_crop_images_dir,
     video_fish_condition_images_dir,
@@ -126,6 +136,21 @@ def _call_submodule_main(module_name: str, argv: list[str]) -> int:
     return int(module.main(argv))
 
 
+def _call_script_main(script_path: Path, argv: list[str]) -> int:
+    """调用文件名不适合普通 Python import 的项目脚本。
+
+    ``arched-back.py`` 带连字符，因此通过 ``runpy`` 加载其命名空间，
+    再以与其它 pipeline 模块相同的方式调用 ``main(argv)``。
+    """
+
+    print(f"[exec] python {script_path} {' '.join(argv)}")
+    namespace = runpy.run_path(str(script_path), run_name="_pipeline_arched_back")
+    main_func = namespace.get("main")
+    if not callable(main_func):
+        raise RuntimeError(f"脚本缺少可调用的 main(argv): {script_path}")
+    return int(main_func(argv))
+
+
 # ---------------------------------------------------------------------------
 # 故障注入
 # ---------------------------------------------------------------------------
@@ -135,6 +160,7 @@ FAULT_AFTER_ADJUST_BATCH = "after_adjust_batch"
 FAULT_AFTER_GROUNDED_SAM = "after_grounded_sam"
 FAULT_AFTER_FILTER_COMPLETE_FISH = "after_filter_complete_fish"
 FAULT_BEFORE_FISH_CONDITION_CSV = "before_fish_condition_csv"
+FAULT_AFTER_ARCHED_BACK = "after_arched_back"
 FAULT_BEFORE_PUBLISH_RESULTS = "before_publish_results"
 
 VALID_FAULT_STAGES: tuple[str, ...] = (
@@ -144,6 +170,7 @@ VALID_FAULT_STAGES: tuple[str, ...] = (
     FAULT_AFTER_GROUNDED_SAM,
     FAULT_AFTER_FILTER_COMPLETE_FISH,
     FAULT_BEFORE_FISH_CONDITION_CSV,
+    FAULT_AFTER_ARCHED_BACK,
     FAULT_BEFORE_PUBLISH_RESULTS,
 )
 
@@ -297,7 +324,7 @@ def step_video_to_frames(args, ctx: dict) -> int:
         argv.extend(["--frame-start", str(args.frame_start)])
     if args.frame_end is not None:
         argv.extend(["--frame-end", str(args.frame_end)])
-    rc = _call_submodule_main("tools.video_to_frames", argv)
+    rc = _call_submodule_main("algorithms.tools.video_to_frames", argv)
     maybe_simulate_failure(args, FAULT_AFTER_VIDEO_TO_FRAMES)
     return rc
 
@@ -322,7 +349,7 @@ def step_adjust(args, ctx: dict) -> int:
     ]
     if args.keep_raw_frames:
         argv.append("--keep-raw-frames")
-    rc = _call_submodule_main("core.adjust", argv)
+    rc = _call_submodule_main("algorithms.core.adjust", argv)
 
     # core.adjust.batch 在默认（非 keep_raw_frames）情况下已经清理 raw；
     # 这里再做一次安全确认 + 日志，绝不触碰视频或标定原图所在目录。
@@ -350,6 +377,14 @@ def step_grounded_sam(args, ctx: dict) -> int:
     ]
     if args.box_threshold is not None:
         argv.extend(["--box-threshold", str(args.box_threshold)])
+    argv.extend(
+        [
+            "--top-edge-ratio", str(args.top_edge_ratio),
+            "--bottom-edge-ratio", str(args.bottom_edge_ratio),
+            "--left-edge-ratio", str(args.left_edge_ratio),
+            "--right-edge-ratio", str(args.right_edge_ratio),
+        ]
+    )
     if getattr(args, "grounded_config", None):
         argv.extend(["--config", str(args.grounded_config)])
     if getattr(args, "grounded_checkpoint", None):
@@ -362,7 +397,7 @@ def step_grounded_sam(args, ctx: dict) -> int:
         argv.append("--use-sam-hq")
     if getattr(args, "transform_matrix", None):
         argv.extend(["--transform-matrix", str(args.transform_matrix)])
-    rc = _call_submodule_main("core.grounded_sam_mmdet_batch", argv)
+    rc = _call_submodule_main("algorithms.core.grounded_sam_mmdet_batch", argv)
     maybe_simulate_failure(args, FAULT_AFTER_GROUNDED_SAM)
     return rc
 
@@ -371,7 +406,10 @@ def step_filter_complete(args, ctx: dict) -> int:
     argv = [
         "--video-id", args.video_id,
     ]
-    rc = _call_submodule_main("core.filter_complete_fish", argv)
+    if getattr(args, "force_all_complete", False):
+        argv.append("--force-all-complete")
+        print("[INFO] 跳过完整性 ViT 判断：所有可正常处理的分割鱼按完整鱼处理。")
+    rc = _call_submodule_main("algorithms.core.filter_complete_fish", argv)
     maybe_simulate_failure(args, FAULT_AFTER_FILTER_COMPLETE_FISH)
     return rc
 
@@ -392,13 +430,23 @@ def step_fish_condition(args, ctx: dict) -> int:
         argv.extend(["--wound-checkpoint", str(args.wound_checkpoint)])
     if getattr(args, "wound_threshold", None) is not None:
         argv.extend(["--wound-threshold", str(args.wound_threshold)])
-    rc = _call_submodule_main("core.fish_condition", argv)
+    rc = _call_submodule_main("algorithms.core.fish_condition", argv)
     maybe_simulate_failure(args, FAULT_BEFORE_FISH_CONDITION_CSV)
     return rc
 
 
+def step_arched_back(args, ctx: dict) -> int:  # noqa: ARG001
+    """计算完整鱼弓背指标，并回填 fish_condition 生成的 CSV。"""
+
+    script_path = ALGORITHMS_ROOT / "core" / "arched-back.py"
+    rc = _call_script_main(script_path, ["--video-id", args.video_id])
+    maybe_simulate_failure(args, FAULT_AFTER_ARCHED_BACK)
+    return rc
+
+
 # 正式 pipeline stages：标定（calibrate）已经独立到 adjust_calibration，
-# 不再作为 stage。pipeline 只负责抽帧 / 矫正 / 检测分割 / 完整鱼筛选 / 测量 / 发布。
+# 不再作为 stage。pipeline 只负责抽帧 / 矫正 / 检测分割 / 完整鱼筛选 /
+# 鱼体测量 / 弓背指标 / 发布。
 # 旧的 "calibrate" 仍保留兼容入口（会立即返回 0），不再参与 stages。
 STEPS = [
     ("calibrate", step_calibrate),
@@ -407,6 +455,7 @@ STEPS = [
     ("grounded_sam", step_grounded_sam),
     ("filter_complete_fish", step_filter_complete),
     ("fish_condition", step_fish_condition),
+    ("arched_back", step_arched_back),
 ]
 
 
@@ -423,6 +472,7 @@ def prepare_job_dirs(video_id: str) -> None:
         video_incomplete_match_dir(video_id),
         video_videos_dir(video_id),
         video_measurements_dir(video_id),
+        video_arched_back_dir(video_id),
         video_fish_condition_images_dir(video_id),
         video_reports_dir(video_id),
     ]:
@@ -443,7 +493,8 @@ def _csv_row_to_fish_record(row: dict, *, video_id: str) -> dict:
     长期字段精简后只保留 CSV 一致的核心字段：
     ``track_id / fish_uid / frame_index / crop_image_path /
     body_length_cm / body_length_no_tail_cm / body_height_cm /
-    pred_weight_g / condition_factor / hex_color / surface_damage_ratio / status / error_message``。
+    pred_weight_g / condition_factor / hex_color / surface_damage_ratio /
+    arched_back_ratio / status / error_message``。
     完整性由 ``status`` 推断（``complete`` = 完整，``incomplete`` / ``failed`` = 其他）。
     """
 
@@ -491,6 +542,8 @@ def _csv_row_to_fish_record(row: dict, *, video_id: str) -> dict:
         "fish_uid": row.get("fish_uid", ""),
         "frame_index": _maybe_int(row.get("frame_index", "")),
         "crop_image_path": _rewrite_crop_path_to_results(row.get("crop_image_path", "")),
+        "fish_condition_image_path": row.get("fish_condition_image_path", "") or None,
+        "arched_back_image_path": row.get("arched_back_image_path", "") or None,
         "body_length_cm": _maybe_number(row.get("body_length_cm", "")) if has_full_metrics else None,
         "body_length_no_tail_cm": _maybe_number(row.get("body_length_no_tail_cm", "")) if has_full_metrics else None,
         "body_height_cm": _maybe_number(row.get("body_height_cm", "")) if has_full_metrics else None,
@@ -498,6 +551,9 @@ def _csv_row_to_fish_record(row: dict, *, video_id: str) -> dict:
         "condition_factor": _maybe_number(row.get("condition_factor", "")) if has_full_metrics else None,
         "hex_color": row.get("hex_color", "") or None,
         "surface_damage_ratio": _maybe_number(row.get("surface_damage_ratio", "")) if has_full_metrics else None,
+        # 弓背计算与 fish_condition 几何测量独立；即使几何测量失败，
+        # 只要 arched-back 阶段成功，仍保留该比值。
+        "arched_back_ratio": _maybe_number(row.get("arched_back_ratio", "")),
         "status": status or "incomplete",
         "error_message": row.get("error_message", "") or "",
     }
@@ -537,6 +593,10 @@ def build_pipeline_result(
         "calibration_json": _log(calibration_json) if calibration_json else _log(CALIBRATION_CURRENT_JSON),
         "grounded_video": _log(result_grounded_sam_video(video_id)),
         "measurement_csv": _log(result_long_height_csv(video_id)),
+        "fish_condition_visualizations_dir": _log(
+            result_fish_images_dir(video_id) / "fish_condition_images"
+        ),
+        "arched_back_results_dir": _log(result_arched_back_dir(video_id)),
         "complete_match_dir": _log(result_complete_match_dir(video_id)),
         "incomplete_match_dir": _log(result_incomplete_match_dir(video_id)),
         "pipeline_result_path": _log(result_pipeline_result_json(video_id)),
@@ -706,14 +766,37 @@ def _safe_copy_tree(src: Path, dst: Path) -> None:
             _safe_copy_file(child, target)
 
 
-def _rewrite_csv_paths_to_results(csv_path: Path, video_id: str) -> None:
+def _rewrite_csv_paths_to_results(
+    csv_path: Path,
+    video_id: str,
+    *,
+    fish_condition_images_dir: Path | None = None,
+    arched_back_dir: Path | None = None,
+) -> None:
     """把 CSV 中指向 ``data/jobs/<video_id>/crop_images/...`` 的路径改写到
-    ``data/results/<video_id>/fish_images/...``。"""
+    ``data/results/<video_id>/fish_images/...``。
+
+    发布鱼体测量和弓背可视化时，同时按 ``track_id + frame_index``
+    将每条鱼的两张代表图路径写入 CSV。只有源图真实存在时才写入，
+    不完整鱼或生成失败的记录保持空路径。
+    """
 
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as fp:
         reader = csv.DictReader(fp)
         rows = list(reader)
-        fieldnames = reader.fieldnames or []
+        fieldnames = list(reader.fieldnames or [])
+
+    visualization_fields = (
+        "fish_condition_image_path",
+        "arched_back_image_path",
+    )
+    include_visualization_paths = (
+        fish_condition_images_dir is not None or arched_back_dir is not None
+    )
+    if include_visualization_paths:
+        for field in visualization_fields:
+            if field not in fieldnames:
+                fieldnames.append(field)
 
     old_complete = f"data/jobs/{video_id}/crop_images/complete_match/"
     new_complete = f"data/results/{video_id}/fish_images/complete_match/"
@@ -735,6 +818,40 @@ def _rewrite_csv_paths_to_results(csv_path: Path, video_id: str) -> None:
         for col in ("crop_image_path",):
             if col in row and row[col]:
                 row[col] = _rewrite(row[col])
+
+        if not include_visualization_paths:
+            continue
+
+        row["fish_condition_image_path"] = ""
+        row["arched_back_image_path"] = ""
+        try:
+            track_id = int(row.get("track_id", ""))
+            frame_index = int(row.get("frame_index", ""))
+        except (TypeError, ValueError):
+            continue
+
+        stem = f"id_{track_id}_{frame_index:012d}"
+        if fish_condition_images_dir is not None:
+            fish_condition_image = (
+                fish_condition_images_dir
+                / stem
+                / f"{stem}_with_line.jpg"
+            )
+            if fish_condition_image.is_file():
+                row["fish_condition_image_path"] = (
+                    f"data/results/{video_id}/fish_images/"
+                    f"fish_condition_images/{stem}/{stem}_with_line.jpg"
+                )
+
+        if arched_back_dir is not None:
+            arched_back_image = (
+                arched_back_dir / "overlays" / f"{stem}_overlay.png"
+            )
+            if arched_back_image.is_file():
+                row["arched_back_image_path"] = (
+                    f"data/results/{video_id}/fish_images/"
+                    f"arched_back/overlays/{stem}_overlay.png"
+                )
 
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
@@ -766,6 +883,7 @@ def _rewrite_pipeline_result_paths(payload: dict, video_id: str) -> dict:
         "input_video",
         "grounded_video",
         "measurement_csv",
+        "arched_back_results_dir",
         "complete_match_dir",
         "incomplete_match_dir",
     ):
@@ -863,15 +981,37 @@ def publish_results(
                     continue
                 _safe_copy_file(entry, dst / entry.name)
 
+    src_fish_condition_images = video_fish_condition_images_dir(video_id)
+    src_arched_back = video_arched_back_dir(video_id)
+
     # 4. measurements/long_height_weight_results.csv
     src_csv = video_long_height_csv(video_id)
     if src_csv.is_file():
         dst_csv = _partial_measurements_dir() / "long_height_weight_results.csv"
         _safe_copy_file(src_csv, dst_csv)
         # 改写 CSV 内路径
-        _rewrite_csv_paths_to_results(dst_csv, video_id)
+        _rewrite_csv_paths_to_results(
+            dst_csv,
+            video_id,
+            fish_condition_images_dir=src_fish_condition_images,
+            arched_back_dir=src_arched_back,
+        )
 
-    # 5. reports/pipeline_result.json（jobs 版已存在；改写路径后写到 partial）
+    # 5. 鱼体测量过程和最终标注图，与 complete_match 一起放在 fish_images/。
+    if src_fish_condition_images.is_dir():
+        _safe_copy_tree(
+            src_fish_condition_images,
+            _partial_fish_images_dir() / "fish_condition_images",
+        )
+
+    # 6. 弓背指标的全部明细、mask 和可视化中间结果。
+    if src_arched_back.is_dir():
+        _safe_copy_tree(
+            src_arched_back,
+            _partial_fish_images_dir() / "arched_back",
+        )
+
+    # 7. reports/pipeline_result.json（jobs 版已存在；改写路径后写到 partial）
     jobs_report = video_pipeline_result_json(video_id)
     if jobs_report.is_file():
         with open(jobs_report, "r", encoding="utf-8") as fp:
@@ -892,7 +1032,7 @@ def publish_results(
     # 同步更新 jobs/reports/pipeline_result.json（去掉 .partial，前端路径不变）
     _fix_partial_paths_in_jobs_reports(video_id)
 
-    # 6. reports/error_conclusion.txt（如果存在）
+    # 8. reports/error_conclusion.txt（如果存在）
     jobs_err = video_reports_dir(video_id) / "error_conclusion.txt"
     if jobs_err.is_file():
         _safe_copy_file(jobs_err, _partial_reports_dir() / "error_conclusion.txt")
@@ -964,10 +1104,10 @@ def _fix_partial_paths_in_jobs_reports(video_id: str) -> None:
 def cleanup_intermediate_dirs(args) -> None:
     """按 ``--keep-*`` 开关安全删除 jobs 中间过程目录。
 
-    默认行为：删除 raw / adjusted / annotated_frames / first_match /
-    fish_condition_images；保留 complete_match、incomplete_match、标注视频、
-    CSV、pipeline_result.json、input/。这些保留项会随后被 ``publish_results``
-    复制到 ``data/results/<video_id>/`` 长期目录。
+    默认行为：删除 raw / adjusted / annotated_frames / first_match；保留
+    fish_condition_images、complete_match、incomplete_match、标注视频、CSV、
+    pipeline_result.json、input/。这些保留项会随后被 ``publish_results`` 复制到
+    ``data/results/<video_id>/`` 长期目录。
     """
 
     job_root = job_dir(args.video_id)
@@ -1008,7 +1148,7 @@ def cleanup_intermediate_dirs(args) -> None:
     else:
         print(f"[keep] annotated_frames 保留：{_log(video_annotated_frames_dir(args.video_id))}")
 
-    # 5. measurements/fish_condition_images：fish_condition 已默认清理；这里再次确认
+    # 5. measurements/fish_condition_images：默认保留，方便复核全长/体长/体高。
     if not args.keep_measurement_debug_images:
         fc_dir = video_fish_condition_images_dir(args.video_id)
         expected_root = video_measurements_dir(args.video_id)
@@ -1025,6 +1165,7 @@ def cleanup_intermediate_dirs(args) -> None:
         ("incomplete_match", video_incomplete_match_dir(args.video_id)),
         ("videos/grounded_sam.mp4", video_grounded_sam_video(args.video_id)),
         ("measurements CSV", video_long_height_csv(args.video_id)),
+        ("arched_back 中间结果", video_arched_back_dir(args.video_id)),
         ("reports/pipeline_result.json", video_pipeline_result_json(args.video_id)),
     ]:
         print(f"[keep] {label} 保留：{_log(path)}")
@@ -1039,7 +1180,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "一键鱼体检测 pipeline：calibrate(可选) → video_to_frames → adjust → "
-            "grounded_sam → filter_complete_fish → fish_condition → publish_results + 默认清理。"
+            "grounded_sam → filter_complete_fish → fish_condition → arched_back "
+            "→ publish_results + 默认清理。"
             "所有路径来自 config/paths；CLI 允许传入绝对路径或相对于项目根的相对路径。"
             "默认不传 --video-id 时，系统自动生成 video_YYYYMMDD_HHMMSS_<8位uuid>。"
         )
@@ -1110,7 +1252,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="SAM-HQ 权重路径；相对项目根或绝对路径。默认 algorithms/pth/sam_hq_vit_h.pth",
     )
     parser.add_argument("--use-sam-hq", action="store_true", help="使用 SAM-HQ 而非基础 SAM")
-    parser.add_argument("--box-threshold", type=float, default=0.3, help="检测框阈值，默认 0.3")
+    parser.add_argument("--box-threshold", type=float, default=0.5, help="检测框阈值，默认 0.5")
+    parser.add_argument(
+        "--top-edge-ratio",
+        type=float,
+        default=0.0,
+        help="顶部有效检测区域向内收缩的画面高度比例",
+    )
+    parser.add_argument(
+        "--bottom-edge-ratio",
+        type=float,
+        default=0.0,
+        help="底部有效检测区域向内收缩的画面高度比例",
+    )
+    parser.add_argument(
+        "--left-edge-ratio",
+        type=float,
+        default=0.0,
+        help="左侧允许检测区域向画面外扩展的画面宽度比例",
+    )
+    parser.add_argument(
+        "--right-edge-ratio",
+        type=float,
+        default=0.0,
+        help="右侧允许检测区域向画面外扩展的画面宽度比例",
+    )
     parser.add_argument("--frame-start", type=int, default=None)
     parser.add_argument("--frame-end", type=int, default=None)
     parser.add_argument("--transform-matrix", default=None)
@@ -1133,6 +1299,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="wound 检测 score 阈值，默认 0.5",
     )
+    parser.add_argument(
+        "--force-all-complete",
+        action="store_true",
+        help=(
+            "跳过完整性 ViT 判断；所有可正常处理的分割鱼都按完整鱼处理，"
+            "但仍执行方向校正以保证后续测量数据格式不变。"
+        ),
+    )
 
     # 行为开关
     parser.add_argument("--overwrite", action="store_true",
@@ -1148,8 +1322,19 @@ def build_parser() -> argparse.ArgumentParser:
                         help="保留 crop_images/first_match/")
     parser.add_argument("--keep-annotated-frames", action="store_true",
                         help="保留 crop_images/annotated_frames/")
-    parser.add_argument("--keep-measurement-debug-images", action="store_true",
-                        help="保留 measurements/fish_condition_images/")
+    parser.add_argument(
+        "--keep-measurement-debug-images",
+        dest="keep_measurement_debug_images",
+        action="store_true",
+        default=True,
+        help="保留 measurements/fish_condition_images/（默认行为）",
+    )
+    parser.add_argument(
+        "--discard-measurement-debug-images",
+        dest="keep_measurement_debug_images",
+        action="store_false",
+        help="发布后删除 jobs 中的 measurements/fish_condition_images/",
+    )
 
     parser.add_argument(
         "--steps",
@@ -1169,7 +1354,7 @@ def build_parser() -> argparse.ArgumentParser:
             "【内部测试参数】模拟在某阶段后抛 RuntimeError 触发失败流程。"
             "生产环境不要使用。可选：none / after_video_to_frames / "
             "after_adjust_batch / after_grounded_sam / after_filter_complete_fish / "
-            "before_fish_condition_csv / before_publish_results。"
+            "before_fish_condition_csv / after_arched_back / before_publish_results。"
         ),
     )
     return parser
@@ -1395,7 +1580,7 @@ def _run_pipeline(args, state: PipelineState, ctx=None) -> int:
         print(f"[step:{step_name}] 完成")
 
         # before_publish_results 钩子
-        if step_name == "fish_condition":
+        if step_name == "arched_back":
             maybe_simulate_failure(args, FAULT_BEFORE_PUBLISH_RESULTS)
 
     csv_path = video_long_height_csv(args.video_id)
@@ -1458,6 +1643,7 @@ def _run_pipeline(args, state: PipelineState, ctx=None) -> int:
     print(f"results_dir           : {_log(result_dir(args.video_id))}")
     print(f"grounded_video        : {payload['grounded_video']}")
     print(f"measurement_csv       : {payload['measurement_csv']}")
+    print(f"arched_back_results   : {payload['arched_back_results_dir']}")
     print(f"complete_match        : {payload['complete_match_dir']}")
     print(f"incomplete_match      : {payload['incomplete_match_dir']}")
     print(f"pipeline_result       : {payload['measurement_csv'] and 'results/reports/pipeline_result.json'}")

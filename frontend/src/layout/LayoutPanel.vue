@@ -1,5 +1,5 @@
 <template>
-  <div class="layout-panel animate animate__bounceIn">
+  <div class="layout-panel animate animate-pop-in">
     <div class="panel-header">
       <div class="panel-header-title">{{ title }}</div>
     </div>
@@ -22,10 +22,10 @@ const props = defineProps<PropsType>()
   background-image: url('@/assets/images/panel_body_bg.png');
   background-repeat: no-repeat;
   background-size: 100% 100%;
-  .panel-header {
+    .panel-header {
     display: flex;
     align-items: center;
-    height: 65px;
+      height: 65px;
     font-family: DouyuFont;
     background-image: url('@/assets/images/panel_title_bg.png');
     background-repeat: no-repeat;
@@ -33,8 +33,8 @@ const props = defineProps<PropsType>()
     .panel-header-title {
       position: relative;
       top: -8px;
-      left: 90px;
-      font-size: 18px;
+        left: 90px;
+        font-size: 18px;
     }
   }
   .panel-body {
@@ -45,6 +45,20 @@ const props = defineProps<PropsType>()
     padding: 0 10px 5px; // 增加顶部内边距，为向上偏移的图片提供更多空间。
     // padding: 20px 10px 10px 10px; 表示上、右、下、左四个方向的 padding 分别为 20px、10px、10px、10px
     overflow: hidden;
+  }
+}
+.animate-pop-in {
+  animation: layout-pop-in 0.45s ease-out both;
+}
+
+@keyframes layout-pop-in {
+  from {
+    transform: scale(0.85);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
   }
 }
 </style>

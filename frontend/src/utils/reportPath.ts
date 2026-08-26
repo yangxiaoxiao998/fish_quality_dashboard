@@ -12,7 +12,7 @@
  *   - http(s)://... 完整 URL
  *
  * 浏览器 <video>/<img> 标签需要的格式：
- *   - 相对路径 /static/...  ← 让 Vite proxy (1124) / 后端 StaticFiles (8000) 处理
+ *   - 相对路径 /static/...  ← 让 Vite proxy (5173) / 后端 StaticFiles (8000) 处理
  *   - 完整 URL
  */
 

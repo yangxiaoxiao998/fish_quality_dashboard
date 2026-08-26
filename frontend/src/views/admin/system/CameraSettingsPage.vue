@@ -21,7 +21,7 @@ import CameraSettingsPanel, { type CameraConfig } from '@/components/camera/Came
 
 function onApplied(_cfg: CameraConfig) {
   // 系统设置页：applied 仅做提示，不关闭页面（页面无 modal）。
-  // 业务方若需要把配置写入 Dashboard.cameraConfig，由后续阶段接入。
+  // 配置已由 CameraSettingsPanel 保存到后端。
   Message.success('摄像头设置已应用')
 }
 

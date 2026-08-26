@@ -47,7 +47,29 @@ export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export FISH_UVICORN_RELOAD="${FISH_UVICORN_RELOAD:-0}"
 
-export FISH_BERT_BASE_UNCASED_PATH="$PROJECT_ROOT_REAL/algorithms/bert-base-uncased"
+BERT_DIR="$PROJECT_ROOT_REAL/algorithms/pth/bert-base-uncased"
+BERT_REQUIRED_FILES=(
+  config.json
+  pytorch_model.bin
+  tokenizer_config.json
+  tokenizer.json
+  vocab.txt
+)
+if [ ! -d "$BERT_DIR" ]; then
+  echo "[ERROR] BERT模型目录不存在：$BERT_DIR"
+  exit 1
+fi
+for file in "${BERT_REQUIRED_FILES[@]}"; do
+  if [ ! -s "$BERT_DIR/$file" ]; then
+    echo "[ERROR] BERT模型文件不存在或为空：$BERT_DIR/$file"
+    exit 1
+  fi
+done
+echo "[OK] BERT模型目录：$BERT_DIR"
+ls -lh "$BERT_DIR/pytorch_model.bin"
+
+export FISH_BERT_BASE_UNCASED_PATH="$BERT_DIR"
+export GDINO_BERT_PATH="$BERT_DIR"
 export FISH_GROUNDING_DINO_CONFIG="$PROJECT_ROOT_REAL/algorithms/fishalgo/measures/crop_images/grounding_dino_swin-t_finetune_8xb4_50e_fish.py"
 export FISH_GROUNDING_DINO_CHECKPOINT="$PROJECT_ROOT_REAL/algorithms/pth/best_coco_bbox_mAP_epoch_12.pth"
 export FISH_SAM_CHECKPOINT="$PROJECT_ROOT_REAL/algorithms/pth/sam_vit_h_4b8939.pth"

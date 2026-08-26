@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import subprocess
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.repositories.models import VideoTask
 from app.utils.time_utils import now_beijing
+from app.services.path_service import to_abs_data_path
 
 
 _RANGE_DAYS = {
@@ -21,6 +23,24 @@ def _range_start(range_value: str):
     if days is None:
         return None
     return now_beijing() - timedelta(days=days)
+
+
+def _probe_duration(path: str | None) -> float | None:
+    if not path:
+        return None
+    resolved = to_abs_data_path(path)
+    if resolved is None or not resolved.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(resolved)],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        value = float(result.stdout.strip())
+        return value if value > 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
 
 
 def get_platform_usage_summary(db: Session, range_value: str = "7d") -> dict:
@@ -44,13 +64,24 @@ def get_platform_usage_summary(db: Session, range_value: str = "7d") -> dict:
     durations = []
     fps_values = []
     for t in tasks:
-        if t.started_at and t.finished_at:
+        if t.processing_duration_seconds is not None:
+            durations.append(float(t.processing_duration_seconds))
+        elif t.started_at and t.finished_at:
             durations.append((t.finished_at - t.started_at).total_seconds())
         if t.fps_estimate:
             fps_values.append(float(t.fps_estimate))
 
     avg_processing = round(sum(durations) / len(durations), 2) if durations else 0
     avg_fps = round(sum(fps_values) / len(fps_values), 2) if fps_values else 0
+
+    total_duration = 0.0
+    for task in tasks:
+        value = task.video_duration_seconds
+        if value is None:
+            value = _probe_duration(task.source_path)
+        if value is not None and value > 0:
+            total_duration += float(value)
+    total_video_duration = round(total_duration, 2)
 
     return {
         "total_video_tasks": total,
@@ -63,7 +94,7 @@ def get_platform_usage_summary(db: Session, range_value: str = "7d") -> dict:
         "failure_rate": round(failed_count / total, 4) if total else 0,
         "total_fish": total_fish,
         "avg_fish_per_video": avg_fish,
-        "total_video_duration": 0,
+        "total_video_duration": total_video_duration,
         "avg_processing_duration": avg_processing,
         "avg_fps": avg_fps,
         "camera_start_count": camera_count,
@@ -93,8 +124,10 @@ def get_platform_usage_charts(db: Session, range_value: str = "7d") -> dict:
         if t.status == "failed":
             daily_failed[day] = daily_failed.get(day, 0) + 1
 
-        if t.started_at and t.finished_at:
+        duration_seconds = t.processing_duration_seconds
+        if duration_seconds is None and t.started_at and t.finished_at:
             duration_seconds = (t.finished_at - t.started_at).total_seconds()
+        if duration_seconds is not None:
             if duration_seconds >= 0:
                 daily_duration_sum[day] = daily_duration_sum.get(day, 0.0) + duration_seconds
                 daily_duration_count[day] = daily_duration_count.get(day, 0) + 1

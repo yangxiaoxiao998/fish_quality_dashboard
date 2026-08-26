@@ -22,7 +22,7 @@
       <!-- 文字板块 -->
       <ReportSection
         id="text-block"
-        title="文字板块"
+        title="一、文字板块"
         subtitle="以文字和指标卡片形式汇总当日检测结果。"
       >
         <div class="block-subtitle">当日检测概览</div>
@@ -31,12 +31,12 @@
         <div class="block-subtitle">当日核心指标</div>
         <ReportMetricsGrid :rows="metricsRows" />
 
-        <div class="block-subtitle">当日异常与破损分析</div>
+        <!-- <div class="block-subtitle">当日异常与破损分析</div>
         <a-empty
           v-if="!hasAbnormalData"
           description="暂无异常或破损统计数据"
         />
-        <ReportMetricsGrid v-else :rows="abnormalRows" />
+        <ReportMetricsGrid v-else :rows="abnormalRows" /> -->
       </ReportSection>
 
       <!-- 图表板块 -->
@@ -55,19 +55,13 @@
             <div ref="statusPieRef" class="chart-canvas chart-canvas-tall"></div>
           </a-card>
           <a-card :bordered="false" class="chart-card">
-            <template #title>
-              <span class="chart-title">鱼数量趋势（{{ charts.fish_count_trend[0]?.bucket_kind === 'day' ? '按天' : '按小时' }}）</span>
-            </template>
-            <div ref="trendRef" class="chart-canvas chart-canvas-tall"></div>
-          </a-card>
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">体长分布 (cm)</span></template>
+             <template #title><span class="chart-title">全长分布 (cm)</span></template>
             <div ref="lengthDistRef" class="chart-canvas"></div>
           </a-card>
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">无尾体长分布 (cm)</span></template>
+           <a-card :bordered="false" class="chart-card">
+              <template #title><span class="chart-title">体高分布 (cm)</span></template>
             <div ref="noTailDistRef" class="chart-canvas"></div>
-          </a-card>
+           </a-card>
           <a-card :bordered="false" class="chart-card">
             <template #title><span class="chart-title">体高分布 (cm)</span></template>
             <div ref="heightDistRef" class="chart-canvas"></div>
@@ -94,24 +88,32 @@
         subtitle="以表格形式展示当日所有视频任务数据。"
       >
         <a-empty v-if="!videoTasks.length" description="当日暂无视频任务" />
-        <div v-else class="table-scroll">
-          <a-table
-            :data="videoTasks"
-            :pagination="false"
+         <div v-else class="table-scroll">
+           <a-table
+             :data="pagedVideoTasks"
+             :pagination="videoPagination"
             row-key="video_id"
             stripe
             :scroll="{ x: 1100 }"
           >
-            <a-table-column title="视频编号" data-index="video_id" :width="220" />
-            <a-table-column title="检测时间" :width="170">
-              <template #cell="{ record }">{{ formatChinaDateTime(record.created_at) }}</template>
-            </a-table-column>
-            <a-table-column title="状态" data-index="status" :width="110" />
-            <a-table-column title="总鱼数" data-index="total_fish" :width="90" />
-            <a-table-column title="完整" data-index="complete_fish" :width="80" />
-            <a-table-column title="不完整" data-index="incomplete_fish" :width="90" />
-            <a-table-column title="失败" data-index="failed_fish" :width="80" />
-            <a-table-column title="破损" data-index="damaged_fish" :width="80" />
+            <template #columns>
+              <a-table-column title="视频编号" data-index="video_id" :width="220" />
+              <a-table-column title="检测时间" :width="170">
+                <template #cell="{ record }">{{ formatChinaDateTime(record.created_at) }}</template>
+              </a-table-column>
+              <a-table-column title="状态" data-index="status" :width="110" />
+               <a-table-column title="总鱼数" :width="90"><template #cell="{ record }">{{ displayValue(record.total_fish) }}</template></a-table-column>
+               <a-table-column title="完整" :width="80"><template #cell="{ record }">{{ displayValue(record.complete_fish) }}</template></a-table-column>
+               <a-table-column title="不完整" :width="90"><template #cell="{ record }">{{ displayValue(record.incomplete_fish) }}</template></a-table-column>
+               <a-table-column title="失败" :width="80"><template #cell="{ record }">{{ displayValue(record.failed_fish) }}</template></a-table-column>
+               <a-table-column title="破损" :width="80"><template #cell="{ record }">{{ displayValue(record.damaged_fish) }}</template></a-table-column>
+              <a-table-column title="视频时长" :width="120">
+                <template #cell="{ record }">{{ formatDuration(record.video_duration_seconds) }}</template>
+              </a-table-column>
+              <a-table-column title="处理耗时" :width="120">
+                <template #cell="{ record }">{{ formatDuration(record.processing_duration_seconds) }}</template>
+              </a-table-column>
+            </template>
           </a-table>
         </div>
       </ReportSection>
@@ -171,17 +173,9 @@
           <a-button
             type="primary"
             :loading="dailyPdfGenerating"
-            @click="generateDailyPdfReport"
+            @click="() => generateDailyPdfReport()"
           >
-            生成{{ reportDate }} 日报
-          </a-button>
-          <a-button
-            v-if="dailyReportInfo?.report_pdf_url"
-            :href="withVersion(dailyReportInfo.report_pdf_url)"
-            target="_blank"
-            @click="logUserAction({ module: '数据报表', action: 'open_daily_pdf', targetType: 'report_date', targetId: reportDate, message: '打开日报 PDF' })"
-          >
-            新窗口打开 PDF
+            重新生成{{ reportDate }} 日报
           </a-button>
           <a-button
             v-if="dailyReportInfo?.report_pdf_url"
@@ -210,23 +204,20 @@
         </div>
         <a-empty
           v-else
-          description="日报尚未生成。请等待数据加载完成后点击上方按钮生成。"
+           description="日报正在自动生成，生成后将在此处显示。"
         />
 
-        <div v-if="dailyReportInfo?.exists_via === 'history'" class="daily-pdf-history-hint">
-          检测到历史报告 <code>{{ dailyReportInfo.report_id }}</code>，已自动复用。
-        </div>
       </ReportSection>
     </main>
 
     <aside class="report-aside">
-      <ReportToc :items="tocItems" />
+      <ReportToc :items="tocItems" separator="、" />
     </aside>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import dayjs from 'dayjs'
 import { useRoute, useRouter } from 'vue-router'
 import { http, toErrorMessage } from '@/api/http'
@@ -244,14 +235,15 @@ const route = useRoute()
 const router = useRouter()
 
 const todayStr = dayjs().format('YYYY-MM-DD')
-const reportDate = ref<string>(todayStr)
+const initialRouteDate = String(route.query.date || '').slice(0, 10)
+const reportDate = ref<string>(/^\d{4}-\d{2}-\d{2}$/.test(initialRouteDate) ? initialRouteDate : todayStr)
 
 const tocItems: ReportTocItem[] = [
-  { id: 'text-block', index: '1', title: '文字板块' },
-  { id: 'chart-block', index: '2', title: '图表板块' },
-  { id: 'excel-block', index: '3', title: 'Excel板块' },
-  { id: 'video-block', index: '4', title: '视频板块' },
-  { id: 'daily-pdf-report', index: '5', title: '查看PDF报表' },
+  { id: 'text-block', index: '一', title: '文字板块' },
+  { id: 'chart-block', index: '二', title: '可视化统计分析' },
+  { id: 'excel-block', index: '三', title: '视频数据表格' },
+  { id: 'video-block', index: '四', title: '视频对比展示' },
+  { id: 'daily-pdf-report', index: '五', title: '查看PDF报表' },
 ]
 
 
@@ -262,6 +254,36 @@ const { loading, summary, charts, loadAll } = useReportData(
 )
 
 const videoTasks = ref<any[]>([])
+const videoPage = ref(1)
+const videoPageSize = ref(10)
+const pagedVideoTasks = computed(() => {
+  const start = (videoPage.value - 1) * videoPageSize.value
+  return videoTasks.value.slice(start, start + videoPageSize.value)
+})
+const videoPagination = computed(() => ({
+  current: videoPage.value,
+  pageSize: videoPageSize.value,
+  total: videoTasks.value.length,
+  showTotal: true,
+  showPageSize: true,
+  pageSizeOptions: [10, 20, 50],
+  onChange: (page: number) => { videoPage.value = page },
+  onPageSizeChange: (size: number) => { videoPageSize.value = size; videoPage.value = 1 },
+}))
+
+function displayValue(value: unknown): string | number {
+  return value === null || value === undefined || value === '' ? '--' : (value as string | number)
+}
+
+function formatDuration(seconds: number | null | undefined): string {
+  const n = Number(seconds)
+  if (!Number.isFinite(n) || n < 0) return '--'
+  const total = Math.round(n)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return h ? `${h}小时${m}分${s}秒` : m ? `${m}分${s}秒` : `${s}秒`
+}
 
 async function loadVideoTasks() {
   try {
@@ -274,6 +296,7 @@ async function loadVideoTasks() {
       return ca.startsWith(reportDate.value) ||
         (ca.startsWith(reportDate.value.slice(0, 10)) && reportDate.value.length === 10)
     })
+    videoPage.value = 1
   } catch (err) {
     Message.error(toErrorMessage(err))
   }
@@ -282,16 +305,28 @@ async function loadVideoTasks() {
 
 const overviewRows = computed(() => [
   { key: 'videos', title: '视频任务数', value: summary.value.total_video, unit: '个' },
+  { key: 'videoDuration', title: '总视频时长', value: formatDurationPrecise(summary.value.total_video_duration), unit: '' },
   { key: 'fishes', title: '检测总鱼数', value: summary.value.total_fish, unit: '条' },
   { key: 'valid', title: '完整鱼数量', value: summary.value.valid_fish, unit: '条' },
-  { key: 'invalid', title: '不完整鱼数量', value: summary.value.abnormal_fish, unit: '条' },
+  { key: 'invalid', title: '不完整鱼数量', value: summary.value.incomplete_fish, unit: '条' },
   { key: 'failed', title: '失败鱼数量', value: 0, unit: '条' },
   { key: 'damaged', title: '破损鱼数量', value: summary.value.surface_damage_count, unit: '条' },
 ])
 
+function formatDurationPrecise(seconds: number | null | undefined): string {
+  const n = Number(seconds)
+  if (!Number.isFinite(n) || n < 0) return '--'
+  if (n < 60) return `${n.toFixed(2)}秒`
+  const total = Math.round(n)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return h ? `${h}小时${m}分${s}秒` : `${m}分${s}秒`
+}
+
 const metricsRows = computed(() => [
-  { key: 'len', title: '平均体长', value: summary.value.avg_body_length, unit: 'cm' },
-  { key: 'noTail', title: '平均无尾体长', value: summary.value.avg_body_length_without_tail, unit: 'cm' },
+   { key: 'len', title: '平均体长', value: summary.value.avg_body_length, unit: 'cm' },
+   { key: 'noTail', title: '平均无尾体长', value: summary.value.avg_body_length_without_tail, unit: 'cm' },
   { key: 'height', title: '平均体高', value: summary.value.avg_body_height, unit: 'cm' },
   { key: 'weight', title: '平均体重', value: summary.value.avg_body_weight, unit: 'g' },
   { key: 'cf', title: '平均肥满度', value: summary.value.avg_condition_factor },
@@ -309,9 +344,9 @@ const abnormalRows = computed(() => {
   return [
     { key: 'invalidCount', title: '异常鱼数量', value: s.abnormal_fish, unit: '条' },
     { key: 'invalidRatio', title: '异常鱼比例', value: ratePct(s.abnormal_fish_rate) },
-    { key: 'damagedCount', title: '破损鱼数量', value: s.surface_damage_count, unit: '条' },
-    { key: 'damagedRatio', title: '破损鱼比例', value: ratePct(s.surface_damage_rate) },
-    { key: 'completeRate', title: '指标完整率', value: ratePct(s.metric_complete_rate) },
+    // { key: 'damagedCount', title: '破损鱼数量', value: s.surface_damage_count, unit: '条' },
+    // { key: 'damagedRatio', title: '破损鱼比例', value: ratePct(s.surface_damage_rate) },
+    // { key: 'completeRate', title: '指标完整率', value: ratePct(s.metric_complete_rate) },
   ]
 })
 
@@ -326,7 +361,6 @@ const hasDamageData = computed(
 )
 
 const statusPieRef = ref<HTMLElement>()
-const trendRef = ref<HTMLElement>()
 const lengthDistRef = ref<HTMLElement>()
 const noTailDistRef = ref<HTMLElement>()
 const heightDistRef = ref<HTMLElement>()
@@ -336,7 +370,6 @@ const damageDistRef = ref<HTMLElement>()
 
 useReportCharts(summary, charts, {
   statusPie: statusPieRef,
-  trend: trendRef,
   lengthDist: lengthDistRef,
   noTailDist: noTailDistRef,
   heightDist: heightDistRef,
@@ -369,6 +402,11 @@ function statusColor(s: string): string {
 }
 
 function goReport(videoId: string) {
+  const task = videoTasks.value.find((v) => String(v.video_id) === videoId)
+  if (String(task?.status || '').toLowerCase() !== 'done') {
+    Message.warning('该任务仍在运行中，请稍后查看报表')
+    return
+  }
   router.push({
     path: `/admin/data-report/video/${encodeURIComponent(videoId)}`,
     query: { video_id: videoId },
@@ -376,6 +414,11 @@ function goReport(videoId: string) {
 }
 
 function goDashboard(videoId: string) {
+  const task = videoTasks.value.find((v) => String(v.video_id) === videoId)
+  if (String(task?.status || '').toLowerCase() !== 'done') {
+    Message.warning('该任务仍在运行中，请稍后查看结果大屏')
+    return
+  }
   router.push({
     path: '/',
     query: { mode: 'result', video_id: videoId },
@@ -383,8 +426,10 @@ function goDashboard(videoId: string) {
 }
 
 function handleDateChange() {
+  videoPage.value = 1
   loadAll()
   loadVideoTasks()
+  checkExistingDailyPdf()
 }
 
  function handleRefresh() {
@@ -402,10 +447,12 @@ const dailyReportInfo = ref<{
   exists_via?: 'history' | 'generated'
 } | null>(null)
 const dailyReportMediaVersion = ref<number>(Date.now())
+let autoRefreshTimer: ReturnType<typeof window.setInterval> | null = null
 
 function withVersion(url: string): string {
   if (!url) return ''
-  return url
+  const separator = url.includes('?') ? '&' : '?'
+  return `${url}${separator}_v=${dailyReportMediaVersion.value}`
 }
 
 async function checkExistingDailyPdf() {
@@ -418,17 +465,14 @@ async function checkExistingDailyPdf() {
       params: {
         start_date: reportDate.value,
         end_date: reportDate.value,
+        report_type: 'daily_fish_quality',
+        status: 'generated',
         page: 1,
-        page_size: 5,
+        page_size: 1,
       },
     })
     const items = Array.isArray(resp.data?.items) ? resp.data.items : []
-    const todayReport = items.find((it: any) => {
-      return (
-        String(it.report_date || '').slice(0, 10) === reportDate.value &&
-        String(it.status || '').toLowerCase() === 'generated'
-      )
-    })
+    const todayReport = items[0]
     if (todayReport) {
       const base: any = {
         report_id: todayReport.report_id,
@@ -442,19 +486,22 @@ async function checkExistingDailyPdf() {
       dailyReportInfo.value = base
     } else {
       dailyReportInfo.value = null
+      if (summary.value.total_fish > 0 && !dailyPdfGenerating.value) {
+        await generateDailyPdfReport(true)
+      }
     }
   } catch (err) {
     console.warn('[daily-pdf] history query failed:', toErrorMessage(err))
   }
 }
 
-async function generateDailyPdfReport() {
+async function generateDailyPdfReport(silent = false) {
   if (!reportDate.value) {
     Message.error('日期无效')
     return
   }
   dailyPdfGenerating.value = true
-  logUserAction({
+  if (!silent) logUserAction({
     module: '数据报表',
     action: 'generate_daily_report',
     targetType: 'report_date',
@@ -465,10 +512,11 @@ async function generateDailyPdfReport() {
     const resp = await http.post(
       '/api/reports/fish-quality/daily-pdf/generate',
       { report_date: reportDate.value },
+      { timeout: 180000 },
     )
     const data = resp.data || {}
     const pdfRel = data.file_path
-    const docxRel = data.file_docx_path
+     const docxRel = data.docx_path || data.file_docx_path
     dailyReportInfo.value = {
       report_id: data.report_id,
       exists_via: 'generated',
@@ -480,13 +528,13 @@ async function generateDailyPdfReport() {
         : '',
     }
     dailyReportMediaVersion.value = Date.now()
-    Message.success('日报已生成')
+    if (!silent) Message.success('日报已生成')
   } catch (err: any) {
     const msg = toErrorMessage(err)
     if (msg.includes('无检测数据')) {
-      Message.warning('当前日期暂无检测数据，无法生成日报')
+      if (!silent) Message.warning('当前日期暂无检测数据，无法生成日报')
     } else {
-      Message.error('生成日报失败：' + msg)
+      if (!silent) Message.error('生成日报失败：' + msg)
     }
   } finally {
     dailyPdfGenerating.value = false
@@ -497,6 +545,10 @@ onMounted(async () => {
   await loadAll()
   await loadVideoTasks()
   await checkExistingDailyPdf()
+  autoRefreshTimer = window.setInterval(async () => {
+    await Promise.all([loadAll(), loadVideoTasks(), checkExistingDailyPdf()])
+    dailyReportMediaVersion.value = Date.now()
+  }, 10000)
   if (route.hash) {
     const id = route.hash.replace('#', '')
     setTimeout(() => {
@@ -504,6 +556,13 @@ onMounted(async () => {
       el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
       router.replace({ query: route.query, hash: `#${id}` })
     }, 80)
+  }
+})
+
+onBeforeUnmount(() => {
+  if (autoRefreshTimer !== null) {
+    window.clearInterval(autoRefreshTimer)
+    autoRefreshTimer = null
   }
 })
 

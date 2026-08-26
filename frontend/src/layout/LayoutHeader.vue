@@ -11,7 +11,7 @@
         @click="goToDashboard"
       >
         <i class="fa-solid fa-desktop"></i>
-        数据大屏
+         返回首页
       </button>
       <button 
         class="nav-btn" 
@@ -31,7 +31,7 @@ import { useRouter, useRoute } from 'vue-router'
 const router = useRouter()
 const route = useRoute()
 
-const isDashboard = computed(() => route.path === '/')
+const isDashboard = computed(() => route.path === '/dashboard')
 const isAdmin = computed(() => route.path.startsWith('/admin'))
 
 function goToDashboard() {
@@ -63,7 +63,7 @@ function goToAdmin() {
   display: flex;
   align-items: center;
   justify-content: center;
-  height: 80px;
+   height: 80px;
   background-image: url(@/assets/images/title_bg.png);
   background-repeat: no-repeat;
   background-position: center top;

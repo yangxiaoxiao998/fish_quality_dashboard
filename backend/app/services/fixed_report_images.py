@@ -1,6 +1,6 @@
 """大黄鱼形体指标测量示意图（图 6）固定资源。
 
-源文件：docs/data_docs/large_yellow_croaker_body.tif
+源文件：backend/app/templates/大黄鱼形体指标测量示意图.tif
 """
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ from app.paths import PROJECT_ROOT
 
 logger = logging.getLogger("report_fixed_images")
 
-FIXED_BODY_DEMO_TIF_REL = Path("docs") / "data_docs" / "large_yellow_croaker_body.tif"
+FIXED_BODY_DEMO_TIF_REL = (
+    Path("backend") / "app" / "templates" / "大黄鱼形体指标测量示意图.tif"
+)
 
 
 def get_fixed_body_demo_tif() -> Path:

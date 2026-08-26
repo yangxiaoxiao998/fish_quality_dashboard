@@ -147,14 +147,12 @@ def build_abnormal_reason(
     is_partial: bool = False,
 ) -> str:
     """根据损伤占比 / 异常状态拼接原因字符串。"""
-    if not abnormal and not is_partial:
+    if not abnormal:
         return "—"
 
     parts: list[str] = []
-    if surface_damage_pct is not None and surface_damage_pct > 0:
+    if surface_damage_pct is not None and surface_damage_pct > 50.0:
         parts.append(f"体表损伤占比 {surface_damage_pct:.2f}%")
-    if is_partial:
-        parts.append("部分指标缺失")
     if not parts:
         return "指标异常"
     return "；".join(parts)

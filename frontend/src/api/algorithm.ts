@@ -68,6 +68,7 @@ export interface RunCalibrationPayload {
   camera_id?: string
   device?: string
   overwrite?: boolean
+  real_length_mm?: number
 }
 
 export interface RunCalibrationResp {
@@ -91,6 +92,7 @@ export interface CaptureCalibrationPayload {
   fps?: number
   // 标定拍摄后自动停止摄像头
   stop_after_capture?: boolean
+  real_length_mm?: number
 }
 
 export interface CaptureCalibrationResp {
@@ -197,6 +199,17 @@ export interface ErrorConclusionResp {
 
 export function getAlgorithmCalibrationStatus() {
   return http.get<AlgorithmCalibrationStatus>('/api/algorithm/calibration/status')
+}
+
+export function getCalibrationConfig() {
+  return http.get<{ ok: boolean; real_length_mm: number }>('/api/algorithm/calibration/config')
+}
+
+export function saveCalibrationConfig(real_length_mm: number) {
+  return http.post<{ ok: boolean; real_length_mm: number }>(
+    '/api/algorithm/calibration/config',
+    { real_length_mm },
+  )
 }
 
 export function runAlgorithmCalibration(payload: RunCalibrationPayload) {

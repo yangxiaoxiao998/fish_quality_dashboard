@@ -37,20 +37,34 @@
             <a-descriptions-item label="检测失败鱼数">
               {{ formatNumber(summaryData.failed_fish) }}
             </a-descriptions-item>
-            <a-descriptions-item label="破损鱼数">
+            <!-- <a-descriptions-item label="破损鱼数">
               {{ formatNumber(summaryData.damaged_fish) }}
-            </a-descriptions-item>
+            </a-descriptions-item> -->
             <a-descriptions-item label="平均破损率">
               {{ formatPercent(summaryData.avg_surface_damage_ratio) }}
             </a-descriptions-item>
-            <a-descriptions-item label="最大破损率">
+            <!-- <a-descriptions-item label="最大破损率">
               {{ formatPercent(summaryData.max_surface_damage_ratio) }}
-            </a-descriptions-item>
+            </a-descriptions-item> -->
           </a-descriptions>
         </ReportSection>
 
         <ReportSection id="embedded-chart-block" title="二、可视化统计分析">
-          <a-empty v-if="!hasChartData" description="暂无可用于绘图的数据" />
+          <a-empty
+            v-if="!hasAnyFish"
+            description="暂无鱼体数据"
+          />
+          <div
+            v-else-if="!hasMetricData"
+            class="metric-empty-tip"
+          >
+            <a-alert type="info" :show-icon="true">
+              <template #title>暂无可用的五维测量指标</template>
+              当前视频的 {{ summaryData.total_fish || 0 }} 条鱼均为不完整鱼（incomplete），
+              尚未测量出体长 / 体高 / 体重 / 肥满度 / 体表破损率。
+              下方"鱼体检测明细"仍可查看鱼图、序号、状态与帧索引。
+            </a-alert>
+          </div>
           <div v-else class="charts-grid">
             <div class="chart-card">
               <div class="chart-title">鱼体状态分布</div>
@@ -60,14 +74,14 @@
               <div class="chart-title">体长分布 (cm)</div>
               <div ref="lengthDistChartRef" class="chart-canvas"></div>
             </div>
-            <div class="chart-card">
-              <div class="chart-title">无尾体长分布 (cm)</div>
+             <!-- <div class="chart-card">
+               <div class="chart-title">体高分布 (cm)</div>
               <div ref="noTailDistChartRef" class="chart-canvas"></div>
-            </div>
-            <div class="chart-card">
-              <div class="chart-title">体高分布 (cm)</div>
-              <div ref="heightDistChartRef" class="chart-canvas"></div>
-            </div>
+            </div> -->
+             <div class="chart-card">
+               <div class="chart-title">体高分布 (cm)</div>
+               <div ref="heightDistChartRef" class="chart-canvas"></div>
+             </div>
             <div class="chart-card">
               <div class="chart-title">体重分布 (g)</div>
               <div ref="weightDistChartRef" class="chart-canvas"></div>
@@ -132,7 +146,7 @@
           <div class="fish-toolbar">
             <a-input
               v-model="fishSearchTrackId"
-              placeholder="输入 track_id 检索"
+               placeholder="输入序号检索"
               allow-clear
               style="width: 220px"
               @press-enter="loadFishTable"
@@ -151,9 +165,9 @@
               @clear="loadFishTable"
             >
               <a-option value="">全部</a-option>
-              <a-option value="done">完整鱼 (done)</a-option>
-              <a-option value="incomplete">不完整鱼 (incomplete)</a-option>
-              <a-option value="failed">失败鱼 (failed)</a-option>
+              <a-option value="done">完整鱼</a-option>
+              <a-option value="incomplete">不完整鱼</a-option>
+              <a-option value="failed">失败鱼</a-option>
             </a-select>
             <a-button type="primary" @click="loadFishTable">查询</a-button>
             <a-button @click="resetFishFilter">重置</a-button>
@@ -170,7 +184,7 @@
                         :scroll="{ x: 1280 }"
                       >
                         <template #columns>
-                          <a-table-column title="track_id" data-index="track_id" :width="90" fixed="left">
+                          <a-table-column title="序号" data-index="track_id" :width="90" fixed="left">
                             <template #cell="{ record }">
                               <a-tag color="arcoblue">{{ record.track_id ?? '--' }}</a-tag>
                             </template>
@@ -198,7 +212,7 @@
                             </template>
                           </a-table-column>
 
-                          <a-table-column title="体长 (cm)" data-index="body_length_cm" :width="110">
+                           <a-table-column title="体长 (cm)" data-index="body_length_cm" :width="110">
                             <template #cell="{ record }">
                               <span :class="{ dim: isEmptyValue(record.body_length_cm) }">
                                 {{ formatCell(record.body_length_cm, 2) }}
@@ -206,15 +220,7 @@
                             </template>
                           </a-table-column>
 
-                          <a-table-column title="无尾体长 (cm)" data-index="body_length_no_tail_cm" :width="130">
-                            <template #cell="{ record }">
-                              <span :class="{ dim: isEmptyValue(record.body_length_no_tail_cm) }">
-                                {{ formatCell(record.body_length_no_tail_cm, 2) }}
-                              </span>
-                            </template>
-                          </a-table-column>
-
-                          <a-table-column title="体高 (cm)" data-index="body_height_cm" :width="110">
+                           <a-table-column title="体高 (cm)" data-index="body_height_cm" :width="110">
                             <template #cell="{ record }">
                               <span :class="{ dim: isEmptyValue(record.body_height_cm) }">
                                 {{ formatCell(record.body_height_cm, 2) }}
@@ -244,6 +250,17 @@
                             </template>
                           </a-table-column>
 
+                          <a-table-column title="腹部颜色" data-index="hex_color" :width="110">
+                            <template #cell="{ record }">
+                              <span
+                                v-if="isHexColor(record.hex_color)"
+                                class="color-swatch"
+                                :style="{ backgroundColor: record.hex_color }"
+                              />
+                              <span v-else class="dim">--</span>
+                            </template>
+                          </a-table-column>
+
                           <a-table-column title="操作" data-index="action" :width="100" fixed="right">
                             <template #cell="{ record }">
                               <a-button size="small" type="primary" @click="openFishDetail(record)">
@@ -262,20 +279,19 @@
             show-total
             show-page-size
             style="margin-top: 12px; justify-content: flex-end; display: flex"
-            @change="loadFishTable"
-            @page-size-change="loadFishTable"
+             @change="handleFishPageChange"
+             @page-size-change="handleFishPageSizeChange"
           />
         </ReportSection>
 
         <ReportSection id="embedded-pdf-report" title="五、查看PDF报表">
           <div class="pdf-report-actions">
             <a-button
-              v-if="reportPdfUrl"
               type="primary"
-              :href="withMediaVersion(reportPdfUrl)"
-              target="_blank"
+              :loading="videoPdfGenerating"
+              @click="regenerateVideoPdfReport"
             >
-              新窗口打开PDF
+              重新生成报表
             </a-button>
             <a-button
               v-if="reportPdfUrl"
@@ -332,15 +348,15 @@
                 <a-descriptions-item label="检测失败鱼数">
                   {{ formatNumber(summaryData.failed_fish) }}
                 </a-descriptions-item>
-                <a-descriptions-item label="破损鱼数">
+                <!-- <a-descriptions-item label="破损鱼数">
                   {{ formatNumber(summaryData.damaged_fish) }}
-                </a-descriptions-item>
+                </a-descriptions-item> -->
                 <a-descriptions-item label="平均破损率">
                   {{ formatPercent(summaryData.avg_surface_damage_ratio) }}
                 </a-descriptions-item>
-                <a-descriptions-item label="最大破损率">
+                <!-- <a-descriptions-item label="最大破损率">
                   {{ formatPercent(summaryData.max_surface_damage_ratio) }}
-                </a-descriptions-item>
+                </a-descriptions-item> -->
               </a-descriptions>
             </ReportSection>
 
@@ -352,13 +368,13 @@
                   <div ref="statusDistChartRef" class="chart-canvas chart-canvas-tall"></div>
                 </div>
                 <div class="chart-card">
-                  <div class="chart-title">体长分布 (cm)</div>
+                    <div class="chart-title">体长分布 (cm)</div>
                   <div ref="lengthDistChartRef" class="chart-canvas"></div>
                 </div>
-                <div class="chart-card">
-                  <div class="chart-title">无尾体长分布 (cm)</div>
+                 <!-- <div class="chart-card">
+                    <div class="chart-title">体高分布 (cm)</div>
                   <div ref="noTailDistChartRef" class="chart-canvas"></div>
-                </div>
+                </div> -->
                 <div class="chart-card">
                   <div class="chart-title">体高分布 (cm)</div>
                   <div ref="heightDistChartRef" class="chart-canvas"></div>
@@ -454,7 +470,7 @@
               <div class="fish-toolbar">
                 <a-input
                   v-model="fishSearchTrackId"
-                  placeholder="输入 track_id 检索"
+                   placeholder="输入序号检索"
                   allow-clear
                   style="width: 220px"
                   @press-enter="loadFishTable"
@@ -473,9 +489,9 @@
                   @clear="loadFishTable"
                 >
                   <a-option value="">全部</a-option>
-                  <a-option value="done">完整鱼 (done)</a-option>
-                  <a-option value="incomplete">不完整鱼 (incomplete)</a-option>
-                  <a-option value="failed">失败鱼 (failed)</a-option>
+                <a-option value="done">完整鱼</a-option>
+                <a-option value="incomplete">不完整鱼</a-option>
+                <a-option value="failed">失败鱼</a-option>
                 </a-select>
                 <a-button type="primary" @click="loadFishTable">查询</a-button>
                 <a-button @click="resetFishFilter">重置</a-button>
@@ -492,7 +508,7 @@
                 :scroll="{ x: 1280 }"
               >
                 <template #columns>
-                  <a-table-column title="track_id" data-index="track_id" :width="90" fixed="left">
+                   <a-table-column title="序号" data-index="track_id" :width="90" fixed="left">
                     <template #cell="{ record }">
                       <a-tag color="arcoblue">{{ record.track_id ?? '--' }}</a-tag>
                     </template>
@@ -520,7 +536,7 @@
                     </template>
                   </a-table-column>
 
-                  <a-table-column title="体长 (cm)" data-index="body_length_cm" :width="110">
+                   <a-table-column title="体长 (cm)" data-index="body_length_cm" :width="110">
                     <template #cell="{ record }">
                       <span :class="{ dim: isEmptyValue(record.body_length_cm) }">
                         {{ formatCell(record.body_length_cm, 2) }}
@@ -560,11 +576,22 @@
                     </template>
                   </a-table-column>
 
-                  <a-table-column title="破损率" data-index="surface_damage_ratio" :width="100">
+                          <a-table-column title="破损率" data-index="surface_damage_ratio" :width="100">
                     <template #cell="{ record }">
                       {{ formatPercentRatio(record.surface_damage_ratio) }}
                     </template>
-                  </a-table-column>
+                          </a-table-column>
+
+                          <a-table-column title="腹部颜色" data-index="hex_color" :width="110">
+                            <template #cell="{ record }">
+                              <span
+                                v-if="isHexColor(record.hex_color)"
+                                class="color-swatch"
+                                :style="{ backgroundColor: record.hex_color }"
+                              />
+                              <span v-else class="dim">--</span>
+                            </template>
+                          </a-table-column>
 
                   <a-table-column title="操作" data-index="action" :width="100" fixed="right">
                     <template #cell="{ record }">
@@ -584,19 +611,18 @@
                 show-total
                 show-page-size
                 style="margin-top: 12px; justify-content: flex-end; display: flex"
-                @change="loadFishTable"
-                @page-size-change="loadFishTable"
+                 @change="handleFishPageChange"
+                 @page-size-change="handleFishPageSizeChange"
               />
             </ReportSection>
 <ReportSection id="pdf-report" title="五、查看PDF报表">
               <div class="pdf-report-actions">
                 <a-button
-                  v-if="reportPdfUrl"
                   type="primary"
-                  :href="withMediaVersion(reportPdfUrl)"
-                  target="_blank"
+                  :loading="videoPdfGenerating"
+                  @click="regenerateVideoPdfReport"
                 >
-                  新窗口打开PDF
+                  重新生成报表
                 </a-button>
                 <a-button
                   v-if="reportPdfUrl"
@@ -681,7 +707,7 @@
                 <span class="value">{{ reportVideoId || '--' }}</span>
               </div>
               <div class="info-item">
-                <span class="label">track_id</span>
+                 <span class="label">序号</span>
                 <span class="value">{{ currentFishRecord.track_id ?? '--' }}</span>
               </div>
               <div class="info-item">
@@ -699,9 +725,9 @@
                 </span>
               </div>
               <div class="info-item">
-                <span class="label">无尾体长</span>
+                   <span class="label">体高</span>
                 <span class="value">
-                  {{ formatCell(currentFishRecord.body_length_no_tail_cm, 2) }} cm
+                   {{ formatCell(currentFishRecord.body_height_cm, 2) }} cm
                 </span>
               </div>
               <div class="info-item">
@@ -780,11 +806,11 @@ interface SummaryData {
 }
 
 const tocItems: ReportTocItem[] = [
-  { id: 'text-block', index: '一', title: '文字板块' },
-  { id: 'chart-block', index: '二', title: '可视化统计分析' },
-  { id: 'video-block', index: '三', title: '视频对比展示' },
-  { id: 'fish-block', index: '四', title: '鱼体检测明细' },
-  { id: 'pdf-report', index: '五', title: '查看PDF报表' },
+  { id: 'text-block', index: '一', title: '一、文字板块' },
+  { id: 'chart-block', index: '二', title: '二、可视化统计分析' },
+  { id: 'video-block', index: '三', title: '三、视频对比展示' },
+  { id: 'fish-block', index: '四', title: '四、鱼体检测明细' },
+  { id: 'pdf-report', index: '五', title: '五、查看PDF报表' },
 ]  
 
 const props = withDefaults(
@@ -809,6 +835,7 @@ function friendlyReportError(_err: any, status?: string): string {
   }
   return '该视频报告暂未生成，请确认视频检测任务已完成。'
 }
+
 
 const route = useRoute()
 
@@ -840,7 +867,39 @@ const statusText = computed(() => statusToText(reportStatus.value))
 const hasChartData = computed(() => (summaryData.value.total_fish || 0) > 0)
 const hasDamageData = computed(() => (summaryData.value.damaged_fish || 0) > 0)
 
+// 是否有任何 fish 行（用于在 metrics 全空时决定给出友好提示而不是空白页）。
+const hasAnyFish = computed(() => (allFishRows.value || []).length > 0)
+
+// 是否至少存在一条鱼具有体长或体高或体重等五维指标。
+const hasMetricData = computed(() => {
+  const rows = allFishRows.value || []
+  return rows.some((f) => {
+    const v = (k: string) => {
+      const x = (f as any)?.[k]
+      if (x === null || x === undefined || x === '') return false
+      const n = Number(x)
+      return Number.isFinite(n)
+    }
+    return (
+      v('body_length_cm') ||
+      v('body_length_no_tail_cm') ||
+      v('body_height_cm') ||
+      v('pred_weight_g') ||
+      v('condition_factor') ||
+      v('surface_damage_ratio')
+    )
+  })
+})
+
 const allFishRows = ref<any[]>([])
+const metricFishRows = computed(() =>
+  allFishRows.value.filter((fish) => {
+    const status = String(fish?.status || '').toLowerCase()
+    if (status !== 'complete' && status !== 'done') return false
+    return ['body_length_cm', 'body_height_cm', 'pred_weight_g', 'condition_factor', 'surface_damage_ratio']
+      .every((key) => Number.isFinite(Number(fish?.[key])))
+  }),
+)
 // 避免浏览器缓存旧视频 / 旧文件
 const mediaVersion = ref<number>(Date.now())
 function withMediaVersion(url: string): string {
@@ -865,6 +924,7 @@ const reportDocxUrl = computed(() =>
       '',
   ),
 )
+const videoPdfGenerating = ref<boolean>(false)
 const fishRows = ref<any[]>([])
 const fishTotal = ref<number>(0)
 const fishPage = ref<number>(1)
@@ -872,6 +932,57 @@ const fishPageSize = ref<number>(20)
 const fishLoading = ref<boolean>(false)
 const fishStatusFilter = ref<string>('')
 const fishSearchTrackId = ref<string>('')
+
+function reportStaticUrl(path: unknown): string {
+  const value = String(path || '').trim()
+  if (!value) return ''
+  if (value.startsWith('/static/')) return value
+  return `/static/${value.replace(/^data\//, '')}`
+}
+
+function withReportVersion(url: string): string {
+  if (!url) return ''
+  const separator = url.includes('?') ? '&' : '?'
+  return `${url}${separator}_v=${mediaVersion.value}`
+}
+
+async function regenerateVideoPdfReport() {
+  if (!reportVideoId.value || videoPdfGenerating.value) return
+  videoPdfGenerating.value = true
+  logUserAction({
+    module: '数据报表',
+    action: 'regenerate_video_report',
+    targetType: 'video',
+    targetId: reportVideoId.value,
+    message: '重新生成视频报表',
+  })
+  try {
+    const resp = await http.post(
+      '/api/reports/fish-quality/video-pdf/generate',
+      { video_id: reportVideoId.value },
+      { timeout: 180000 },
+    )
+    const data = resp.data || {}
+    const reportResult = data.report_result || {}
+    const pdfUrl = reportStaticUrl(
+      data.report_pdf_url || data.report_pdf || reportResult.report_pdf || data.file_path,
+    )
+    const docxUrl = reportStaticUrl(
+      data.report_docx_url || data.report_docx || reportResult.report_docx,
+    )
+    resultData.value = {
+      ...resultData.value,
+       report_pdf_url: withReportVersion(pdfUrl),
+       report_docx_url: withReportVersion(docxUrl),
+    }
+    mediaVersion.value = Date.now()
+    Message.success('视频报表已重新生成')
+  } catch (err) {
+    Message.error(`重新生成报表失败：${toErrorMessage(err)}`)
+  } finally {
+    videoPdfGenerating.value = false
+  }
+}
 
 const fishDetailVisible = ref<boolean>(false)
 const currentFishIndex = ref<number>(-1)
@@ -913,11 +1024,11 @@ function showNextFish() {
 }
 
 const fishColumns = [
-  { title: 'track_id', dataIndex: 'track_id', width: 90, fixed: 'left' as const },
+   { title: '序号', dataIndex: 'track_id', width: 90, fixed: 'left' as const },
   { title: '鱼图', dataIndex: 'crop_image', width: 110 },
   { title: '状态', dataIndex: 'status', width: 100 },
-  { title: '体长 (cm)', dataIndex: 'body_length_cm', width: 100 },
-  { title: '无尾体长 (cm)', dataIndex: 'body_length_no_tail_cm', width: 120 },
+   { title: '体长 (cm)', dataIndex: 'body_length_cm', width: 100 },
+   { title: '无尾体长 (cm)', dataIndex: 'body_length_no_tail_cm', width: 120 },
   { title: '体高 (cm)', dataIndex: 'body_height_cm', width: 100 },
   { title: '体重 (g)', dataIndex: 'pred_weight_g', width: 100 },
   { title: '肥满度', dataIndex: 'condition_factor', width: 90 },
@@ -1005,7 +1116,7 @@ function formatCell(v: any, decimals: number = 2): string {
 
 function statusTagColor(s: string): string {
   const v = String(s || '').toLowerCase()
-  if (v === 'done') return 'green'
+  if (v === 'done' || v === 'complete') return 'green'
   if (v === 'incomplete') return 'orange'
   if (v === 'failed') return 'red'
   return 'gray'
@@ -1013,10 +1124,14 @@ function statusTagColor(s: string): string {
 
 function statusTagText(s: string): string {
   const v = String(s || '').toLowerCase()
-  if (v === 'done') return 'done'
-  if (v === 'incomplete') return 'incomplete'
-  if (v === 'failed') return 'failed'
+  if (v === 'done' || v === 'complete') return '完整'
+  if (v === 'incomplete') return '不完整'
+  if (v === 'failed') return '失败'
   return s || '--'
+}
+
+function isHexColor(value: unknown): boolean {
+  return /^#[0-9a-f]{6}$/i.test(String(value || '').trim())
 }
 
 function onImgError(e: Event) {
@@ -1025,9 +1140,36 @@ function onImgError(e: Event) {
   img.style.opacity = '0.3'
 }
 
+async function loadWebmFallback(kind: 'source' | 'result'): Promise<void> {
+  const videoId = reportVideoId.value
+  if (!videoId) return
+  try {
+    const query = kind === 'result' ? '?result_video=true' : ''
+    const response = await http.get(`/api/videos/${encodeURIComponent(videoId)}/webm${query}`)
+    if (response.status === 202 || response.data?.processing) {
+      window.setTimeout(() => void loadWebmFallback(kind), 3000)
+      return
+    }
+    const url = normalizeReportUrl(response.data?.webm_url || '')
+    if (!url) throw new Error('WebM URL 为空')
+    if (kind === 'source') {
+      if (sourcePlayableUrl.value === url) return
+      sourcePlayableUrl.value = url
+      sourceVideoErrored.value = false
+    } else {
+      if (resultGroundedUrl.value === url) return
+      resultGroundedUrl.value = url
+      resultVideoErrored.value = false
+    }
+  } catch (err) {
+    console.warn(`[EmbeddedVideoReport] ${kind} WebM fallback failed:`, err)
+  }
+}
+
 function onSourceVideoError() {
   sourceVideoErrored.value = true
   console.warn('[EmbeddedVideoReport] source video decode failed:', sourcePlayableUrl.value)
+  if (!sourcePlayableUrl.value.endsWith('.webm')) void loadWebmFallback('source')
 }
 
 watch(sourcePlayableUrl, () => {
@@ -1036,6 +1178,7 @@ watch(sourcePlayableUrl, () => {
 
 function onResultVideoError() {
   resultVideoErrored.value = true
+  if (!resultGroundedUrl.value.endsWith('.webm')) void loadWebmFallback('result')
 }
 
 function resultSearchedFishCropUrl(fish: any): string {
@@ -1066,7 +1209,7 @@ function resultSearchedFishCropUrl(fish: any): string {
 }
 
 function loadFishTable() {
-  // 本地分页筛选：直接从 allFishRows 派生
+  // 查询条件变化时回到第一页；页码切换走 handleFishPageChange。
   fishPage.value = 1
   applyFishFilterAndPage()
 }
@@ -1075,12 +1218,12 @@ function getFilteredFishRows(): any[] {
   const trackKeyword = String(fishSearchTrackId.value || '').trim()
   const status = String(fishStatusFilter.value || '').trim().toLowerCase()
   return allFishRows.value.filter((fish) => {
+    // 仅按 track_id 精确匹配；fish_uid 不参与模糊匹配（fish_uid 中包含日期数字，会误命中）
     const trackId = String(fish?.track_id ?? fish?.id ?? '').trim()
-    const fishUid = String(fish?.fish_uid ?? fish?.fish_id ?? '').trim()
-    const fishStatus = String(fish?.status || '').toLowerCase()
+    const rawFishStatus = String(fish?.status || '').toLowerCase()
+    const fishStatus = rawFishStatus === 'complete' ? 'done' : rawFishStatus
     if (trackKeyword) {
-      const hit = trackId.includes(trackKeyword) || fishUid.includes(trackKeyword)
-      if (!hit) return false
+      if (trackId !== trackKeyword) return false
     }
     if (status && fishStatus !== status) {
       return false
@@ -1100,12 +1243,24 @@ function applyFishFilterAndPage() {
 function handleFishPageChange(page: number) {
   fishPage.value = page
   applyFishFilterAndPage()
+  requestAnimationFrame(() => {
+    document.getElementById(props.embedded ? 'embedded-fish-detail' : 'fish-block')?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    })
+  })
 }
 
 function handleFishPageSizeChange(size: number) {
   fishPageSize.value = size
   fishPage.value = 1
   applyFishFilterAndPage()
+  requestAnimationFrame(() => {
+    document.getElementById(props.embedded ? 'embedded-fish-detail' : 'fish-block')?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    })
+  })
 }
 
 function resetFishFilter() {
@@ -1193,7 +1348,19 @@ async function loadAllData() {
       /* tolerate */
     }
 
-    sourcePlayableUrl.value = pickSourceUrl()
+    try {
+      const playbackResp = await http.get(
+        `/api/videos/${encodeURIComponent(reportVideoId.value)}/playback`,
+      )
+      const playback = playbackResp.data || {}
+      sourcePlayableUrl.value = normalizeReportUrl(
+        playback.playable_url || playback.source_url || '',
+      )
+    } catch (_) {
+      sourcePlayableUrl.value = reportVideoId.value
+        ? `/static/uploads/videos/playable/${reportVideoId.value}_h264.mp4`
+        : ''
+    }
     resultGroundedUrl.value = pickResultGroundedUrl()
     resultVideoErrored.value = false
 
@@ -1254,7 +1421,7 @@ function pickSourceUrl(): string {
   //   4. result.video?.video_url
   //   5. result.video?.source_url
   //   6. result.video?.input_video
-  //   7. /static/results/<video_id>/videos/<input> 兜底
+  //   7. 无可用地址时返回空，不使用已清理的 results/input 副本
   const candidates: any[] = [
     summaryData.value.input_video,
     summaryData.value.original_input_video,
@@ -1268,16 +1435,13 @@ function pickSourceUrl(): string {
       currentTask.value?.input_video,
     )
   }
-  if (reportVideoId.value) {
-    candidates.push(
-      `/static/results/${reportVideoId.value}/input/${reportVideoId.value}_source_video.mp4`,
-    )
-  }
   for (const c of candidates) {
     const u = normalizeReportUrl(c)
-    if (u) return u
+    if (u && !u.includes('/results/') && !u.includes('/input/')) return u
   }
-  return ''
+  return reportVideoId.value
+    ? `/static/uploads/videos/playable/${reportVideoId.value}_h264.mp4`
+    : ''
 }
 
 function pickResultGroundedUrl(): string {
@@ -1319,11 +1483,10 @@ function renderCharts() {
 
   if (statusDistChartRef.value) {
     const c = echarts.init(statusDistChartRef.value)
-    const fishes = fishRows.value
+    const fishes = allFishRows.value
     const statusData = [
-      { name: '完整', value: fishes.filter((f) => (f?.status || '').toLowerCase() === 'done').length },
-      { name: '不完整', value: fishes.filter((f) => (f?.status || '').toLowerCase() === 'incomplete').length },
-      { name: '失败', value: fishes.filter((f) => (f?.status || '').toLowerCase() === 'failed').length },
+      { name: '完整鱼', value: fishes.filter((f) => ['done', 'complete'].includes((f?.status || '').toLowerCase())).length },
+      { name: '不完整鱼', value: fishes.filter((f) => (f?.status || '').toLowerCase() === 'incomplete').length },
     ].filter((x) => x.value > 0)
     const total = statusData.reduce((sum, x) => sum + Number(x.value || 0), 0)
     c.setOption({
@@ -1356,12 +1519,12 @@ function renderCharts() {
   if (lengthDistChartRef.value) {
     const c = echarts.init(lengthDistChartRef.value)
     c.setOption(buildBarOption(
-      buildBarBins(fishRows.value, (f: any) => {
-        const v = f?.body_length_cm
+       buildBarBins(metricFishRows.value, (f: any) => {
+      const v = f?.body_length_cm
         return v === null || v === undefined ? null : Number(v)
       }, 5, 0, 60),
       '',
-      '体长区间（cm）',
+       '体长区间（cm）',
       ' cm'
     ))
     charts.push(c)
@@ -1369,12 +1532,12 @@ function renderCharts() {
   if (noTailDistChartRef.value) {
     const c = echarts.init(noTailDistChartRef.value)
     c.setOption(buildBarOption(
-      buildBarBins(fishRows.value, (f: any) => {
-        const v = f?.body_length_no_tail_cm
+       buildBarBins(metricFishRows.value, (f: any) => {
+      const v = f?.body_height_cm
         return v === null || v === undefined ? null : Number(v)
       }, 5, 0, 60),
       '',
-      '无尾体长区间（cm）',
+      '体高区间（cm）',
       ' cm'
     ))
     charts.push(c)
@@ -1382,7 +1545,7 @@ function renderCharts() {
   if (heightDistChartRef.value) {
     const c = echarts.init(heightDistChartRef.value)
     c.setOption(buildBarOption(
-      buildBarBins(fishRows.value, (f: any) => {
+       buildBarBins(metricFishRows.value, (f: any) => {
         const v = f?.body_height_cm
         return v === null || v === undefined ? null : Number(v)
       }, 1, 0, 15),
@@ -1393,25 +1556,35 @@ function renderCharts() {
     charts.push(c)
   }
   if (weightDistChartRef.value) {
-    const c = echarts.init(weightDistChartRef.value)
-    c.setOption(buildBarOption(
-      buildBarBins(fishRows.value, (f: any) => {
-        const v = f?.pred_weight_g
-        return v === null || v === undefined ? null : Number(v)
-      }, 100, 0, 1000),
-      '',
-      '体重区间（g）',
-      ' g'
-    ))
-    charts.push(c)
+    const weightValues = metricFishRows.value
+      .map((f: any) => Number(f?.pred_weight_g))
+      .filter((v) => Number.isFinite(v) && v > 0)
+    if (weightValues.length > 0) {
+      const c = echarts.init(weightDistChartRef.value)
+      const weightMax = Math.max(100, Math.ceil(Math.max(...weightValues) / 100) * 100)
+      c.setOption(buildBarOption(
+         buildBarBins(metricFishRows.value, (f: any) => {
+          const v = f?.pred_weight_g
+          return v === null || v === undefined ? null : Number(v)
+        }, 100, 0, weightMax),
+        '',
+        '体重区间（g）',
+        ' g'
+      ))
+      charts.push(c)
+    }
   }
   if (conditionDistChartRef.value) {
     const c = echarts.init(conditionDistChartRef.value)
+    const conditionValues = metricFishRows.value
+      .map((f: any) => Number(f?.condition_factor))
+      .filter((v) => Number.isFinite(v))
+    const conditionMax = Math.max(2.5, Math.ceil(Math.max(...conditionValues, 0) * 10) / 10)
     c.setOption(buildBarOption(
-      buildBarBins(fishRows.value, (f: any) => {
+      buildBarBins(metricFishRows.value, (f: any) => {
         const v = f?.condition_factor
         return v === null || v === undefined ? null : Number(v)
-      }, 0.1, 0, 2.5),
+      }, 0.1, 0, conditionMax),
       '',
       '肥满度区间',
       ''
@@ -1421,7 +1594,7 @@ function renderCharts() {
   if (hasDamageData.value && damageDistChartRef.value) {
     const c = echarts.init(damageDistChartRef.value)
     const damageBins = buildBarBins(
-      fishRows.value,
+      metricFishRows.value,
       (f: any) => {
         const v = f?.surface_damage_ratio
         return v === null || v === undefined ? null : Number(v) * 100
@@ -1472,6 +1645,7 @@ function buildBarOption(
   xAxisName: string,
   xUnitLabel: string,
 ): any {
+  bins = bins.filter((b) => b.count > 0)
   const counts = bins.map((b) => Number(b.count) || 0)
   const total = counts.reduce((s, v) => s + v, 0)
   const percents = total > 0
@@ -1515,7 +1689,11 @@ function buildBarOption(
       nameGap: 46,
       min: 0,
       max: 100,
-      axisLabel: { formatter: '{value}%', color: '#4e5969', fontSize: 11 },
+      axisLabel: {
+        formatter: (value: number) => (Number(value) === 0 ? '' : `${value}%`),
+        color: '#4e5969',
+        fontSize: 11,
+      },
       splitLine: { lineStyle: { color: '#e5e6eb' } },
       nameTextStyle: { color: '#4e5969', fontSize: 11 },
     },
@@ -1659,6 +1837,14 @@ onBeforeUnmount(() => {
 .dim {
   color: #c9cdd4;
 }
+.color-swatch {
+  display: inline-block;
+  width: 58px;
+  height: 22px;
+  border: 1px solid rgb(0 0 0 / 18%);
+  border-radius: 4px;
+  vertical-align: middle;
+}
 .report-page-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 220px;
@@ -1701,6 +1887,9 @@ onBeforeUnmount(() => {
   gap: 12px;
   flex-wrap: wrap;
   margin-bottom: 12px;
+}
+.metric-empty-tip {
+  padding: 16px 4px;
 }
 .pdf-preview-wrap {
   width: 100%;

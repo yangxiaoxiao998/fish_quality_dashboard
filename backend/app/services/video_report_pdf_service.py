@@ -56,6 +56,8 @@ from docx.shared import Inches  # noqa: E402
 
 logger = logging.getLogger("video_report_pdf")
 
+FIXED_BODY_DEMO_HEIGHT_INCH = 3.6 / 2.54
+
 
 # ---------------------------------------------------------------------------
 # 模板路径
@@ -63,17 +65,11 @@ logger = logging.getLogger("video_report_pdf")
 
 
 def get_video_report_template_path() -> Path:
-    """单视频检测报告模板，优先 backend/app/templates，回退 docs/data_docs。"""
-    candidates = [
-        PROJECT_ROOT / "backend" / "app" / "templates" / "report_word_template.docx",
-        PROJECT_ROOT / "docs" / "data_docs" / "report_word_template.docx",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError(
-        "未找到 report_word_template.docx，请检查 backend/app/templates 或 docs/data_docs"
-    )
+    """单视频检测报告使用与日报相同的固定模板。"""
+    path = PROJECT_ROOT / "backend" / "app" / "templates" / "report_word_template.docx"
+    if path.exists():
+        return path
+    raise FileNotFoundError(f"未找到 report_word_template.docx：{path}")
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +156,19 @@ def _fmt_float(v: Any, decimals: int = 2) -> str:
     return f"{f:.{decimals}f}"
 
 
+def _fmt_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "--"
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}小时{minutes}分{secs}秒"
+    if minutes:
+        return f"{minutes}分{secs}秒"
+    return f"{secs}秒"
+
+
 def _fmt_percent(v: Any) -> str:
     f = _to_float(v)
     if f is None:
@@ -188,6 +197,118 @@ def _min_or_none(values: list[float]) -> float | None:
 
 def _max_or_none(values: list[float]) -> float | None:
     return max(values) if values else None
+
+
+def _video_duration_seconds(video_id: str, payload: dict[str, Any]) -> float | None:
+    value = _to_float(payload.get("video_duration_seconds"))
+    if value is not None and value > 0:
+        return value
+    source = payload.get("input_video") or payload.get("original_input_video")
+    if not source:
+        return None
+    path = Path(source) if Path(str(source)).is_absolute() else resolve_report_image_path(source)
+    if path is None or not path.exists():
+        from app.services.path_service import to_abs_data_path
+        path = to_abs_data_path(source)
+    if path is None or not path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        return _to_float(result.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _processing_seconds(payload: dict[str, Any]) -> float | None:
+    stored = _to_float(
+        payload.get("processing_duration_seconds") or payload.get("processing_seconds")
+    )
+    if stored is not None and stored >= 0:
+        return stored
+    started = payload.get("started_at")
+    finished = payload.get("finished_at")
+    if not started or not finished:
+        return None
+    try:
+        start = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+        end = datetime.fromisoformat(str(finished).replace("Z", "+00:00"))
+        value = (end - start).total_seconds()
+        return value if value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _task_timing(video_id: str) -> tuple[float | None, float | None]:
+    """Use persisted task timing when older pipeline JSON lacks timing fields."""
+    try:
+        from app.repositories.db import SessionLocal
+        from app.repositories.models import VideoTask
+
+        db = SessionLocal()
+        try:
+            task = db.get(VideoTask, video_id)
+            if task is None:
+                return None, None
+            video_duration = _to_float(task.video_duration_seconds)
+            processing_duration = _to_float(task.processing_duration_seconds)
+            return (
+                video_duration if video_duration is not None and video_duration > 0 else None,
+                processing_duration if processing_duration is not None and processing_duration > 0 else None,
+            )
+        finally:
+            db.close()
+    except Exception:
+        return None, None
+
+
+def _video_capture_date_cn(video_id: str) -> str:
+    """返回视频拍摄/录制日期，而不是报表生成日期。"""
+    try:
+        from app.repositories.db import SessionLocal
+        from app.repositories.models import VideoTask
+
+        db = SessionLocal()
+        try:
+            task = db.get(VideoTask, video_id)
+            # VideoTask.created_at 是系统记录视频任务、即拍摄/录制时间的
+            # 统一口径；旧数据缺失时再退回 started_at。
+            captured_at = getattr(task, "created_at", None) or getattr(task, "started_at", None)
+            if captured_at is None:
+                return ""
+            if captured_at.tzinfo is None:
+                from app.utils.timezone import CHINA_TZ
+
+                captured_at = captured_at.replace(tzinfo=CHINA_TZ)
+            else:
+                captured_at = captured_at.astimezone(now_china().tzinfo)
+            return captured_at.strftime("%Y 年 %m 月 %d 日")
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("读取视频拍摄日期失败 video_id=%s: %s", video_id, exc)
+        return ""
+
+
+def _aquaculture_bin(video_id: str) -> str:
+    try:
+        from app.repositories.db import SessionLocal
+        from app.repositories.models import VideoTask
+        db = SessionLocal()
+        try:
+            task = db.get(VideoTask, video_id)
+            return str(getattr(task, "aquaculture_bin", None) or "未填写")
+        finally:
+            db.close()
+    except Exception:
+        return "未填写"
+
+
+def _fps_value(video_id: str, payload: dict[str, Any]) -> float | None:
+    value = _to_float(payload.get("fps_estimate") or payload.get("fps"))
+    return value if value and value > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +410,8 @@ def _context_for_template(
     extra 用于补充 average/min/max 之类可能模板用到的字段。
     """
     extra = extra or {}
+    video_duration = _to_float(extra.get("video_duration_seconds"))
+    processing_seconds = _to_float(extra.get("processing_seconds"))
 
     status = (payload.get("status") or "").strip()
     status_text = {
@@ -300,7 +423,8 @@ def _context_for_template(
 
     complete = sum(
         1 for f in fish
-        if isinstance(f, dict) and str(f.get("status") or "").lower() == "done"
+        if isinstance(f, dict)
+        and str(f.get("status") or "").lower() in {"done", "complete"}
     )
 
     base = {
@@ -308,12 +432,17 @@ def _context_for_template(
         "video_id": video_id,
         "report_no": extra.get("report_no") or _safe_report_no(video_id),
         "generated_at": format_china_datetime(),
-        "report_date_cn": now_china().strftime("%Y 年 %m 月 %d 日"),
-        "system_name": "鱼质检测分析系统",
+        "report_date_cn": (
+            extra.get("video_capture_date_cn")
+            or _video_capture_date_cn(video_id)
+            or now_china().strftime("%Y 年 %m 月 %d 日")
+        ),
+        "system_name": extra.get("report_name") or "鱼质检测分析系统",
         "report_type_name": "单视频鱼体检测报告",
         "report_status_name": status_text,
         "video_status": status_text,
-        "report_title": f"鱼体检测视频报告 · {video_id}",
+         "report_title": extra.get("report_name") or f"鱼体检测视频报告 · {video_id}",
+        "aquaculture_bin": _aquaculture_bin(video_id),
         "status": status_text,
 
         # === 鱼数 / 状态统计 ===
@@ -359,9 +488,16 @@ def _context_for_template(
         "max_body_weight_g": _fmt_float(extra.get("max_body_weight_g")),
 
         # === 结尾结论 / 摘要 ===
-        "daily_conclusion": extra.get("daily_conclusion") or _build_conclusion(
-            video_id, status, summary, fish,
-        ),
+        "daily_conclusion": (
+            f"养鱼仓：{_aquaculture_bin(video_id)}。"
+            + (extra.get("daily_conclusion") or _build_conclusion(
+            video_id,
+            status,
+            summary,
+            fish,
+            video_duration_seconds=video_duration,
+            processing_seconds=processing_seconds,
+        ))),
 
         # === 单视频场景下覆盖的"日报级"字段（避免占位符残留） ===
         # 所有多视频汇总的占位符在单视频场景无意义，但模板里都有。
@@ -371,7 +507,7 @@ def _context_for_template(
         "no_fish_video_total": "0",
         "done_video_total": _fmt_int(1 if status.lower() == "done" else 0),
         "failed_video_total": _fmt_int(1 if status.lower() == "failed" else 0),
-        "total_video_duration": "--",
+        "total_video_duration": _fmt_duration(video_duration),
         "task_success_rate": _fmt_float(summary.get("total_fish") and complete / len(fish) if fish else None, 2),
         "metric_complete_rate": "--",
 
@@ -403,7 +539,7 @@ def _context_for_template(
             2,
         ),
         "avg_fps": "--",
-        "avg_processing_seconds": "--",
+        "avg_processing_seconds": _fmt_duration(processing_seconds),
         "local_save_status": "--",
         "usb_backup_status": "--",
         "report_file_name": f"{video_id}_report.docx",
@@ -478,11 +614,11 @@ def _context_for_template(
         "video_processed_fish_3": "--",
         "video_processed_fish_4": "--",
         "video_processed_fish_5": "--",
-        "video_source_type_1": "--",
-        "video_source_type_2": "--",
-        "video_source_type_3": "--",
-        "video_source_type_4": "--",
-        "video_source_type_5": "--",
+        "aquaculture_bin_1": _aquaculture_bin(video_id),
+        "aquaculture_bin_2": "--",
+        "aquaculture_bin_3": "--",
+        "aquaculture_bin_4": "--",
+        "aquaculture_bin_5": "--",
         "video_created_at_1": "--",
         "video_created_at_2": "--",
         "video_created_at_3": "--",
@@ -508,23 +644,54 @@ def _build_conclusion(
     status: str,
     summary: dict[str, Any],
     fish: list[dict],
+    video_duration_seconds: float | None = None,
+    processing_seconds: float | None = None,
 ) -> str:
-    """daily_conclusion 兜底文本。"""
+    """复用日报综合结论格式生成单视频结论。"""
     total = len(fish)
     if total == 0:
         return f"视频 {video_id} 当前没有可分析的鱼体数据。"
     complete = sum(
         1 for f in fish
-        if isinstance(f, dict) and str(f.get("status") or "").lower() == "done"
+        if isinstance(f, dict)
+        and str(f.get("status") or "").lower() in {"done", "complete"}
     )
-    rate = complete / total if total else 0.0
-    avg_ratio = summary.get("avg_surface_damage_ratio")
-    avg_pct = f"{float(avg_ratio) * 100:.2f}%" if avg_ratio not in (None, "") else "--"
-    return (
-        f"视频 {video_id} 共检测到 {total} 条鱼，"
-        f"其中完整鱼 {complete} 条，完整率 {rate * 100:.2f}%；"
-        f"平均破损率 {avg_pct}。"
-    )
+    from app.services.report_stats_service import _build_daily_conclusion
+
+    metric_block = {
+        "body_length": [
+            float(f["body_length_cm"])
+            for f in fish
+            if isinstance(f, dict) and f.get("body_length_cm") not in (None, "")
+        ],
+        "body_height": [
+            float(f["body_height_cm"])
+            for f in fish
+            if isinstance(f, dict) and f.get("body_height_cm") not in (None, "")
+        ],
+        "body_weight": [
+            float(f["pred_weight_g"])
+            for f in fish
+            if isinstance(f, dict) and f.get("pred_weight_g") not in (None, "")
+        ],
+        "condition_factor": [
+            float(f["condition_factor"])
+            for f in fish
+            if isinstance(f, dict) and f.get("condition_factor") not in (None, "")
+        ],
+    }
+    daily_summary = {
+        "fish_total": total,
+        "video_total": 1,
+        "done_video_total": 1 if status.lower() == "done" else 0,
+        "metric_complete_rate": complete / total,
+        "surface_damage_rate": float(summary.get("avg_surface_damage_ratio") or 0),
+        "abnormal_fish_rate": 0.0,
+        "total_video_duration": float(video_duration_seconds or 0),
+        "avg_processing_seconds": float(processing_seconds or 0),
+    }
+    # 日报构造器负责统一统计口径和句式；单视频报告只替换报告主体名称。
+    return _build_daily_conclusion(daily_summary, metric_block).replace("本日报", "本视频")
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +703,7 @@ def _build_conclusion(
 #   "{{chart_body_length_distributi on}}" 或带 \n/空格/全角空格 → "{{chart_body_length_distribution}}"
 _PLACEHOLDER_BOUNDARY = re.compile(r"\{\s*\{\s*([a-zA-Z0-9_]+)\s*\}\s*\}")
 _PLACEHOLDER_FRAGMENTED = re.compile(
-    r"\{\s*\{[^{}\n]*?(?:chart_|total_fish|complete_fish|incomplete_fish|failed_fish|damaged_fish|avg_|max_|min_|video_id|report_no|generated_at|report_date_cn|system_name|report_type_name|report_status_name|video_status|report_title|fish_count|total_count|complete_count|incomplete_count|failed_count|damaged_count|avg_damage_ratio|max_damage_ratio|status|daily_conclusion)[^{}]*?\}\s*\}"
+    r"\{\s*\{[^{}\n]*?(?:chart_|aquaculture_bin|total_fish|complete_fish|incomplete_fish|failed_fish|damaged_fish|avg_|max_|min_|video_id|report_no|generated_at|report_date_cn|system_name|report_type_name|report_status_name|video_status|report_title|fish_count|total_count|complete_count|incomplete_count|failed_count|damaged_count|avg_damage_ratio|max_damage_ratio|status|daily_conclusion)[^{}]*?\}\s*\}"
 )
 _ANY_BRACES = re.compile(r"\{\s*\{\s*([a-zA-Z0-9_]+)\s*\}\s*\}")
 
@@ -661,6 +828,8 @@ def _insert_chart_images(doc, chart_paths: dict[str, Path]) -> dict[str, str]:
 
     residual: list[str] = []
     inserted: dict[str, str] = {}
+    seen_cells: set[str] = set()
+    fixed_demo_inserted = False
 
     def _strip_token_from_cell(cell, key: str) -> None:
         """从 cell 中所有 run 文本里抹掉 {{ key }} 的所有拆散形态。"""
@@ -690,6 +859,9 @@ def _insert_chart_images(doc, chart_paths: dict[str, Path]) -> dict[str, str]:
                     p.add_run(full)
 
     def _append_chart_to_cell(cell, key: str) -> None:
+        nonlocal fixed_demo_inserted
+        if key == FIXED_BODY_DEMO_CHART_KEY and fixed_demo_inserted:
+            return
         png = chart_paths.get(key)
         # 创建新段落承载图片
         try:
@@ -708,13 +880,24 @@ def _insert_chart_images(doc, chart_paths: dict[str, Path]) -> dict[str, str]:
             return
 
         try:
-            w_in, h_in = calc_fit_image_size_safe(png, cell, max_w=5.8, max_h=3.2)
+            max_h = 3.2
+            if key == FIXED_BODY_DEMO_CHART_KEY:
+                max_h = FIXED_BODY_DEMO_HEIGHT_INCH
+            w_in, h_in = calc_fit_image_size_safe(png, cell, max_w=5.8, max_h=max_h)
+            if key == FIXED_BODY_DEMO_CHART_KEY:
+                # 使用行高作为图片高度，宽度按原始比例同步计算。
+                from app.services.report_docx_service import calc_fit_image_size
+
+                w_in, h_in = calc_fit_image_size(png, 5.8, max_h)
+                h_in = round(max_h, 3)
             pic_p.add_run().add_picture(
                 str(png),
                 width=Inches(w_in),
                 height=Inches(h_in),
             )
             inserted[key] = _data_rel(png)
+            if key == FIXED_BODY_DEMO_CHART_KEY:
+                fixed_demo_inserted = True
         except Exception as exc:
             logger.warning(f"[video_report] 插入 {key} 失败：{exc}")
             pic_p.add_run(f"图表加载失败：{type(exc).__name__}")
@@ -724,8 +907,22 @@ def _insert_chart_images(doc, chart_paths: dict[str, Path]) -> dict[str, str]:
             for row in tab.rows:
                 for cell in row.cells:
                     handle_cell(cell)
+                    # 递归处理嵌套表格；合并单元格仍由 seen_cells 去重。
+                    walk(cell)
 
     def handle_cell(cell) -> None:
+        # python-docx 对横向合并单元格会返回多个代理对象；它们共享同一个
+        # 底层 tc。按 tc 去重，避免同一单元格重复追加图表。
+        cell_element = getattr(cell, "_tc", None)
+        if cell_element is not None:
+            # 取插图前的 XML 快照作为 key。合并单元格的多个代理 XML 相同；
+            # 不能直接保存 XML proxy，因为第一次插图后 proxy 会被修改，
+            # 后续代理就无法再与它相等。
+            cell_key = str(cell_element.xml)
+            if cell_key in seen_cells:
+                return
+            seen_cells.add(cell_key)
+
         all_text = "\n".join(p.text for p in cell.paragraphs)
         norm = _normalize_placeholder(all_text)
         chart_hits = [
@@ -852,7 +1049,7 @@ def _write_report_urls_back_to_pipeline(
 # ---------------------------------------------------------------------------
 
 
-def generate_video_pdf_report(video_id: str) -> dict[str, Any]:
+def generate_video_pdf_report(video_id: str, report_name: str | None = None) -> dict[str, Any]:
     """为单一 video_id 生成 DOCX + PDF 报表。
 
     返回 dict：
@@ -883,6 +1080,11 @@ def generate_video_pdf_report(video_id: str) -> dict[str, Any]:
     if not isinstance(fish_list, list):
         fish_list = []
     fish_list = [f for f in fish_list if isinstance(f, dict)]
+    normalized_fish_list: list[dict] = []
+    for fish in fish_list:
+        row = dict(fish)
+        normalized_fish_list.append(row)
+    fish_list = normalized_fish_list
     summary = _summary_get(payload)
 
     # 1. 5 张统计图
@@ -918,6 +1120,9 @@ def generate_video_pdf_report(video_id: str) -> dict[str, Any]:
     weight_vals = _to_float_list(fish_list, "pred_weight_g")
     cf_vals = _to_float_list(fish_list, "condition_factor")
 
+    video_duration_from_task, processing_from_task = _task_timing(video_id)
+    video_duration = _video_duration_seconds(video_id, payload)
+    processing_seconds = _processing_seconds(payload)
     extra = {
         "avg_body_length_cm": _avg_or_none(body_vals),
         "avg_body_length_without_tail_cm": _avg_or_none(no_tail_vals),
@@ -934,6 +1139,11 @@ def generate_video_pdf_report(video_id: str) -> dict[str, Any]:
         "max_body_weight_g": _max_or_none(weight_vals),
         "min_condition_factor": _min_or_none(cf_vals),
         "max_condition_factor": _max_or_none(cf_vals),
+        "video_duration_seconds": video_duration or video_duration_from_task,
+        "processing_seconds": processing_seconds or processing_from_task,
+        "fps": _fps_value(video_id, payload),
+        "video_capture_date_cn": _video_capture_date_cn(video_id),
+        "report_name": str(report_name or "").strip(),
     }
 
     context = _context_for_template(video_id, payload, fish_list, summary, extra)
@@ -1007,6 +1217,170 @@ def generate_video_pdf_report(video_id: str) -> dict[str, Any]:
         f"residual_text={len(residual_text)} residual_chart={len(residual_chart)}"
     )
     return result
+
+
+def generate_combined_video_pdf_report(
+    video_ids: list[str], output_dir: Path, report_name: str = "自定义报表"
+) -> dict[str, Any]:
+    """Use the standard report template for a multi-video report."""
+    normalized_ids = list(dict.fromkeys(str(value).strip() for value in video_ids if str(value).strip()))
+    if not normalized_ids:
+        return {"ok": False, "error": "video_ids is empty"}
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    combined_id = f"combined_{int(time.time())}"
+    payloads = [_read_pipeline_result(video_id) for video_id in normalized_ids]
+    fish_list: list[dict] = []
+    for video_id, payload in zip(normalized_ids, payloads):
+        for fish in payload.get("fish") or []:
+            if isinstance(fish, dict):
+                row = dict(fish)
+                row.setdefault("video_id", video_id)
+                fish_list.append(row)
+    summaries = [_summary_get(payload) for payload in payloads]
+    timings = []
+    for video_id, payload in zip(normalized_ids, payloads):
+        task_duration, task_processing = _task_timing(video_id)
+        timings.append((
+            task_duration if task_duration is not None else _video_duration_seconds(video_id, payload),
+            task_processing if task_processing is not None else _processing_seconds(payload),
+        ))
+    video_durations = [value for value, _ in timings if value is not None and value >= 0]
+    processing_durations = [value for _, value in timings if value is not None and value >= 0]
+    summary: dict[str, Any] = {
+        "total_fish": len(fish_list),
+        "complete_fish": sum(int(item.get("complete_fish") or 0) for item in summaries),
+        "incomplete_fish": sum(int(item.get("incomplete_fish") or 0) for item in summaries),
+        "failed_fish": sum(int(item.get("failed_fish") or 0) for item in summaries),
+        "damaged_fish": sum(int(item.get("damaged_fish") or 0) for item in summaries),
+        "avg_surface_damage_ratio": next((item.get("avg_surface_damage_ratio") for item in summaries if item.get("avg_surface_damage_ratio") is not None), None),
+    }
+    chart_dir = output_dir / "charts"
+    chart_paths = generate_charts(fish_list, chart_dir)
+    fixed_demo_path = chart_dir / f"{FIXED_BODY_DEMO_CHART_KEY}.png"
+    if not fixed_demo_path.exists():
+        generated = prepare_fixed_body_demo_image(chart_dir)
+        if generated and Path(generated).exists() and Path(generated) != fixed_demo_path:
+            shutil.copy2(str(generated), str(fixed_demo_path))
+    chart_paths[FIXED_BODY_DEMO_CHART_KEY] = fixed_demo_path
+
+    body_values = _to_float_list(fish_list, "body_length_cm")
+    no_tail_values = _to_float_list(fish_list, "body_length_no_tail_cm")
+    height_values = _to_float_list(fish_list, "body_height_cm")
+    weight_values = _to_float_list(fish_list, "pred_weight_g")
+    condition_values = _to_float_list(fish_list, "condition_factor")
+    # The combined report must use the same per-video data as the individual
+    # report, rather than filling its detail rows with template placeholders.
+    task_map: dict[str, Any] = {}
+    try:
+        from app.repositories.db import SessionLocal
+        from app.repositories.models import VideoTask
+
+        db = SessionLocal()
+        try:
+            task_map = {
+                task.video_id: task
+                for task in db.query(VideoTask).filter(VideoTask.video_id.in_(normalized_ids)).all()
+            }
+        finally:
+            db.close()
+    except Exception:
+        task_map = {}
+
+    fish_by_video: dict[str, list[dict]] = {video_id: [] for video_id in normalized_ids}
+    for fish in fish_list:
+        fish_by_video.setdefault(str(fish.get("video_id") or ""), []).append(fish)
+    complete_total = sum(
+        1 for fish in fish_list
+        if str(fish.get("status") or "").lower() in {"done", "complete"}
+    )
+    damage_values = [
+        value for fish in fish_list
+        if (value := _to_float(fish.get("surface_damage_ratio"))) is not None
+    ]
+    context = _context_for_template(
+        combined_id,
+        {"status": "done"},
+        fish_list,
+        summary,
+        {
+            "report_no": f"CUSTOM-{int(time.time())}",
+            "video_capture_date_cn": "合并选定视频",
+            "report_type_name": "鱼质检测合并报表",
+            "report_title": "鱼质检测合并报表",
+            "report_name": report_name,
+            "avg_body_length_cm": _avg_or_none(body_values),
+            "avg_body_length_without_tail_cm": _avg_or_none(no_tail_values),
+            "avg_body_height_cm": _avg_or_none(height_values),
+            "avg_body_weight_g": _avg_or_none(weight_values),
+            "avg_condition_factor": _avg_or_none(condition_values),
+            "min_body_length_cm": _min_or_none(body_values),
+            "max_body_length_cm": _max_or_none(body_values),
+            "min_body_length_without_tail_cm": _min_or_none(no_tail_values),
+            "max_body_length_without_tail_cm": _max_or_none(no_tail_values),
+            "min_body_height_cm": _min_or_none(height_values),
+            "max_body_height_cm": _max_or_none(height_values),
+            "min_body_weight_g": _min_or_none(weight_values),
+            "max_body_weight_g": _max_or_none(weight_values),
+            "min_condition_factor": _min_or_none(condition_values),
+            "max_condition_factor": _max_or_none(condition_values),
+        },
+    )
+    context.update({
+        "report_type_name": "鱼质检测合并报表",
+        "report_title": "鱼质检测合并报表",
+        "system_name": report_name,
+        "report_title": report_name,
+        "video_id": "、".join(normalized_ids),
+        "video_total": str(len(normalized_ids)),
+        "total_video_duration": _fmt_duration(sum(video_durations)) if video_durations else "0秒",
+        "complete_fish": complete_total,
+        "incomplete_fish": sum(int(item.get("incomplete_fish") or 0) for item in summaries),
+        "failed_fish": sum(int(item.get("failed_fish") or 0) for item in summaries),
+        "damaged_fish": sum(int(item.get("damaged_fish") or 0) for item in summaries),
+        "avg_surface_damage_ratio": _avg_or_none(damage_values),
+        "avg_processing_seconds": _fmt_duration(
+            sum(processing_durations) / len(processing_durations)
+        ) if processing_durations else "0秒",
+        "daily_conclusion": f"本报表汇总了 {len(normalized_ids)} 个视频，共检测 {len(fish_list)} 条鱼。" + (context.get("daily_conclusion") or ""),
+    })
+    for index in range(1, 6):
+        selected_id = normalized_ids[index - 1] if index <= len(normalized_ids) else "--"
+        context[f"video_index_{index}"] = str(index) if selected_id != "--" else "--"
+        context[f"video_id_{index}"] = selected_id
+        context[f"video_status_{index}"] = "已完成" if selected_id != "--" else "--"
+        selected_fish = fish_by_video.get(selected_id, []) if selected_id != "--" else []
+        selected_task = task_map.get(selected_id)
+        context[f"aquaculture_bin_{index}"] = str(getattr(selected_task, "aquaculture_bin", None) or "未填写") if selected_task else "未填写"
+        context[f"video_total_fish_{index}"] = str(len(selected_fish)) if selected_id != "--" else "--"
+        context[f"video_processed_fish_{index}"] = str(sum(
+            1 for fish in selected_fish
+            if str(fish.get("status") or "").lower() in {"done", "complete"}
+        )) if selected_id != "--" else "--"
+    docx_path = output_dir / "custom_video_report.docx"
+    pdf_path = output_dir / "custom_video_report.pdf"
+    try:
+        from docx import Document
+        shutil.copy2(str(get_video_report_template_path()), str(docx_path))
+        doc = Document(str(docx_path))
+        _replace_text_placeholders(doc, context)
+        _insert_chart_images(doc, chart_paths)
+        doc.save(str(docx_path))
+        converted = _convert_docx_to_pdf(docx_path, output_dir)
+        if converted and converted != pdf_path and converted.exists():
+            converted.rename(pdf_path)
+    except Exception as exc:
+        logger.exception("[combined_video_report] generation failed: %s", exc)
+        return {"ok": False, "error": f"合并报表生成失败：{exc}"}
+
+    return {
+        "ok": True,
+        "report_docx": _data_rel(docx_path),
+        "report_pdf": _data_rel(pdf_path) if pdf_path.exists() else "",
+        "file_path": _data_rel(pdf_path if pdf_path.exists() else docx_path),
+        "file_name": (pdf_path if pdf_path.exists() else docx_path).name,
+        "video_ids": normalized_ids,
+    }
 
 
 __all__ = [

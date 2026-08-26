@@ -3,6 +3,10 @@
 Crop/mask pairs from ``first_match`` are classified into ``complete_match`` or
 ``incomplete_match``.  Complete fish retain the existing direction-correction
 workflow before they are saved.
+
+With ``--force-all-complete``, the ViT classification is skipped.  Every
+processable crop/mask pair still follows the complete-fish direction-correction
+workflow and is saved to ``complete_match``.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Sequence, TYPE_CHECKING
 
@@ -52,7 +57,7 @@ if str(ALGORITHMS_DENGCHAO_DIR) not in sys.path:
 def _import_processing_functions():
     """Import orientation and ViT helpers only when processing starts."""
 
-    from merge_funs import (  # type: ignore[import-not-found]  # noqa: WPS433
+    from algorithms.core.merge_funs import (  # type: ignore[import-not-found]  # noqa: WPS433
         DEFAULT_ANGLE_THRESHOLD,
         DEFAULT_MIN_AREA,
         DEFAULT_THRESHOLD,
@@ -63,7 +68,7 @@ def _import_processing_functions():
         get_fish_mask,
         rotate_bound,
     )
-    from vit_completeness import get_default_classifier  # type: ignore[import-not-found]  # noqa: WPS433
+    from algorithms.core.vit_completeness import get_default_classifier  # type: ignore[import-not-found]  # noqa: WPS433
     return {
         "DEFAULT_ANGLE_THRESHOLD": DEFAULT_ANGLE_THRESHOLD,
         "DEFAULT_MIN_AREA": DEFAULT_MIN_AREA,
@@ -365,7 +370,13 @@ def save_incomplete_pair(crop_path: Path, mask_path: Path,
 # ---------------------------------------------------------------------------
 
 
-def process_directory(input_dir: Path, complete_dir: Path, incomplete_dir: Path) -> int:
+def process_directory(
+    input_dir: Path,
+    complete_dir: Path,
+    incomplete_dir: Path,
+    *,
+    force_all_complete: bool = False,
+) -> int:
     if not input_dir.is_dir():
         print(f"[ERROR] 输入目录不存在：{_log_path(input_dir)}")
         return 1
@@ -373,22 +384,42 @@ def process_directory(input_dir: Path, complete_dir: Path, incomplete_dir: Path)
     ensure_dir(complete_dir)
     ensure_dir(incomplete_dir)
 
-    # Initialise the classifier once per stage.  A resource/configuration
-    # error must fail the stage rather than skip every fish below.
+    # Direction-correction helpers are needed in both modes.  The ViT model is
+    # deliberately initialized only for the normal completeness-classification
+    # path.
     try:
         mf = _processing_functions()
-        classifier = mf["get_default_classifier"]()
     except Exception as exc:
-        print(f"[ERROR] failed to initialize ViT completeness classifier: {exc}")
+        print(f"[ERROR] failed to initialize fish orientation helpers: {exc}")
         return 1
+
+    classifier = None
+    if force_all_complete:
+        print(
+            "[INFO] 跳过完整性 ViT 判断：所有可正常处理的分割鱼按完整鱼处理，"
+            "并保留方向校正。"
+        )
+    else:
+        # Initialise the classifier once per stage.  A resource/configuration
+        # error must fail the stage rather than skip every fish below.
+        try:
+            classifier = mf["get_default_classifier"]()
+        except Exception as exc:
+            print(f"[ERROR] failed to initialize ViT completeness classifier: {exc}")
+            return 1
 
     total = 0
     complete_count = 0
     incomplete_count = 0
     skipped_count = 0
 
-    with tempfile.TemporaryDirectory(prefix="fish_complete_") as temp_dir_name:
-        temp_dir = Path(temp_dir_name)
+    temp_dir_context = (
+        nullcontext(None)
+        if force_all_complete
+        else tempfile.TemporaryDirectory(prefix="fish_complete_")
+    )
+    with temp_dir_context as temp_dir_name:
+        temp_dir = Path(temp_dir_name) if temp_dir_name is not None else None
 
         for stem, crop_path, mask_path, track_id, frame_index in iter_crop_mask_pairs(input_dir):
             total += 1
@@ -398,13 +429,22 @@ def process_directory(input_dir: Path, complete_dir: Path, incomplete_dir: Path)
                 continue
             try:
                 crop_image, mask_image = read_crop_mask_images(crop_path, mask_path)
-                black_background_fish = make_black_background_fish_from_images(crop_image, mask_image)
-                temp_image_path = temp_dir / f"{stem}_black_bg.png"
-                _cv2().imwrite(str(temp_image_path), black_background_fish)
+                if force_all_complete:
+                    is_complete = True
+                    label = "forced_complete"
+                    confidence = None
+                else:
+                    black_background_fish = make_black_background_fish_from_images(
+                        crop_image, mask_image
+                    )
+                    temp_image_path = temp_dir / f"{stem}_black_bg.png"
+                    _cv2().imwrite(str(temp_image_path), black_background_fish)
+                    result = classifier.predict_path(temp_image_path)
+                    is_complete = result.is_complete
+                    label = result.label
+                    confidence = result.confidence
 
-                result = classifier.predict_path(temp_image_path)
-
-                if result.is_complete:
+                if is_complete:
                     (
                         aligned_crop,
                         aligned_mask,
@@ -426,7 +466,7 @@ def process_directory(input_dir: Path, complete_dir: Path, incomplete_dir: Path)
                 print(f"[skip] {stem}: {exc}")
                 continue
 
-            if result.is_complete:
+            if is_complete:
                 complete_count += 1
                 action = (
                     "aligned"
@@ -441,7 +481,10 @@ def process_directory(input_dir: Path, complete_dir: Path, incomplete_dir: Path)
                 incomplete_count += 1
                 action = "saved to incomplete"
 
-            print(f"[{result.label}] {stem}: confidence={result.confidence:.6f}, {action}")
+            if confidence is None:
+                print(f"[{label}] {stem}: completeness classification skipped, {action}")
+            else:
+                print(f"[{label}] {stem}: confidence={confidence:.6f}, {action}")
 
     print()
     print("==== filter_complete_fish 完成 ====")
@@ -482,6 +525,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="兼容旧参数：相当于 --complete-output-dir")
     parser.add_argument("--incomplete-dir", dest="incomplete_dir", default=None,
                         help="兼容旧参数：相当于 --incomplete-output-dir")
+    parser.add_argument(
+        "--force-all-complete",
+        action="store_true",
+        help=(
+            "跳过完整性 ViT 判断；所有可正常处理的分割鱼均写入 complete_match，"
+            "但仍执行完整鱼方向校正。"
+        ),
+    )
     return parser
 
 
@@ -496,7 +547,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SystemExit as exc:
         print(f"[ERROR] {exc}")
         return 2
-    return process_directory(input_dir, complete_dir, incomplete_dir)
+    return process_directory(
+        input_dir,
+        complete_dir,
+        incomplete_dir,
+        force_all_complete=args.force_all_complete,
+    )
 
 
 if __name__ == "__main__":

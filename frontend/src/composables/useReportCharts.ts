@@ -68,7 +68,11 @@ function buildPercentBarOption(
       nameGap: 46,
       min: 0,
       max: 100,
-      axisLabel: { formatter: '{value}%', color: '#4e5969', fontSize: 11 },
+      axisLabel: {
+        formatter: (value: number) => (Number(value) === 0 ? '' : `${value}%`),
+        color: '#4e5969',
+        fontSize: 11,
+      },
       splitLine: { lineStyle: { color: '#e5e6eb' } },
       nameTextStyle: { color: '#4e5969', fontSize: 11 },
     },
@@ -79,7 +83,7 @@ function buildPercentBarOption(
         data: percents,
         barMaxWidth: 36,
         label: {
-          show: percents.some((v) => v >= 4),
+          show: (p: any) => Number(p.value || 0) > 0,
           formatter: (p: any) => `${Number(p.value || 0).toFixed(1)}%`,
           color: '#1d2129',
           fontSize: 11,
@@ -179,12 +183,12 @@ export function useReportCharts(
 
     if (refs.lengthDist?.value && c.body_length_distribution?.length) {
       const inst = echarts.init(refs.lengthDist.value)
-      inst.setOption(buildPercentBarOption(c.body_length_distribution, '', '体长区间（cm）', ' cm'))
+       inst.setOption(buildPercentBarOption(c.body_length_distribution, '', '全长区间（cm）', ' cm'))
       chartInstances.push(inst)
     }
     if (refs.noTailDist?.value && c.body_length_without_tail_distribution?.length) {
       const inst = echarts.init(refs.noTailDist.value)
-      inst.setOption(buildPercentBarOption(c.body_length_without_tail_distribution, '', '无尾体长区间（cm）', ' cm'))
+       inst.setOption(buildPercentBarOption(c.body_length_without_tail_distribution, '', '体高区间（cm）', ' cm'))
       chartInstances.push(inst)
     }
     if (refs.heightDist?.value && c.body_height_distribution?.length) {
@@ -215,10 +219,9 @@ export function useReportCharts(
 
     if (refs.statusPie?.value) {
       const statusData = [
-        { name: '有效', value: s.valid_fish || 0 },
-        { name: '异常', value: s.abnormal_fish || 0 },
-        { name: '破损', value: s.surface_damage_count || 0 },
-      ].filter((x) => x.value > 0)
+        { name: '完整鱼', value: s.valid_fish || 0 },
+        { name: '不完整鱼', value: s.incomplete_fish ?? s.abnormal_fish ?? 0 },
+      ]
       const total = statusData.reduce((sum, x) => sum + Number(x.value || 0), 0)
       const inst = echarts.init(refs.statusPie.value)
       inst.setOption({

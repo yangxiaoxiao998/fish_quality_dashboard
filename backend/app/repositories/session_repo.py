@@ -96,6 +96,10 @@ def update_video_task_status(
     # 终态：done / failed / stopped / no_fish_detected 都意味着任务结束
     if status in ("done", "failed", "stopped", "no_fish_detected"):
         obj.finished_at = now
+        if obj.started_at:
+            elapsed = (now - obj.started_at).total_seconds()
+            if elapsed >= 0:
+                obj.processing_duration_seconds = round(elapsed, 2)
 
     db.commit()
     print(
@@ -120,6 +124,20 @@ def update_video_task_source_path(
     db.commit()
 
 
+def update_video_task_duration(
+    db: Session,
+    *,
+    video_id: str,
+    video_duration_seconds: float | None,
+) -> None:
+    """Persist the measured media duration after recording/transcoding."""
+    obj = db.get(VideoTask, video_id)
+    if obj is None or video_duration_seconds is None or video_duration_seconds <= 0:
+        return
+    obj.video_duration_seconds = round(float(video_duration_seconds), 3)
+    db.commit()
+
+
 def delete_video_task(
     db: Session,
     *,
@@ -137,6 +155,22 @@ def delete_video_task(
     db.commit()
     print(f"[DB] delete video task: video_id={video_id!r}")
     return True
+
+
+def update_video_task_aquaculture_bin(
+    db: Session,
+    *,
+    video_id: str,
+    aquaculture_bin: str | None,
+) -> VideoTask | None:
+    obj = db.get(VideoTask, video_id)
+    if obj is None:
+        return None
+    value = (aquaculture_bin or "").strip()
+    obj.aquaculture_bin = value[:255] or None
+    db.commit()
+    db.refresh(obj)
+    return obj
 
 
 def update_video_progress(

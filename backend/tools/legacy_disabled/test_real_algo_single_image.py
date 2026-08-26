@@ -94,7 +94,7 @@ def main() -> int:
         "--image",
         type=str,
         default=None,
-        help="待测试的单张图片路径。不填则自动查找 data/uploads/original_images 下最新图片。",
+        help="待测试的单张图片路径。不填则自动查找 data/jobs/<video_id>/frames/raw/ 下最新图片。",
     )
     parser.add_argument(
         "--video-id",

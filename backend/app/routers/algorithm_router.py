@@ -15,6 +15,7 @@ algorithm_router.py - 算法 CLI 对接接口
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Optional
 from pathlib import Path
@@ -26,11 +27,27 @@ from sqlalchemy.orm import Session
 from app.repositories.db import SessionLocal, get_db
 from app.repositories import session_repo
 from app.services import algorithm_cli_service, algorithm_result_service
+from app.paths import DATA_DIR
 from app.services import algorithm_calibration_capture_service
 from app.services.video_report_pdf_service import generate_video_pdf_report
 
 router = APIRouter()
 logger = logging.getLogger("algorithm_router")
+CALIBRATION_CONFIG_JSON = DATA_DIR / "calibration" / "calibration_config.json"
+
+
+class CalibrationConfigRequest(BaseModel):
+    real_length_mm: float = Field(..., gt=0)
+
+
+def _read_calibration_config() -> dict[str, Any]:
+    if not CALIBRATION_CONFIG_JSON.exists():
+        return {"real_length_mm": 1376.0}
+    try:
+        data = json.loads(CALIBRATION_CONFIG_JSON.read_text(encoding="utf-8"))
+        return {"real_length_mm": float(data.get("real_length_mm", 1376.0))}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {"real_length_mm": 1376.0}
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +59,7 @@ class CalibrationRequest(BaseModel):
     camera_id: str = "default"
     device: str = "cuda"
     overwrite: bool = True
+    real_length_mm: Optional[float] = Field(None, gt=0)
 
 
 class CaptureCalibrationRequest(BaseModel):
@@ -52,12 +70,13 @@ class CaptureCalibrationRequest(BaseModel):
 
     # 新增：复用"摄像头输入"按钮当前配置
     stream_url: Optional[str] = None
-    width: Optional[int] = 1920
-    height: Optional[int] = 1080
-    fps: Optional[int] = 25
+    width: Optional[int] = None
+    height: Optional[int] = None
+    fps: Optional[int] = None
 
     # 新增：标定拍摄后自动停止摄像头（不污染视频历史）
     stop_after_capture: bool = True
+    real_length_mm: Optional[float] = Field(None, gt=0)
 
 
 class BatchImportResultsRequest(BaseModel):
@@ -113,6 +132,7 @@ def post_calibration(payload: CalibrationRequest) -> dict:
         camera_id=payload.camera_id,
         device=payload.device,
         overwrite=payload.overwrite,
+        real_length_mm=payload.real_length_mm,
     )
 
     if result.get("ok"):
@@ -169,16 +189,20 @@ def post_capture_and_calibrate(payload: CaptureCalibrationRequest) -> dict:
         - adjusted_preview_url / adjusted_preview_path
         - log_path / returncode
     """
+    from app.services.camera_yzt.camera_yzt_service import camera_service_yzt
+
+    camera_settings = camera_service_yzt.get_saved_settings()
     result = algorithm_calibration_capture_service.run_capture_and_calibrate(
         camera_id=payload.camera_id,
         device=payload.device,
         overwrite=payload.overwrite,
         save_only=payload.save_only,
         stream_url=payload.stream_url,
-        width=payload.width,
-        height=payload.height,
-        fps=payload.fps,
+        width=payload.width or camera_settings["width"],
+        height=payload.height or camera_settings["height"],
+        fps=payload.fps or camera_settings["fps"],
         stop_after_capture=payload.stop_after_capture,
+        real_length_mm=payload.real_length_mm,
     )
 
     if result.get("error_message") and not result.get("calibrated") and not result.get("saved"):
@@ -327,7 +351,24 @@ def _build_calibration_status_payload() -> dict[str, Any]:
 
 @router.get("/algorithm/calibration/status")
 def get_calibration_status() -> dict:
-    return _build_calibration_status_payload()
+    payload = _build_calibration_status_payload()
+    payload["real_length_mm"] = _read_calibration_config()["real_length_mm"]
+    return payload
+
+
+@router.get("/algorithm/calibration/config")
+def get_calibration_config() -> dict[str, Any]:
+    return {"ok": True, **_read_calibration_config()}
+
+
+@router.post("/algorithm/calibration/config")
+def save_calibration_config(payload: CalibrationConfigRequest) -> dict[str, Any]:
+    CALIBRATION_CONFIG_JSON.parent.mkdir(parents=True, exist_ok=True)
+    data = {"real_length_mm": float(payload.real_length_mm)}
+    CALIBRATION_CONFIG_JSON.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return {"ok": True, **data}
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +378,9 @@ def get_calibration_status() -> dict:
 class CaptureFrameRequest(BaseModel):
     stream_url: Optional[str] = None
     timeout: Optional[float] = 8.0
+    width: Optional[int] = None
+    height: Optional[int] = None
+    fps: Optional[int] = None
 
 
 @router.post("/algorithm/calibration/capture-frame")
@@ -351,9 +395,16 @@ def post_capture_calibration_frame(payload: CaptureFrameRequest) -> dict:
       - 不影响数据大屏的"摄像头输入"状态
       - 即使后端正在录制业务视频，本接口仍然可以独立抓帧
     """
-    result = algorithm_calibration_capture_service.capture_calibration_frame(
+    from app.services.camera_yzt.camera_yzt_service import camera_service_yzt
+
+    settings = camera_service_yzt.get_saved_settings()
+    result = algorithm_calibration_capture_service.capture_frame_via_camera_yzt(
         stream_url=payload.stream_url,
-        timeout=float(payload.timeout or 8.0),
+        width=payload.width or settings["width"],
+        height=payload.height or settings["height"],
+        fps=payload.fps or settings["fps"],
+        timeout_seconds=max(8.0, float(payload.timeout or 8.0) * 3),
+        stop_after_capture=True,
     )
     if not result.get("ok"):
         code = result.get("error_code") or "CAPTURE_FAILED"
@@ -520,17 +571,14 @@ def get_pipeline_result(video_id: str, db: Session = Depends(get_db)) -> dict:
         )
 
     if payload is None:
-        payload = _build_payload_from_db(db, video_id)
-        if payload is None:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "ok": False,
-                    "error": "pipeline_result.json not found and DB has no record",
-                    "video_id": video_id,
-                },
-            )
-        return {"ok": True, "data": payload, "_source": "database"}
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "ok": False,
+                "error": "pipeline_result.json not found",
+                "video_id": video_id,
+            },
+        )
 
     resp = algorithm_result_service.pipeline_result_to_response(payload)
     return {"ok": True, "data": resp, "_source": "pipeline_result.json"}

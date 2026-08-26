@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import threading
 import time
@@ -21,6 +22,7 @@ from app.services.camera_yzt.pi_runtime_config import (
     get_camera_read_url,
     get_pi_base_url,
     get_pi_runtime_config,
+    is_camera_push_url_automatic,
 )
 from app.services.pi_http_client import make_pi_session, pi_get, pi_post
 from app.services.pi_endpoint_resolver import (
@@ -103,8 +105,8 @@ class CameraServiceYzt:
         # capture_url 等价于 camera_read_url（后端读流地址）。
         self.stream_url: str = self.camera_push_url
         self.capture_url: str = self.camera_read_url
-        self.width: int = 1920
-        self.height: int = 1080
+        self.width: int = 960
+        self.height: int = 540
         self.fps: int = self.FPS
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -133,9 +135,14 @@ class CameraServiceYzt:
         self._timer_armed_at: Optional[datetime] = None
         self._frames_captured: int = 0
         self._frames_written: int = 0
+        self._capture_started_monotonic: Optional[float] = None
         self._last_error: Optional[str] = None
         self._read_fail_count: int = 0
         self.READ_FAIL_THRESHOLD: int = 5
+        # 未来录制计划 ID：start_stream 收到 record_schedule_id 时记录；
+        # 正常停止 / 异常停止都会写回计划表。
+        self._record_schedule_id: Optional[str] = None
+        self._force_all_complete = False
         # 启动 / 运行阶段状态（供前端精细展示）。
         self._stream_ready: bool = False
         self._startup_phase: str = "idle"
@@ -149,6 +156,90 @@ class CameraServiceYzt:
         self._write_video_enabled: bool = True
         self._calibration_only: bool = False
         self._session_create_video_task: bool = True
+        # 调试用 desync 模拟开关：None = 使用真实状态。
+        # 用于前端“正常流 / 异常流 / 逆向流”三种场景的验证。
+        self._debug_pi_running: Optional[bool] = None
+        self._debug_backend_active: Optional[bool] = None
+        self._debug_pi_reachable: Optional[bool] = None
+        # 对焦参数（会话级；每次 start_stream 重置）
+        self._autofocus_mode: Optional[str] = None
+        self._lens_position: Optional[float] = None
+        self._autofocus_window: Optional[str] = None
+
+    @property
+    def settings_path(self) -> Path:
+        return DATA_DIR / "config" / "camera_settings.json"
+
+    def get_saved_settings(self) -> dict:
+        defaults = {
+            "stream_url": self._get_camera_push_url(),
+            "width": 960,
+            "height": 540,
+            "fps": self.FPS,
+        }
+        try:
+            with self.settings_path.open("r", encoding="utf-8") as file:
+                saved = json.load(file)
+            if isinstance(saved, dict):
+                defaults.update({key: saved[key] for key in defaults if key in saved})
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            pass
+        # In automatic mode, an old Wi-Fi address must never override the
+        # current shared-Ethernet address. Keep the setting editable as an
+        # empty value while exposing the effective runtime target to callers.
+        if is_camera_push_url_automatic():
+            defaults["stream_url"] = ""
+        return defaults
+
+    def save_settings(self, settings: dict) -> dict:
+        current = self.get_saved_settings()
+        current.update(settings)
+        if is_camera_push_url_automatic():
+            current["stream_url"] = ""
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.settings_path.open("w", encoding="utf-8") as file:
+            json.dump(current, file, ensure_ascii=False, indent=2)
+        return current
+
+    @property
+    def focus_config_path(self) -> Path:
+        return DATA_DIR / "config" / "focus_settings.json"
+
+    @property
+    def focus_photo_dir(self) -> Path:
+        return DATA_DIR / "tmp" / "focalLength"
+
+    def get_focus_settings(self) -> dict:
+        defaults = {
+            "autofocus_mode": "continuous",
+            "lens_position": 2.0,
+            "autofocus_window": "0.35,0.30,0.30,0.40",
+        }
+        try:
+            with self.focus_config_path.open("r", encoding="utf-8") as file:
+                saved = json.load(file)
+            if isinstance(saved, dict):
+                defaults.update({key: saved[key] for key in defaults if key in saved})
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            pass
+        return defaults
+
+    def save_focus_settings(self, settings: dict) -> dict:
+        current = self.get_focus_settings()
+        current.update(settings)
+        self.focus_config_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.focus_config_path.open("w", encoding="utf-8") as file:
+            json.dump(current, file, ensure_ascii=False, indent=2)
+        return current
+
+    def capture_focus_photo(self, name: str) -> Path:
+        frame_bytes = self.get_latest_frame()
+        if not frame_bytes:
+            raise RuntimeError("摄像头尚未获取到实时画面")
+        self.focus_photo_dir.mkdir(parents=True, exist_ok=True)
+        target = self.focus_photo_dir / f"{name}.jpg"
+        target.write_bytes(frame_bytes)
+        return target
 
     def _release_runtime_resources(self) -> None:
         if self._cap is not None:
@@ -313,6 +404,13 @@ class CameraServiceYzt:
                     scheduled_stop_at=armed_bj,
                     auto_stop_triggered=False,
                 )
+                if self._record_schedule_id:
+                    from app.repositories import camera_record_schedule_repo as schedule_repo
+                    schedule_repo.mark_schedule_recording(
+                        db,
+                        schedule_id=self._record_schedule_id,
+                        actual_start_at=now_beijing(),
+                    )
             finally:
                 db.close()
         except Exception as db_err:
@@ -723,6 +821,27 @@ class CameraServiceYzt:
             result["error"] = f"unexpected: {e!r}"
         return result
 
+    def _post_pi_focus(self, payload: dict, timeout: float = 5.0) -> dict:
+        """通知树莓派 /camera/focus 动态更新对焦参数。"""
+        result: dict = {
+            "ok": False,
+            "status_code": None,
+            "text": "",
+            "error": None,
+        }
+        target_url = self._build_pi_url("/camera/focus")
+        try:
+            resp = pi_post(target_url, json=payload, timeout=timeout)
+            result["status_code"] = resp.status_code
+            result["text"] = (resp.text or "")[:500]
+            result["ok"] = resp.status_code < 400
+        except requests.exceptions.RequestException as e:
+            invalidate_pi_resolution_cache()
+            result["error"] = str(e)
+        except Exception as e:  # noqa: BLE001
+            result["error"] = f"unexpected: {e!r}"
+        return result
+
     def _probe_expected_stream(self, stream_url: str, attempts: int = 3, delay: float = 1.0) -> bool:
         """短探测 expected stream_url 是否真的可达。
 
@@ -762,6 +881,7 @@ class CameraServiceYzt:
         calibration_only: bool = False,
         write_video: Optional[bool] = None,
         create_video_task: Optional[bool] = None,
+        record_schedule_id: Optional[str] = None,
     ) -> dict:
         """
         启动摄像头推流 + 拉帧 + 可选写视频。
@@ -774,7 +894,10 @@ class CameraServiceYzt:
             来自 ``FISH_CAMERA_READ_URL``，默认 ``rtmp://127.0.0.1:1935/fish_camera``；
             不接受前端覆盖。
         """
-        # 参数归一化
+        # 参数归一化。页面保存的设置作为默认值，单次请求参数优先。
+        saved_settings = self.get_saved_settings()
+        stream_config = {**saved_settings, **(stream_config or {})}
+        self._force_all_complete = bool(stream_config.get("force_all_complete", False))
         if write_video is None:
             write_video = not calibration_only  # 标定模式默认不写视频
         if create_video_task is None:
@@ -782,6 +905,18 @@ class CameraServiceYzt:
 
         # 校验定时录制参数；非法直接抛 ValueError 由 router 转 status=error
         duration_minutes = self._parse_duration_minutes(stream_config)
+
+        # 记录本次会话关联的 future 计划 ID。
+        # preview 不得携带计划；只有正式录制 + write_video + create_video_task 才保存。
+        if (
+            record_schedule_id
+            and not calibration_only
+            and write_video
+            and create_video_task
+        ):
+            self._record_schedule_id = record_schedule_id
+        else:
+            self._record_schedule_id = None
 
         runtime = get_pi_runtime_config()
 
@@ -816,7 +951,11 @@ class CameraServiceYzt:
             self._release_runtime_resources()
 
             # ---- 拆分 push / read ----
-            if stream_config and stream_config.get("stream_url"):
+            if (
+                stream_config
+                and stream_config.get("stream_url")
+                and not is_camera_push_url_automatic()
+            ):
                 # 前端显式传入时只能覆盖 push_url（用于树莓派推流目标）；
                 # 不允许前端覆盖 capture_url（后端读流地址）。
                 self.camera_push_url = str(stream_config["stream_url"]).strip() or (
@@ -830,19 +969,37 @@ class CameraServiceYzt:
             self.capture_url = self.camera_read_url
 
             self.width = (
-                int(stream_config["width"]) if stream_config and stream_config.get("width") else 1920
+                int(stream_config["width"]) if stream_config and stream_config.get("width") else 960
             )
             self.height = (
                 int(stream_config["height"])
                 if stream_config and stream_config.get("height")
-                else 1080
+                else 540
             )
             self.fps = (
                 int(stream_config["fps"]) if stream_config and stream_config.get("fps") else self.FPS
             )
 
+            # 对焦参数（会话级，供 _capture_loop 拼装 rasp_payload 使用）
+            self._autofocus_mode = (
+                str(stream_config["autofocus_mode"])
+                if stream_config and stream_config.get("autofocus_mode")
+                else None
+            )
+            self._lens_position = (
+                float(stream_config["lens_position"])
+                if stream_config and stream_config.get("lens_position") is not None
+                else None
+            )
+            self._autofocus_window = (
+                str(stream_config["autofocus_window"])
+                if stream_config and stream_config.get("autofocus_window")
+                else None
+            )
+
             self._frames_captured = 0
             self._frames_written = 0
+            self._capture_started_monotonic = None
             self._last_error = None
             self._startup_error = None
             self._stream_ready = False
@@ -1063,6 +1220,12 @@ class CameraServiceYzt:
             "height": self.height,
             "fps": self.fps,
         }
+        if getattr(self, "_autofocus_mode", None):
+            rasp_payload["autofocus_mode"] = self._autofocus_mode
+        if getattr(self, "_lens_position", None) is not None:
+            rasp_payload["lens_position"] = self._lens_position
+        if getattr(self, "_autofocus_window", None):
+            rasp_payload["autofocus_window"] = self._autofocus_window
 
         # ===== 1) 先查 Pi 端状态，决定是否复用已有推流 =====
         reused_existing = False
@@ -1290,7 +1453,8 @@ class CameraServiceYzt:
                 self._read_fail_count = 0
                 reconnect_delay = 1.0
                 self._frames_captured += 1
-
+                if self._capture_started_monotonic is None:
+                    self._capture_started_monotonic = time.monotonic()
                 # 延迟武装：收到第一帧后，立即设置 scheduled_stop_at 和启动 watchdog。
                 # 条件内部已判断（preview / calibration 不参与）。
                 try:
@@ -1300,8 +1464,11 @@ class CameraServiceYzt:
 
                 _, jpeg = cv2.imencode('.jpg', frame)
                 self.last_frame_bytes = jpeg.tobytes()
-
-                if self._writer is None and self._video_path is not None and getattr(self, "_write_video_enabled", True):
+                if (
+                    self._writer is None
+                    and self._video_path is not None
+                    and getattr(self, "_write_video_enabled", True)
+                ):
                     h, w = frame.shape[:2]
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     self._writer = cv2.VideoWriter(
@@ -1310,13 +1477,20 @@ class CameraServiceYzt:
                     self._writer_width = w
                     self._writer_height = h
 
-                if self._writer is not None and self._writer.isOpened() and getattr(self, "_write_video_enabled", True):
+                if (
+                    self._writer is not None
+                    and self._writer.isOpened()
+                    and getattr(self, "_write_video_enabled", True)
+                ):
                     write_frame = frame
                     fh, fw = frame.shape[:2]
                     if fh != self._writer_height or fw != self._writer_width:
                         write_frame = cv2.resize(frame, (self._writer_width, self._writer_height))
-                    self._writer.write(write_frame)
-                    self._frames_written += 1
+                    elapsed = time.monotonic() - (self._capture_started_monotonic or time.monotonic())
+                    target_frames = max(1, int(elapsed * float(self.fps)))
+                    while self._frames_written < target_frames:
+                        self._writer.write(write_frame)
+                        self._frames_written += 1
 
                 if self._frames_captured % 100 == 1:
                     print(f"[camera_yzt] 已捕获帧: {self._frames_captured}, 已写入: {self._frames_written}")
@@ -1326,6 +1500,15 @@ class CameraServiceYzt:
             self._record_event("capture_error", reason=str(loop_error))
         finally:
             self._release_runtime_resources()
+
+            measured_duration_seconds = None
+            if video_path and Path(video_path).is_file():
+                try:
+                    from app.services.video_playback_service import probe_media_duration_seconds
+
+                    measured_duration_seconds = probe_media_duration_seconds(video_path)
+                except Exception as exc:
+                    print(f"[camera_yzt] probe original duration failed: {exc!r}")
             with self._lock:
                 if self.state == CameraRuntimeState.STOPPING:
                     pass
@@ -1470,6 +1653,18 @@ class CameraServiceYzt:
             f"[camera_yzt] stop_stream called: reason={reason!r}, source={source!r}, "
             f"auto_stop_triggered={auto_stop_triggered}"
         )
+
+        # 局部快照：在重置 state 前保存本次会话关联的 plan / video_id，
+        # 供 stop_stream 末尾（锁外）异步更新计划状态使用。
+        # 不再使用 self._stopped_* 实例级字段，避免与并发 stop_stream 调用互相覆盖。
+        stopped_record_schedule_id = self._record_schedule_id
+        stopped_video_id = self._video_id
+        stopped_actual_stop_at = __import__('datetime').datetime.now(
+            __import__('datetime').timezone.utc
+        )
+        # 本次 stop_stream 是否正常完成；异常路径置 False，_flush_schedule_after_stop 据此区分 completed / failed。
+        stop_completed = False
+        stop_exception: Optional[BaseException] = None
         # 取消 watchdog：内部会判断是否自身线程，不会 join 自己。
         self._stop_timed_recording_watchdog(
             reason=f"stop_stream:{reason or 'unknown'}"
@@ -1570,6 +1765,10 @@ class CameraServiceYzt:
         rasp_stop_status: int | str = "not_sent"
         rasp_stop_error = None
         db_update_error: Optional[str] = None
+        # 提前初始化：异常分支的 return 也会引用这两个变量，
+        # 必须在 try 块之前给默认值，避免 finally 之前的异常导致 UnboundLocalError。
+        pi_stop_called_norm: Optional[bool] = False
+        pi_status_after_norm: Optional[dict] = None
 
         try:
             if self._capture_thread and self._capture_thread.is_alive():
@@ -1610,6 +1809,13 @@ class CameraServiceYzt:
                             print(
                                 f"[camera_yzt] playable file missing: {pb_result.get('playable_path')}"
                             )
+                        if transcoded_path and Path(transcoded_path).is_file():
+                            try:
+                                from app.services.video_playback_service import probe_media_duration_seconds
+
+                                measured_duration_seconds = probe_media_duration_seconds(transcoded_path) or measured_duration_seconds
+                            except Exception as exc:
+                                print(f"[camera_yzt] probe playable duration failed: {exc!r}")
                     else:
                         err = pb_result.get("error_message") or "unknown"
                         transcoded_status = f"failed: {err[:200]}"
@@ -1703,6 +1909,12 @@ class CameraServiceYzt:
                             session_repo.update_video_task_source_path(
                                 db, video_id=video_id, source_path=rel_transcoded_path
                             )
+                    if video_id and measured_duration_seconds:
+                        session_repo.update_video_task_duration(
+                            db,
+                            video_id=video_id,
+                            video_duration_seconds=measured_duration_seconds,
+                        )
             except Exception as e:
                 db_update_error = str(e)
                 print(f"[camera_yzt] 更新视频状态失败: {e}")
@@ -1738,6 +1950,7 @@ class CameraServiceYzt:
                         job_id = enqueue_algorithm_video_pipeline_from_video_task(
                             video_id=video_id,
                             input_video=transcoded_path,
+                            force_all_complete=self._force_all_complete,
                         )
                         queued = True
                         queue_message = (
@@ -1779,6 +1992,15 @@ class CameraServiceYzt:
                     except Exception:
                         pass
 
+            # 正常完成即将返回：标记 stop_completed=True，
+            # _flush_schedule_after_stop 据此把计划状态置为 completed。
+            stop_completed = bool(
+                video_id
+                and stopped_frames_written > 0
+                and transcoded_path
+                and Path(transcoded_path).is_file()
+                and Path(transcoded_path).stat().st_size > 0
+            )
             return {
                 "status": "stopped",
                 "video_id": video_id,
@@ -1810,6 +2032,9 @@ class CameraServiceYzt:
         except Exception as e:
             print(f"[camera_yzt] stop_stream 异常: {e}")
             self._last_error = str(e)
+            # 异常路径：保留真实异常信息，_flush_schedule_after_stop 据此置为 failed。
+            stop_completed = False
+            stop_exception = e
             return {
                 "status": "stopped",
                 "video_id": video_id,
@@ -1836,6 +2061,7 @@ class CameraServiceYzt:
                 "auto_stop_triggered": stopped_auto_stop_triggered,
             }
         finally:
+            # 锁内：清理摄像头运行态（包括清空 _record_schedule_id）
             with self._lock:
                 self.state = CameraRuntimeState.IDLE
                 self.is_active = False
@@ -1854,12 +2080,26 @@ class CameraServiceYzt:
                 self._write_video_enabled = True
                 self._calibration_only = False
                 self._session_create_video_task = True
+                # 录制计划 ID 清理：本次会话已结束，不再持有计划关联
+                self._record_schedule_id = None
                 # 定时录制运行态字段重置（数据库字段由上面 update 持久化）
                 self._record_duration_seconds = None
                 self._scheduled_stop_at = None
                 self._auto_stop_triggered = False
                 self._timer_pending = False
                 self._timer_armed_at = None
+            # 锁外：执行计划状态写回，避免 DB 慢/异常占用摄像头运行态锁
+            self._flush_schedule_after_stop(
+                stopped_record_schedule_id=stopped_record_schedule_id,
+                video_id=stopped_video_id,
+                actual_stop_at=stopped_actual_stop_at,
+                reason=reason,
+                source=source,
+                completed=stop_completed,
+                error_message=(
+                    repr(stop_exception) if stop_exception is not None else None
+                ),
+            )
 
     def get_latest_frame(self) -> Optional[bytes]:
         return self.last_frame_bytes
@@ -1900,9 +2140,88 @@ class CameraServiceYzt:
             "stream_url": start_result.get("stream_url"),
         }
 
+    def _flush_schedule_after_stop(
+        self,
+        *,
+        stopped_record_schedule_id: Optional[str],
+        video_id: Optional[str],
+        actual_stop_at: datetime,
+        reason: str,
+        source: str,
+        completed: bool,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """stop_stream 完成后调用：根据本次 stop 是否正常完成更新 future 计划。
+
+        任何异常都不应影响 stop_stream 自身的返回值。
+
+        - ``completed=True`` → 计划状态置为 completed；
+          stop_reason 只保存为 ``stop_reason``（不做中英文猜测）。
+        - ``completed=False`` → 计划状态置为 failed；
+          真实异常信息（error_message）优先，reason 仅作为辅助 stop_reason。
+        """
+        if not video_id:
+            return
+        try:
+            from app.repositories import (
+                camera_record_schedule_repo as _repo,
+            )
+            from app.repositories.db import SessionLocal as _SL
+            db = _SL()
+            try:
+                existing = _repo.get_schedule(db, stopped_record_schedule_id) if stopped_record_schedule_id else None
+                if existing is None:
+                    from sqlalchemy import select
+                    from app.repositories.models import CameraRecordSchedule
+                    existing = db.execute(
+                        select(CameraRecordSchedule)
+                        .where(CameraRecordSchedule.video_id == video_id)
+                        .order_by(CameraRecordSchedule.created_at.desc())
+                    ).scalars().first()
+                if existing is None:
+                    return
+                if existing.video_id and (
+                    existing.video_id != video_id
+                ):
+                    return
+                if existing.status in (
+                    _repo.SCHEDULE_COMPLETED,
+                    _repo.SCHEDULE_FAILED,
+                    _repo.SCHEDULE_CANCELLED,
+                    _repo.SCHEDULE_SKIPPED,
+                ):
+                    return
+                if completed:
+                    _repo.mark_schedule_completed(
+                        db,
+                        schedule_id=existing.schedule_id,
+                        actual_stop_at=actual_stop_at,
+                        stop_reason=reason or None,
+                        stop_source=source or None,
+                    )
+                else:
+                    _repo.mark_schedule_failed(
+                        db,
+                        schedule_id=existing.schedule_id,
+                        error_message=(
+                            error_message
+                            or f"stop_stream failure: {reason or 'unknown'}"
+                        ),
+                        stop_reason=reason or None,
+                        stop_source=source or None,
+                    )
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[camera_yzt] _flush_schedule_after_stop failed: {exc!r}"
+            )
+
     def reset(self) -> dict:
-        # 先停止 watchdog：reset 路径（force_restart / 异常恢复）不应保留旧 watchdog
-        self._stop_timed_recording_watchdog(reason="reset")
+        # 先停止 watchdog：reset 路径不应保留旧 watchdog
+        self._stop_timed_recording_watchdog(
+            reason="reset",
+        )
 
         with self._lock:
             self._stop_event.set()
@@ -1910,7 +2229,10 @@ class CameraServiceYzt:
             self.is_active = False
 
         try:
-            if self._capture_thread and self._capture_thread.is_alive():
+            if (
+                self._capture_thread
+                and self._capture_thread.is_alive()
+            ):
                 self._capture_thread.join(timeout=5)
         except Exception:
             pass
@@ -1927,10 +2249,12 @@ class CameraServiceYzt:
             self._frames_written = 0
             self._capture_thread = None
             self._read_fail_count = 0
+
             self._write_video_enabled = True
+            self._record_schedule_id = None
             self._calibration_only = False
             self._session_create_video_task = True
-            # 定时录制运行态字段重置
+
             self._record_duration_seconds = None
             self._scheduled_stop_at = None
             self._auto_stop_triggered = False
@@ -1939,6 +2263,74 @@ class CameraServiceYzt:
 
         print("[camera_yzt] reset done")
         return {"status": "reset"}
+
+    def set_debug_mock(
+        self,
+        *,
+        pi_running: Optional[bool] = None,
+        backend_active: Optional[bool] = None,
+        pi_reachable: Optional[bool] = None,
+    ) -> dict:
+        """调试用：强制覆盖 desync 判定所用状态，用于验证“正常/异常/逆向流”。
+
+        每个参数传 None 表示不覆盖该项、使用真实状态。
+        """
+        self._debug_pi_running = pi_running
+        self._debug_backend_active = backend_active
+        self._debug_pi_reachable = pi_reachable
+        return {
+            "status": "ok",
+            "debug_mock": {
+                "pi_running": self._debug_pi_running,
+                "backend_active": self._debug_backend_active,
+                "pi_reachable": self._debug_pi_reachable,
+            },
+        }
+
+    def clear_debug_mock(self) -> dict:
+        """清除调试模拟，恢复真实状态。"""
+        self._debug_pi_running = None
+        self._debug_backend_active = None
+        self._debug_pi_reachable = None
+        return {"status": "ok", "debug_mock": None}
+
+    def sync_stream(self) -> dict:
+        """重新同步后端与树莓派：复用树莓派已有推流。
+
+        用于“后端状态丢失、树莓派仍在推流”的 desync 场景：
+        - 不停止树莓派推流；
+        - 不创建 video_task、不写视频、不入队算法；
+        - 只是让后端重新连接并读取现有流。
+        """
+        return self.start_stream(
+            {},
+            calibration_only=True,
+            write_video=False,
+            create_video_task=False,
+        )
+
+    def focus_update(
+        self,
+        autofocus_mode: str,
+        lens_position: Optional[float] = None,
+        autofocus_window: Optional[str] = None,
+    ) -> dict:
+        """在线更新对焦参数，调用树莓派 /camera/focus。
+
+        要求树莓派端支持该端点，实现动态对焦调整（不重启推流）。
+        """
+        payload: dict = {"autofocus_mode": autofocus_mode}
+        if lens_position is not None:
+            payload["lens_position"] = lens_position
+        if autofocus_window:
+            payload["autofocus_window"] = autofocus_window
+        result = self._post_pi_focus(payload)
+        return {
+            "ok": result.get("ok", False),
+            "status_code": result.get("status_code"),
+            "error": result.get("error"),
+            "text": result.get("text"),
+        }
 
     def get_status(self) -> dict:
         from app.utils.time_utils import now_beijing
@@ -1966,7 +2358,9 @@ class CameraServiceYzt:
             stream_ready = bool(self._stream_ready)
             startup_phase = self._startup_phase
             startup_error = self._startup_error
-            # 定时录制字段
+            write_video_enabled = bool(self._write_video_enabled)
+            calibration_only = bool(self._calibration_only)
+            session_create_video_task = bool(self._session_create_video_task)
             record_duration_seconds = (
                 self._record_duration_seconds if show_current else None
             )
@@ -1976,6 +2370,24 @@ class CameraServiceYzt:
             auto_stop_triggered = (
                 self._auto_stop_triggered if show_current else False
             )
+            timer_pending = (
+                self._timer_pending if show_current else False
+            )
+            timer_armed_at = self._timer_armed_at if show_current else None
+
+        # 会话类型：idle / recording / preview
+        if current_state not in (
+            CameraRuntimeState.STARTING,
+            CameraRuntimeState.RUNNING,
+            CameraRuntimeState.STOPPING,
+            CameraRuntimeState.ERROR,
+        ):
+            session_mode = 'idle'
+        elif calibration_only or not write_video_enabled or not session_create_video_task:
+            session_mode = 'preview'
+        else:
+            session_mode = 'recording'
+        preview_mode = session_mode == 'preview'
 
         runtime = get_pi_runtime_config()
         effective_push_url = camera_push_url or runtime.camera_push_url
@@ -2011,6 +2423,22 @@ class CameraServiceYzt:
             CameraRuntimeState.RUNNING,
             CameraRuntimeState.STARTING,
         )
+
+        # ---- 调试模拟：允许前端强制覆盖状态以验证 desync 判定 ----
+        if self._debug_pi_reachable is not None:
+            pi_reachable = bool(self._debug_pi_reachable)
+        if self._debug_pi_running is not None:
+            pi_running = bool(self._debug_pi_running)
+        if self._debug_backend_active is not None:
+            backend_active = bool(self._debug_backend_active)
+
+        # 同步覆盖返回给前端的 raspberry_pi 块，保证模拟场景前后端展示一致。
+        if self._debug_pi_running is not None:
+            pi_status["running"] = bool(self._debug_pi_running)
+        if self._debug_pi_reachable is not None:
+            pi_status["reachable"] = bool(self._debug_pi_reachable)
+            pi_status["ok"] = bool(self._debug_pi_reachable)
+
         if not pi_reachable:
             desync = None
             desync_reason = "树莓派状态不可达"
@@ -2040,6 +2468,11 @@ class CameraServiceYzt:
             "stream_ready": stream_ready,
             "startup_phase": startup_phase,
             "startup_error": startup_error,
+            "session_mode": session_mode,
+            "preview_mode": preview_mode,
+            "write_video_enabled": write_video_enabled,
+            "create_video_task": session_create_video_task,
+            "calibration_only": calibration_only,
             "record_duration_seconds": record_duration_seconds,
             "scheduled_stop_at": (
                 scheduled_stop_at.isoformat() if scheduled_stop_at else None
@@ -2048,16 +2481,14 @@ class CameraServiceYzt:
             if scheduled_stop_at
             else None,
             "timed_recording": scheduled_stop_at is not None,
-            "timer_pending": (
-                self._timer_pending if show_current else False
-            ),
+            "timer_pending": timer_pending,
             "timer_armed_at": (
-                self._timer_armed_at.isoformat()
-                if (self._timer_armed_at and show_current) else None
+                timer_armed_at.isoformat() if timer_armed_at else None
             ),
             "auto_stop_triggered": auto_stop_triggered,
         }
 
+        record_schedule_id = self._record_schedule_id
         return {
             "state": current_state.value,
             "is_active": is_active,
@@ -2078,6 +2509,11 @@ class CameraServiceYzt:
             "stream_ready": stream_ready,
             "startup_phase": startup_phase,
             "startup_error": startup_error,
+            "session_mode": session_mode,
+            "preview_mode": preview_mode,
+            "write_video_enabled": write_video_enabled,
+            "create_video_task": session_create_video_task,
+            "calibration_only": calibration_only,
             "fish_detected": 0,
             "last_fish_detected": 0,
             "note": "本阶段算法统一走整视频 CLI pipeline，摄像头不再做实时 mock 检测。",
@@ -2095,9 +2531,7 @@ class CameraServiceYzt:
             if scheduled_stop_at
             else None,
             "timed_recording": scheduled_stop_at is not None,
-            "timer_pending": (
-                self._timer_pending if show_current else False
-            ),
+            "timer_pending": timer_pending,
             "timer_armed_at": (
                 self._timer_armed_at.isoformat()
                 if self._timer_armed_at

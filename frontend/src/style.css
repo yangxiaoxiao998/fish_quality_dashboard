@@ -1,4 +1,19 @@
 /* /home/yangzt/Code/fish_quality_dashboard/frontend/src/style.css */
+@font-face {
+  font-family: AlibabaPuHuiTi;
+  src: url("@/assets/fonts/AlibabaPuHuiTi-3-65-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: AlibabaPuHuiTi;
+  src: url("@/assets/fonts/AlibabaPuHuiTi-3-85-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
 :root {
   color-scheme: dark;
 }
@@ -7,10 +22,12 @@ body,
 #app {
   width: 100%;
   height: 100%;
+  min-height: 100%;
   margin: 0;
   padding: 0;
 }
 body {
   display: block;
-  overflow: hidden;
+  overflow: hidden auto;
+  font-family: AlibabaPuHuiTi, "Noto Sans SC", sans-serif;
 }

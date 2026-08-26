@@ -27,6 +27,22 @@
       <template v-else-if="column.dataIndex === 'surface_damage_ratio'">
         {{ formatPercentRatio(record.surface_damage_ratio) }}
       </template>
+      <template v-else-if="column.dataIndex === 'hex_color'">
+        <span
+          v-if="isHexColor(record.hex_color)"
+          class="color-swatch"
+          :style="{ backgroundColor: record.hex_color }"
+        />
+        <span v-else class="dim">--</span>
+      </template>
+      <template v-else-if="column.dataIndex === 'hex_color'">
+        <span
+          v-if="isHexColor(record.hex_color)"
+          class="color-swatch"
+          :style="{ backgroundColor: record.hex_color }"
+        />
+        <span v-else class="dim">--</span>
+      </template>
       <template v-else-if="column.dataIndex === 'error_message'">
         <span class="dim">{{ record.error_message || '--' }}</span>
       </template>
@@ -58,7 +74,7 @@ function onImgError(e: Event) {
 
 function statusTagColor(s: string): string {
   const v = String(s || '').toLowerCase()
-  if (v === 'done') return 'green'
+  if (v === 'done' || v === 'complete') return 'green'
   if (v === 'incomplete') return 'orange'
   if (v === 'failed') return 'red'
   return 'gray'
@@ -66,10 +82,14 @@ function statusTagColor(s: string): string {
 
 function statusTagText(s: string): string {
   const v = String(s || '').toLowerCase()
-  if (v === 'done') return 'done'
-  if (v === 'incomplete') return 'incomplete'
-  if (v === 'failed') return 'failed'
+  if (v === 'done' || v === 'complete') return '完整'
+  if (v === 'incomplete') return '不完整'
+  if (v === 'failed') return '失败'
   return s || '--'
+}
+
+function isHexColor(value: unknown): boolean {
+  return /^#[0-9a-f]{6}$/i.test(String(value || '').trim())
 }
 
 function formatPercentRatio(v: any): string {
@@ -113,7 +133,7 @@ function fishCropUrl(fish: any): string {
 }
 
 const columns = [
-  { title: 'track_id', dataIndex: 'track_id', width: 90, fixed: 'left' as const },
+  { title: '序号', dataIndex: 'track_id', width: 90, fixed: 'left' as const },
   { title: '鱼图', dataIndex: 'crop_image', width: 110 },
   { title: 'fish_uid', dataIndex: 'fish_uid', width: 200 },
   { title: 'frame_index', dataIndex: 'frame_index', width: 110 },
@@ -124,6 +144,7 @@ const columns = [
   { title: '体重 (g)', dataIndex: 'pred_weight_g', width: 100, digits: 2 },
   { title: '肥满度', dataIndex: 'condition_factor', width: 90, digits: 3 },
   { title: '破损率', dataIndex: 'surface_damage_ratio', width: 90 },
+  { title: '腹部颜色', dataIndex: 'hex_color', width: 110 },
   { title: 'error_message', dataIndex: 'error_message', width: 200 },
 ]
 </script>
@@ -146,5 +167,13 @@ const columns = [
 }
 .dim {
   color: #c9cdd4;
+}
+.color-swatch {
+  display: inline-block;
+  width: 58px;
+  height: 22px;
+  border: 1px solid rgb(0 0 0 / 18%);
+  border-radius: 4px;
+  vertical-align: middle;
 }
 </style>

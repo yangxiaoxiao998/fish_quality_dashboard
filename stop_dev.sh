@@ -8,7 +8,12 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT_REAL="$(realpath "$SCRIPT_DIR")"
-PID_DIR="$PROJECT_ROOT_REAL/data/pids"
+RUNTIME_DIR="$PROJECT_ROOT_REAL/.runtime"
+BACKEND_PORT="${BACKEND_PORT:-8000}"
+FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+
+MEDIAMTX_BIN="$PROJECT_ROOT_REAL/mediamtx/mediamtx"
+MEDIAMTX_CFG="$PROJECT_ROOT_REAL/mediamtx/mediamtx.yml"
 
 stop_pid_file() {
   local name="$1"
@@ -43,40 +48,40 @@ stop_pid_file() {
 }
 
 echo "[stop_dev] stopping by pid files..."
-stop_pid_file "worker"  "$PID_DIR/backend_worker.pid"
-stop_pid_file "uvicorn" "$PID_DIR/backend_uvicorn.pid"
-stop_pid_file "vite"    "$PID_DIR/frontend_vite.pid"
+stop_pid_file "worker"  "$RUNTIME_DIR/rq-worker.pid"
+stop_pid_file "uvicorn" "$RUNTIME_DIR/backend.pid"
+stop_pid_file "vite"    "$RUNTIME_DIR/frontend.pid"
+stop_pid_file "upgrade-manager" "$RUNTIME_DIR/upgrade-manager.pid"
 
 # 只停止本项目配置启动的 mediamtx，不要误杀系统 mediamtx
-MEDIAMTX_BIN="$PROJECT_ROOT_REAL/mediamtx/mediamtx"
-MEDIAMTX_CFG="$PROJECT_ROOT_REAL/mediamtx/mediamtx.yml"
 echo "[stop_dev] stopping project mediamtx..."
+stop_pid_file "mediamtx" "$RUNTIME_DIR/mediamtx.pid"
 pkill -f "$MEDIAMTX_BIN $MEDIAMTX_CFG" 2>/dev/null || true
-stop_pid_file "mediamtx" "$PID_DIR/mediamtx.pid"
 
 echo "[stop_dev] killing remaining backend (uvicorn / worker)..."
 # 安全 pkill：使用 [xxx] 防自杀
 pkill -f '[u]vicorn.*app.main:app' 2>/dev/null || true
 pkill -f '[p]ython -m uvicorn app.main:app' 2>/dev/null || true
 pkill -f '[a]pp.workers.worker_main' 2>/dev/null || true
+pkill -f '[a]pp.services.update.upgrade_manager' 2>/dev/null || true
 
 echo "[stop_dev] killing remaining frontend (vite / npm / node)..."
-pkill -f '[v]ite.*1124' 2>/dev/null || true
-pkill -f '[n]pm run dev.*1124' 2>/dev/null || true
+pkill -f "[v]ite.*$FRONTEND_PORT" 2>/dev/null || true
+pkill -f "[n]pm run dev.*$FRONTEND_PORT" 2>/dev/null || true
 pkill -f '[n]ode.*vite' 2>/dev/null || true
 
 sleep 2
 
 echo "[stop_dev] port check:"
-ss_check="$(ss -tlnp 2>/dev/null | grep -E ':8000|:1124|:1935|:8554' || true)"
+ss_check="$(ss -tlnp 2>/dev/null | grep -E ":$BACKEND_PORT|:$FRONTEND_PORT|:8012|:1935|:8554" || true)"
 if [ -z "$ss_check" ]; then
-  echo "  [OK] ports 8000 / 1124 / 1935 / 8554 已释放"
+  echo "  [OK] ports $BACKEND_PORT / $FRONTEND_PORT / 8012 / 1935 / 8554 已释放"
 else
   echo "$ss_check"
 fi
 
 echo "[stop_dev] process check:"
-remaining="$(ps -ef | grep -E '[u]vicorn.*app.main:app|[a]pp.workers.worker_main|[v]ite.*1124|[n]pm run dev.*1124|[n]ode.*vite' || true)"
+remaining="$(ps -ef | grep -E "[u]vicorn.*app.main:app|[a]pp.workers.worker_main|[v]ite.*$FRONTEND_PORT|[n]pm run dev.*$FRONTEND_PORT|[n]ode.*vite" || true)"
 if [ -z "$remaining" ]; then
   echo "  [OK] no backend / worker / vite process running"
 else

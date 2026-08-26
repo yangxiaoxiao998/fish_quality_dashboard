@@ -1,17 +1,50 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import Dashboard from '@/views/Dashboard.vue'
+import ScreenHome from '@/views/ScreenHome.vue'
+import DataInput from '@/views/DataInput.vue'
+import VideoDetectionReport from '@/views/VideoDetectionReport.vue'
 import AdminLayout from '@/layout/AdminLayout.vue'
 // DataSearch 入口已被合并到 /admin/data-report（鱼体检测明细章节），保留文件供 legacy import。
 import VideoHistory from '@/views/admin/VideoHistory.vue'
 import { clearVideoState } from '@/store/video'
+import {
+  consumeTechnicalDebugAccess,
+  requestTechnicalDebugAccess,
+} from '@/utils/technicalDebugAuth'
 
 const router = createRouter({
   history: createWebHistory(),
   routes: [
     {
+      // 开屏首页：默认入口
       path: '/',
+      name: 'ScreenHome',
+      component: ScreenHome
+    },
+    {
+      // 原 Dashboard 保留路由
+      path: '/dashboard',
       name: 'Dashboard',
       component: Dashboard
+    },
+    {
+      // 兼容入口：旧链接 / 书签重定向到 /dashboard
+      path: '/legacy-dashboard',
+      redirect: '/dashboard'
+    },
+    {
+      // 数据录入占位页（后续正式录入页将替换此组件）
+      path: '/data-input',
+      name: 'DataInputLite',
+      component: DataInput,
+      meta: { title: '数据录入' }
+    },
+    {
+      // 视频检测报告大屏（单中间列铺满，独立于 AdminLayout）
+      path: '/video-report/:videoId?',
+      name: 'VideoDetectionReport',
+      component: VideoDetectionReport,
+      meta: { title: '视频检测报告' }
     },
     {
       path: '/admin',
@@ -23,15 +56,26 @@ const router = createRouter({
         },
         {
           path: 'data-report',
+          name: 'AdminDataReport',
           component: () => import('@/views/admin/DataReport.vue'),
           meta: { title: '数据报表' }
         },
         {
-          // 视频单报告：?video_id=xxx 跳到 5 章节单 video 报告。
+          path: 'report-overview',
+          name: 'AdminReportOverview',
+          component: () => import('@/views/admin/ReportOverview.vue'),
+          meta: { title: '报表总览' },
+        },
+        {
+          // 视频单报告：旧路由 ?video_id=xxx 自动跳到鱼品质检测报表
           path: 'data-report/video/:videoId',
-          name: 'AdminVideoReport',
-          component: () => import('@/views/admin/VideoReport.vue'),
-          meta: { title: '鱼类检测结果分析报告' }
+          redirect: (to) => ({
+            path: '/admin/data-report',
+            query: {
+              type: 'daily-videos',
+              video_id: String(to.params.videoId || ''),
+            },
+          }),
         },
         {
           // legacy 子页面路由，全部统一收敛到 DataReport workspace
@@ -43,12 +87,9 @@ const router = createRouter({
           redirect: '/admin/data-report'
         },
         {
+          // 视频历史：旧入口重定向到 /admin/data-report
           path: 'video-history',
-          name: 'AdminVideoHistory',
-          component: () => import('@/views/admin/VideoHistory.vue'),
-          meta: {
-            title: '视频历史记录'
-          }
+          redirect: '/admin/data-report',
         },
         {
           path: 'system-ops',
@@ -111,6 +152,14 @@ const router = createRouter({
 })
 
 router.beforeEach((to, from, next) => {
+  if (
+    (to.path === '/admin/system-ops' || to.path === '/admin/system-settings') &&
+    !consumeTechnicalDebugAccess(to.fullPath)
+  ) {
+    requestTechnicalDebugAccess(to.fullPath)
+    next(false)
+    return
+  }
   if (from.path === '/' && to.path.startsWith('/admin')) {
     // Keep video state when going to admin pages
   } else if (from.path.startsWith('/admin') && to.path === '/') {

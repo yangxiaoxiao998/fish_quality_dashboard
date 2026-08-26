@@ -203,7 +203,11 @@ function handleDownload(row: DetectionReportRow) {
 async function handleRegenerate(row: DetectionReportRow) {
   actionLoading.value[row.report_id] = true
   try {
-    const resp = await http.post(`/api/reports/history/${row.report_id}/regenerate`)
+    const resp = await http.post(
+      `/api/reports/history/${row.report_id}/regenerate`,
+      undefined,
+      { timeout: 180000 },
+    )
     Message.success(`日报已重新生成：${resp.data.report_name || row.report_name}`)
     fetchData()
   } catch (err) {

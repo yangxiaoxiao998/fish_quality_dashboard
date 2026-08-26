@@ -21,6 +21,8 @@ from app.services.calibration_config_service import (
     clear_calibration_config,
     get_calibration_status,
     save_calibration_config,
+    get_margin_config,
+    save_margin_config,
 )
 
 
@@ -87,6 +89,19 @@ def calibration_save(payload: CalibrationSaveRequest) -> dict[str, Any]:
 @router.post("/calibration/clear")
 def calibration_clear() -> dict[str, Any]:
     return clear_calibration_config()
+
+
+@router.get("/calibration/margin-config")
+def calibration_margin_config() -> dict[str, Any]:
+    return {"ok": True, **get_margin_config()}
+
+
+@router.post("/calibration/margin-config")
+def save_calibration_margin_config(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return {"ok": True, **save_margin_config(payload)}
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # =============================================================================
@@ -244,10 +259,33 @@ def prepare_algorithm_runtime() -> None:
 
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault(
-        "FISH_BERT_BASE_UNCASED_PATH",
-        str(ALGORITHMS_ROOT / "bert-base-uncased"),
+    # BERT 唯一目录：algorithms/pth/bert-base-uncased。
+    # 强制覆盖（不用 setdefault），与 algorithm_cli_service._build_env 完全一致。
+    bert_dir = (
+        ALGORITHMS_ROOT
+        / "pth"
+        / "bert-base-uncased"
+    ).resolve()
+    required_bert_files = (
+        "config.json",
+        "pytorch_model.bin",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "vocab.txt",
     )
+    missing_bert_files = [
+        name
+        for name in required_bert_files
+        if not (bert_dir / name).is_file()
+    ]
+    if missing_bert_files:
+        raise FileNotFoundError(
+            "BERT模型目录不存在或文件不完整，缺少："
+            + ", ".join(missing_bert_files)
+            + f"（{bert_dir}）"
+        )
+    os.environ["FISH_BERT_BASE_UNCASED_PATH"] = str(bert_dir)
+    os.environ["GDINO_BERT_PATH"] = str(bert_dir)
     os.environ.setdefault(
         "FISH_GROUNDING_DINO_CONFIG",
         str(ALGORITHMS_ROOT / "fishalgo" / "measures" / "crop_images" / "grounding_dino_swin-t_finetune_8xb4_50e_fish.py"),

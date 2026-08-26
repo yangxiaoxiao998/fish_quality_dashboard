@@ -285,9 +285,9 @@
         <div class="detail-section">
           <div class="detail-section-title">基础信息</div>
           <a-descriptions :column="2" bordered size="small">
-            <a-descriptions-item label="鱼编号 (track_id)">{{ getFishDisplayId(currentRecord) || '--' }}</a-descriptions-item>
+            <a-descriptions-item label="序号">{{ getFishDisplayId(currentRecord) || '--' }}</a-descriptions-item>
             <a-descriptions-item label="视频ID">{{ currentRecord.video_display_id || currentRecord.video_id }}</a-descriptions-item>
-            <a-descriptions-item label="检测时间" :span="2">{{ currentRecord.created_at }}</a-descriptions-item>
+            <a-descriptions-item label="检测时间" :span="2">{{ formatChinaDateTime(currentRecord.created_at) }}</a-descriptions-item>
             <a-descriptions-item label="置信度">{{ currentRecord.confidence != null ? currentRecord.confidence.toFixed(1) + '%' : '-' }}</a-descriptions-item>
             <a-descriptions-item label="完整 fish_id" :span="2">
               <code style="word-break: break-all;">{{ currentRecord.fish_id }}</code>
@@ -340,6 +340,7 @@ import { normalizeImageUrl } from '@/utils/reportPath'
 import { useRoute } from 'vue-router'
 import { Message } from '@arco-design/web-vue'
 import { http } from '@/api/http'
+import { formatChinaDateTime } from '@/utils/time'
 import {
   getFishImageUrl,
   getFishLengthCm,

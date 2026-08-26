@@ -16,8 +16,10 @@ export interface ReportQuery {
 
 export interface ReportSummary {
   total_video: number
+  total_video_duration?: number | null
   total_fish: number
   valid_fish: number
+  incomplete_fish: number
   abnormal_fish: number
   avg_body_length: number
   avg_body_length_without_tail: number
@@ -51,6 +53,7 @@ export interface ReportFishRow {
   body_height_cm?: number | null
   pred_weight_g?: number | null
   condition_factor?: number | null
+  hex_color?: string | null
   surface_damage_ratio?: number | null
   status?: string
   error_message?: string
@@ -68,8 +71,10 @@ export interface ReportFishesResp {
 
 const EMPTY_SUMMARY: ReportSummary = {
   total_video: 0,
+  total_video_duration: 0,
   total_fish: 0,
   valid_fish: 0,
+  incomplete_fish: 0,
   abnormal_fish: 0,
   avg_body_length: 0,
   avg_body_length_without_tail: 0,

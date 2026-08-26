@@ -13,6 +13,4 @@ const app = createApp(App)
 app.use(router)
 app.use(ArcoVue)
 app.mount('#app')
-// 1920x1080 固定缩放仅由 Dashboard.vue 局部控制 (useFixedScreen)，
-// 不在这里做全局 autofit.init，避免影响 /admin 等页面的布局。
-// 详见 deploy/CLIENT_DEPLOY_README.md 和 src/utils/useFixedScreen.ts。
+// 页面布局使用浏览器视口原生尺寸；ECharts 通过 ResizeObserver 适配容器变化。

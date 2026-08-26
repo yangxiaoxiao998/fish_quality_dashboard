@@ -54,13 +54,6 @@
           <a-button @click="showSelectedVideoReport">
             查看单视频报告
           </a-button>
-          <a-button
-            type="primary"
-            :loading="generatingVideoReport"
-            @click="handleGenerateVideoReport"
-          >
-            生成视频报表
-          </a-button>
         </div>
 
         <div
@@ -69,6 +62,8 @@
         >
           当前展示视频：<code>{{ selectedVideoInfo.video_id }}</code>
           ｜录制开始时间：{{ formatVideoStartTime(selectedVideoInfo) }}
+          ｜视频时长：{{ formatDuration(selectedVideoInfo.video_duration_seconds) }}
+          ｜处理耗时：{{ formatDuration(selectedVideoInfo.processing_duration_seconds) }}
         </div>
 
         <a-empty
@@ -143,7 +138,6 @@ const videoReportTocItems: ReportTocItem[] = [
 ]  
 
 const loading = ref(false)
-const generatingVideoReport = ref(false)
 const tasks = ref<any[]>([])
 const selectedVideoId = ref<string>('')
 const selectedReportVideoId = ref<string>('')
@@ -210,6 +204,16 @@ function formatVideoStartTime(v: any): string {
   return formatChinaDateTime(d.toDate())
 }
 
+function formatDuration(seconds: number | null | undefined): string {
+  const n = Number(seconds)
+  if (!Number.isFinite(n) || n < 0) return '--'
+  const total = Math.round(n)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return h ? `${h}小时${m}分${s}秒` : m ? `${m}分${s}秒` : `${s}秒`
+}
+
 function videoOptionLabel(v: any): string {
   const start = formatVideoStartTime(v)
   const status = v?.status || '--'
@@ -240,7 +244,16 @@ function applyInitialVideoSelection() {
   syncSelectedVideoAfterDateChange()
 }
 
+// 请求序号：每次 loadTasks 调用自增；await 后如果当前请求已不是最新，
+// 旧结果必须丢弃，避免在切换 video_id 时旧请求覆盖新视频。
+let loadTasksSeq = 0
+
 async function loadTasks() {
+  const seq = ++loadTasksSeq
+  // 切换 video_id 时立刻清空旧数据，避免旧视频残留
+  tasks.value = []
+  selectedVideoId.value = ''
+  selectedReportVideoId.value = ''
   loading.value = true
   try {
     const date = String(reportDate.value || '')
@@ -251,14 +264,17 @@ async function loadTasks() {
         '/api/reports/fish-quality/videos',
         { params: { report_date: date } }
       )
+      // 已被新请求取代则丢弃
+      if (seq !== loadTasksSeq) return
       const data = daily.data?.data || daily.data || {}
       if (Array.isArray(data.items)) items = data.items
       else if (Array.isArray(data.videos)) items = data.videos
       else if (Array.isArray(data)) items = data
     } catch (_) {
       const fallback = await http.get('/api/videos', {
-        params: { page: 1, page_size: 200 },
+        params: { page: 1, page_size: 100 },
       })
+      if (seq !== loadTasksSeq) return
       const all: any[] = fallback.data?.data?.items || fallback.data?.items || []
       items = all
     }
@@ -275,6 +291,7 @@ async function loadTasks() {
           const r = await http.get('/api/videos', {
             params: { keyword: target, page: 1, page_size: 1 },
           })
+          if (seq !== loadTasksSeq) return
           const arr: any[] =
             r.data?.data?.items || r.data?.items || []
           const found = arr.find(
@@ -287,15 +304,21 @@ async function loadTasks() {
       }
     }
 
+    // 再次检查 seq，防止请求途中发生新 loadTasks
+    if (seq !== loadTasksSeq) return
+
     tasks.value = items
     syncSelectedVideoAfterDateChange()
   } catch (err) {
+    if (seq !== loadTasksSeq) return
     tasks.value = []
     selectedVideoId.value = ''
     selectedReportVideoId.value = ''
     Message.error(toErrorMessage(err))
   } finally {
-    loading.value = false
+    if (seq === loadTasksSeq) {
+      loading.value = false
+    }
   }
 }
 
@@ -365,40 +388,15 @@ function handleSelectedVideoChange(value: string) {
   })
 }
 
-async function handleGenerateVideoReport() {
-  const vid = String(selectedVideoId.value || selectedReportVideoId.value || '').trim()
-  if (!vid) {
-    Message.warning('请先选择视频')
-    return
-  }
-  generatingVideoReport.value = true
-  try {
-    const resp = await http.post(
-      '/api/reports/fish-quality/video-pdf/generate',
-      { video_id: vid }
-    )
-    const data = resp.data || {}
-    if (data.ok) {
-      Message.success(`视频报表已生成（report_id=${data.report_id}）`)
-      // 跳转到历史日报筛选视频报表，方便用户查看
-      router.push({
-        path: '/admin/data-report',
-        query: { open: 'history', type: 'daily-videos', report_type: 'video_fish_quality' },
-      })
-    } else {
-      Message.error(data.error || '生成视频报表失败')
-    }
-  } catch (err: any) {
-    Message.error(toErrorMessage(err) || '生成视频报表失败')
-  } finally {
-    generatingVideoReport.value = false
-  }
-}
-
 function showSelectedVideoReport() {
   const vid = String(selectedVideoId.value || '').trim()
   if (!vid) {
     Message.warning('请先选择视频')
+    return
+  }
+  const task = tasks.value.find((v) => String(v.video_id) === vid)
+  if (String(task?.status || '').toLowerCase() !== 'done') {
+    Message.warning('该任务仍在运行中，请稍后查看视频报告')
     return
   }
   selectedReportVideoId.value = vid
@@ -436,10 +434,9 @@ watch(
   (v) => {
     const id = String(v || '').trim()
     if (id) {
-      selectedVideoId.value = id
-      selectedReportVideoId.value = id
-      // 切换到 video_id 模式时重新加载 tasks（含跨日视频兜底），
-      // 避免在视频历史 → 报表连续点击多条时左侧选择器不刷新。
+      // 切换到不同 video_id：必须清空旧数据再加载新数据，
+      // 避免 EmbeddedVideoReport 短暂展示上一视频的统计与鱼列表。
+      // loadTasks 内部会重新自增请求序号并清理 tasks。
       loadTasks()
     }
   }

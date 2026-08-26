@@ -27,7 +27,8 @@ from app.repositories import session_repo
 from app.repositories.models import VideoTask
 from app.services import ops_algorithm_task_service
 from app.services import algorithm_runtime_status_service
-from app.services.path_service import to_abs_data_path
+from app.services.path_service import to_abs_data_path, to_data_relative
+from app.infra.redis_client import get_redis
 
 logger = logging.getLogger("ops_algorithm_task_router")
 
@@ -51,6 +52,7 @@ class RetryRequest(BaseModel):
     force: bool = Field(
         default=False, description="是否强制重新入队（即使 source_path 缺失）"
     )
+    force_all_complete: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +133,25 @@ def mark_algorithm_task_failed(
                 status_code=400,
                 detail=f"当前 status={vt.status} 不允许手动标记为 failed；如需强改请带 force=true。",
             )
+        # 先写跨进程取消标记。worker 会轮询该标记并终止 CLI 进程，
+        # 同时在入库前再次检查，避免旧任务覆盖人工失败状态。
+        redis_client = get_redis()
+        generation_key = f"fish:algorithm-task:generation:{video_id}"
+        # 更换任务代次会让旧 worker 的 token 立即失效。
+        redis_client.set(generation_key, f"cancelled:{datetime.now(timezone.utc).timestamp()}", ex=24 * 3600)
+        redis_client.set(
+            f"fish:algorithm-task:cancel:{video_id}",
+            payload.reason or "运维手动标记失败",
+            ex=24 * 3600,
+        )
+
+        cancelled_jobs = 0
+        try:
+            from app.workers.queue import cancel_algorithm_jobs
+            cancelled_jobs = cancel_algorithm_jobs(video_id)
+        except Exception:
+            logger.exception("cancel algorithm jobs failed: %s", video_id)
+
         try:
             session_repo.update_video_task_status(
                 db,
@@ -150,6 +171,7 @@ def mark_algorithm_task_failed(
             "video_id": video_id,
             "status": "failed",
             "last_error": payload.reason,
+            "cancelled_jobs": cancelled_jobs,
         }
     finally:
         db.close()
@@ -175,7 +197,21 @@ def retry_algorithm_task(
                 status_code=404, detail=f"VideoTask 不存在：{video_id}"
             )
 
-        src = vt.source_path or vt.input_video or vt.original_input_video
+        get_redis().delete(f"fish:algorithm-task:cancel:{video_id}")
+
+        from app.services.video_playback_service import (
+            ensure_browser_playable_video,
+            resolve_canonical_video_path,
+        )
+
+        canonical_source = resolve_canonical_video_path(video_id)
+        if canonical_source is None:
+            playback_result = ensure_browser_playable_video(video_id)
+            if playback_result.get("ok"):
+                canonical_source = resolve_canonical_video_path(video_id)
+        # results/input 是算法运行期副本，任务结束后可能已被清理，不能作为重试源。
+        # 只有 canonical 视频不存在时，才允许检查数据库中的旧 source_path。
+        src = str(canonical_source) if canonical_source else (vt.source_path or "")
         if not src:
             if not payload.force:
                 raise HTTPException(
@@ -184,7 +220,7 @@ def retry_algorithm_task(
                 )
             abs_path = ""
         else:
-            abs_path = to_abs_data_path(src)
+            abs_path = Path(src) if Path(src).is_absolute() else to_abs_data_path(src)
             abs_path_str = str(abs_path) if abs_path else ""
             if not abs_path_str or not Path(abs_path_str).exists():
                 if not payload.force:
@@ -194,11 +230,22 @@ def retry_algorithm_task(
                     )
                 abs_path_str = ""
 
-        if not abs_path_str and not payload.force:
-            raise HTTPException(
-                status_code=400,
-                detail="无法解析 source_path；如需强制 retry 请带 force=true",
-            )
+            if not abs_path_str and not payload.force:
+                raise HTTPException(
+                    status_code=400,
+                    detail="无法解析 source_path；如需强制 retry 请带 force=true",
+                )
+
+        if canonical_source is not None:
+            canonical_rel = to_data_relative(canonical_source)
+            if canonical_rel and vt.source_path != canonical_rel:
+                vt.source_path = canonical_rel
+                db.commit()
+                logger.info(
+                    "retry: corrected source_path video_id=%s path=%s",
+                    video_id,
+                    canonical_rel,
+                )
 
         # 清理可能残留的 data/jobs/<video_id>，避免算法 CLI 报"job 目录已存在"
         # （虽然 run_video_pipeline 自身 --overwrite 也会清理，这里多一道保险）
@@ -218,7 +265,8 @@ def retry_algorithm_task(
         from app.workers.queue import enqueue_algorithm_video_pipeline_from_video_task
 
         job_id = enqueue_algorithm_video_pipeline_from_video_task(
-            video_id=video_id, input_video=abs_path_str or ""
+            video_id=video_id, input_video=abs_path_str or "",
+            force_all_complete=payload.force_all_complete,
         )
 
         # 更新 video_task

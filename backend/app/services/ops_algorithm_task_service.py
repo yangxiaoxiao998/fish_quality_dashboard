@@ -610,7 +610,8 @@ def _query_rq_jobs(video_id: str) -> dict[str, Any]:
         return info
 
     try:
-        from rq.job import Job, NoSuchJob
+        from rq.job import Job
+        from rq.exceptions import NoSuchJobError
         from rq.registry import (
             StartedJobRegistry,
             FinishedJobRegistry,
@@ -637,7 +638,7 @@ def _query_rq_jobs(video_id: str) -> dict[str, Any]:
                 for jid in reg.get_job_ids():
                     try:
                         j = Job.fetch(jid, connection=redis)
-                    except NoSuchJob:
+                    except NoSuchJobError:
                         continue
                     if j.kwargs.get("upload_video_id") == video_id:
                         info["job_id"] = jid
@@ -988,6 +989,16 @@ def _compute_last_activity(
     return best
 
 
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
 def _compute_display_status(
     video_task: VideoTask,
     rq_info: dict[str, Any],
@@ -1251,10 +1262,14 @@ def _video_task_to_dict(vt: VideoTask) -> dict[str, Any]:
         "error_message": vt.error_message,
         "last_error": vt.last_error,
         "fps_estimate": vt.fps_estimate,
+        "video_duration_seconds": getattr(vt, "video_duration_seconds", None),
+        "processing_duration_seconds": getattr(vt, "processing_duration_seconds", None),
         "created_at": _iso(vt.created_at),
         "updated_at": _iso(vt.updated_at),
         "started_at": _iso(vt.started_at),
         "finished_at": _iso(vt.finished_at),
+        "video_duration_seconds": getattr(vt, "video_duration_seconds", None),
+        "processing_duration_seconds": getattr(vt, "processing_duration_seconds", None),
         "total_fish": int(getattr(vt, "total_fish", 0) or 0),
         "complete_fish": int(getattr(vt, "complete_fish", 0) or 0),
         "incomplete_fish": int(getattr(vt, "incomplete_fish", 0) or 0),
@@ -1569,6 +1584,7 @@ def get_algorithm_task_detail(video_id: str) -> dict[str, Any]:
 
     # 时间归一化：处理 finished_at < started_at 这种时区/旧字段混用异常
     finished_at_normalized, time_anomaly = _normalize_finish_time(vt, ps)
+    rq_state = (rq_info.get("job_state") or "").lower()
     # current_stage / failed_stage 优先从 pipeline_result / pipeline_state 读取
     current_stage = None
     failed_stage = None
@@ -1584,8 +1600,18 @@ def get_algorithm_task_detail(video_id: str) -> dict[str, Any]:
     if not failed_stage:
         failed_stage = vt.failed_stage
 
-    # last_log：保持兼容旧字段；algorithm_cli 找不到时 fallback pipeline_state 摘要
-    if log_info.get("exists"):
+    # 运行中的 pipeline_state 比上一次已结束的 CLI 日志更新时，优先展示
+    # pipeline_state，避免详情抽屉继续显示旧任务日志。
+    log_mtime = _parse_iso_datetime(log_info.get("mtime"))
+    state_mtime = _parse_iso_datetime(ps_summary.get("mtime"))
+    prefer_pipeline_state = bool(
+        ps_summary.get("exists")
+        and state_mtime
+        and (not log_mtime or state_mtime >= log_mtime)
+    )
+
+    # last_log：保持兼容旧字段；algorithm_cli 找不到或已落后时 fallback pipeline_state 摘要
+    if log_info.get("exists") and not prefer_pipeline_state:
         latest_log = dict(log_info)
         latest_log["source"] = "algorithm_cli"
         latest_log.setdefault("message", "")
@@ -1653,15 +1679,38 @@ def get_algorithm_task_detail(video_id: str) -> dict[str, Any]:
     )
 
     diagnosis_lines: list[str] = []
-    if "time_anomaly" in dir() and time_anomaly:
+    # 当 db 状态已经是终态（done / failed / stopped）时，
+    # 不要再把 RQ 残留或最新活动纳入诊断——这些可能是上一次任务留下的。
+    db_terminal = (vt.status or "").lower() in {"done", "failed", "stopped"}
+    # RQ 命中后状态为 scheduled/queued 但 db 还在 processing，
+    # 通常意味着 RQ 一直保留着旧 job 而实际任务已经失败。
+    rq_residue_processing = (
+        (vt.status or "").lower() == "processing"
+        and rq_state in {"scheduled", "queued"}
+        and (log_info.get("returncode") or 0) != 0
+    )
+    if db_terminal and time_anomaly:
         diagnosis_lines.append("时间字段异常（finished_at 早于 started_at），可能存在旧任务状态残留。")
-    if is_stuck:
-        diagnosis_lines.append(stuck_reason or "任务长时间未推进")
+    if not db_terminal:
+        if is_stuck:
+            diagnosis_lines.append(stuck_reason or "任务长时间未推进")
     if vt.status == "failed":
         if vt.last_error:
             diagnosis_lines.append(f"last_error: {vt.last_error[:500]}")
         if vt.failed_stage:
             diagnosis_lines.append(f"failed_stage: {vt.failed_stage}")
+    if vt.status in {"failed", "processing"} and rq_state in {"started", "queued", "deferred", "scheduled"}:
+        if (log_info.get("returncode") or 0) != 0 or vt.failed_stage or time_anomaly:
+            diagnosis_lines.append(
+                "RQ 队列里仍能查到本次任务的旧 running/queued 记录，"
+                "属于历史残留，不会再被 worker 执行；"
+                "可直接重新入队，无需等待。"
+            )
+    if rq_residue_processing:
+        diagnosis_lines.append(
+            "数据库仍为 processing，但 RQ 只剩 scheduled/queued 记录且最近一次算法 CLI 已失败，"
+            "判定为任务已实际失败但 db 状态未刷新；建议调用 retry 重跑或先 mark-failed 再 retry。"
+        )
     if log_info.get("returncode") and log_info.get("returncode") != 0:
         diagnosis_lines.append(
             f"latest algorithm CLI returncode={log_info.get('returncode')}"
@@ -1729,7 +1778,10 @@ def _suggest_action(
     if display_status == "done":
         return "已成功。"
     if display_status == "failed":
-        return "请查看 latest_log.stderr_tail / last_error；如果想重新跑，可调用 retry 接口。"
+        return (
+            "任务已标记为失败；RQ 队列里的旧 running 记录属于历史残留，"
+            "可直接调用 retry 重新入队，或先清理 data/jobs/<video_id> 后再 retry。"
+        )
     if is_stuck:
         msg = (
             "数据库状态长时间未推进，但 RQ 没有 running job。"
@@ -1739,6 +1791,12 @@ def _suggest_action(
             msg += f" 上次记录到的运行阶段：{current_stage}。"
         return msg
     if display_status == "processing":
+        log_rc = (log_info or {}).get("returncode")
+        if log_rc and log_rc != 0:
+            return (
+                "数据库停留在 processing，但 RQ 已无 started job、最近一次算法 CLI returncode 非 0，"
+                "判定为任务已实际失败但 db 状态未刷新；可直接调用 retry 重跑或先 mark-failed 再 retry。"
+            )
         return "请稍后刷新；RQ 仍有 running job。"
     if display_status == "queued":
         return "等待 worker 拉起。"

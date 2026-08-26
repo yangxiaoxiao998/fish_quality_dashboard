@@ -35,6 +35,8 @@ pydantic==2.10.6
 pydantic-settings==2.8.1
 pydantic_core==2.27.2
 pydeck==0.9.1
+python-multipart>=0.0.9
+rq>=1.16.0
 
 # gaoyuxi
 # torch: 2.7.0+cu128

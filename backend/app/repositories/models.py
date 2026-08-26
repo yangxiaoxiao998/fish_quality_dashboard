@@ -48,6 +48,9 @@ class VideoTask(Base):
 
     video_id: Mapped[str] = mapped_column(String(64), primary_key=True)
 
+    # 用户为视频任务填写的养鱼仓名称。
+    aquaculture_bin: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     source_type: Mapped[str] = mapped_column(
         String(32), default="upload"
     )  # upload / rtsp
@@ -65,6 +68,9 @@ class VideoTask(Base):
     current_algorithm: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     fps_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 视频媒体真实时长，以及算法任务从 started_at 到 finished_at 的处理耗时。
+    video_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    processing_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ============ 算法最新字段（第一阶段新增） ============
@@ -219,6 +225,7 @@ class Fish(Base):
     body_length_no_tail_cm: Mapped[float | None] = mapped_column(Float, nullable=True)
     body_height_cm: Mapped[float | None] = mapped_column(Float, nullable=True)
     pred_weight_g: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hex_color: Mapped[str | None] = mapped_column(String(32), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # 时间戳
@@ -335,4 +342,72 @@ class OperationLog(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         index=True
+    )
+
+
+class CameraRecordSchedule(Base):
+    """未来录制计划（持久化 + 后端调度）。
+
+    与 video_task 严格区分：
+      - video_task 只在正式录制开始后由现有链路创建
+      - 本表保存 start_time > 当前时间的待执行计划
+    """
+
+    __tablename__ = "camera_record_schedule"
+
+    schedule_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", index=True
+    )
+    planned_start_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    planned_end_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    force_all_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    video_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+
+    actual_start_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    actual_stop_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    claim_token: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stop_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stop_source: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_camera_record_schedule_due",
+            "status",
+            "planned_start_at",
+        ),
     )
