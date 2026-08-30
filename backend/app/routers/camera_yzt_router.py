@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Response, Depends
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.services.camera_yzt.camera_yzt_service import camera_service_yzt
 from app.services.path_service import to_abs_data_path, to_static_url
-from app.repositories.db import SessionLocal
+from app.repositories.db import SessionLocal, get_db
 from app.repositories import session_repo, fish_repo
 from app.paths import DATA_DIR
 from app.utils.time_utils import to_beijing
@@ -154,7 +154,7 @@ async def get_camera_settings():
 
 
 @router.put("/camera_yzt/settings")
-async def save_camera_settings(request: CameraSettingsRequest):
+async def save_camera_settings(request: CameraSettingsRequest, db: Session = Depends(get_db)):
     if not 320 <= request.width <= 3840:
         return JSONResponse(content={"error": "宽度必须在 320~3840 之间"}, status_code=422)
     if not 240 <= request.height <= 2160:
@@ -165,6 +165,10 @@ async def save_camera_settings(request: CameraSettingsRequest):
     if not settings["stream_url"]:
         settings["stream_url"] = camera_service_yzt._get_camera_push_url()
     saved = await run_in_threadpool(camera_service_yzt.save_settings, settings)
+    from app.services.config_revision_service import create_revision
+    revision = create_revision(db, "camera_settings", "default", saved, "camera-settings-page")
+    from app.services.config_revision_service import activate_revision
+    activate_revision(db, int(revision["revision_id"]))
     return {"ok": True, "settings": saved}
 
 
@@ -687,7 +691,16 @@ async def play_camera_video(video_id: str):
 
         abs_video_path = to_abs_data_path(task.source_path)
         if not abs_video_path or not os.path.exists(abs_video_path):
-            return JSONResponse(content={"error": "Video file not found"}, status_code=404)
+            try:
+                from app.services.object_storage_service import download_owned_object
+                abs_video_path = DATA_DIR / "jobs" / video_id / "input" / f"{video_id}_playback.mp4"
+                download_owned_object(db, owner_type="video_source", owner_id=video_id,
+                                      destination=abs_video_path)
+            except Exception:
+                abs_video_path = None
+        if not abs_video_path or not os.path.exists(abs_video_path):
+            return JSONResponse(content={"ok": False, "error_code": "OBJECT_MISSING",
+                                         "error": "视频对象缺失，无法播放"}, status_code=404)
 
         return FileResponse(str(abs_video_path), media_type="video/mp4", filename=f"{video_id}.mp4")
     except Exception as e:

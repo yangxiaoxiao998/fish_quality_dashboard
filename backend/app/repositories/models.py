@@ -313,6 +313,59 @@ class DetectionReport(Base):
     )
 
 
+class StoredObject(Base):
+    """Metadata for a local or object-storage file.
+
+    The object key is deliberately separate from the legacy local path fields;
+    this allows a reversible migration without changing business IDs.
+    """
+
+    __tablename__ = "stored_object"
+
+    object_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    backend: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
+    bucket: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    object_key: Mapped[str] = mapped_column(Text, nullable=False)
+    content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending")
+    source_local_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SystemConfigRevision(Base):
+    """Versioned runtime configuration; local JSON remains a cache in stage two."""
+
+    __tablename__ = "system_config_revision"
+
+    revision_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    config_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    config_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    object_bucket: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("config_type", "config_key", "version", name="uq_config_revision_version"),
+        Index("idx_config_revision_active", "config_type", "config_key", "is_active"),
+    )
+
+
 class OperationLog(Base):
     __tablename__ = "operation_log"
 

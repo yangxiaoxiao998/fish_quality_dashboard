@@ -11,6 +11,7 @@ PROJECT_ROOT_REAL="$(realpath "$SCRIPT_DIR")"
 RUNTIME_DIR="$PROJECT_ROOT_REAL/.runtime"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+MINIO_API_PORT="${FISH_MINIO_API_PORT:-9000}"
 
 MEDIAMTX_BIN="$PROJECT_ROOT_REAL/mediamtx/mediamtx"
 MEDIAMTX_CFG="$PROJECT_ROOT_REAL/mediamtx/mediamtx.yml"
@@ -49,6 +50,7 @@ stop_pid_file() {
 
 echo "[stop_dev] stopping by pid files..."
 stop_pid_file "worker"  "$RUNTIME_DIR/rq-worker.pid"
+stop_pid_file "minio"   "$RUNTIME_DIR/minio.pid"
 stop_pid_file "uvicorn" "$RUNTIME_DIR/backend.pid"
 stop_pid_file "vite"    "$RUNTIME_DIR/frontend.pid"
 stop_pid_file "upgrade-manager" "$RUNTIME_DIR/upgrade-manager.pid"
@@ -73,7 +75,7 @@ pkill -f '[n]ode.*vite' 2>/dev/null || true
 sleep 2
 
 echo "[stop_dev] port check:"
-ss_check="$(ss -tlnp 2>/dev/null | grep -E ":$BACKEND_PORT|:$FRONTEND_PORT|:8012|:1935|:8554" || true)"
+ss_check="$(ss -tlnp 2>/dev/null | grep -E ":$BACKEND_PORT|:$FRONTEND_PORT|:$MINIO_API_PORT|:8012|:1935|:8554" || true)"
 if [ -z "$ss_check" ]; then
   echo "  [OK] ports $BACKEND_PORT / $FRONTEND_PORT / 8012 / 1935 / 8554 已释放"
 else

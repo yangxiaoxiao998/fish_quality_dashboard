@@ -1853,6 +1853,36 @@ class CameraServiceYzt:
 
             db = SessionLocal()
             try:
+                object_upload_error = None
+                if update_video_task and video_id and transcoded_path:
+                    try:
+                        from app.services.object_storage_service import (
+                            object_key_for_video, store_file_metadata,
+                        )
+                        from app.settings import settings
+
+                        store_file_metadata(
+                            db,
+                            owner_type="video_source",
+                            owner_id=video_id,
+                            path=Path(transcoded_path),
+                            bucket=settings.minio_raw_bucket,
+                            object_key=object_key_for_video(video_id, transcoded_path,
+                                                             kind="playable"),
+                        )
+                        if video_path and video_path != transcoded_path and Path(video_path).is_file():
+                            store_file_metadata(
+                                db,
+                                owner_type="video_source_raw",
+                                owner_id=video_id,
+                                path=Path(video_path),
+                                bucket=settings.minio_raw_bucket,
+                                object_key=object_key_for_video(video_id, video_path,
+                                                                 kind="source"),
+                            )
+                    except Exception as exc:
+                        object_upload_error = f"video object upload failed: {exc}"
+                        print(f"[camera_yzt] {object_upload_error}")
                 if remove_video_task and video_id:
                     # 标定拍摄场景：start_stream 没创建 video_task，
                     # 但如果会话跨过 start_stream 旧路径残留了 video_id，也直接删除。
@@ -1863,7 +1893,12 @@ class CameraServiceYzt:
                         db_update_error = f"delete_video_task failed: {e}"
                         print(f"[camera_yzt] remove_video_task failed: {e}")
                 elif update_video_task:
-                    if transcoded_path and Path(transcoded_path).exists() and Path(transcoded_path).stat().st_size > 0:
+                    if object_upload_error:
+                        session_repo.update_video_task_status(
+                            db, video_id=video_id, status="failed",
+                            last_error=object_upload_error,
+                        )
+                    elif transcoded_path and Path(transcoded_path).exists() and Path(transcoded_path).stat().st_size > 0:
                         session_repo.update_video_task_status(
                             db, video_id=video_id, status="done"
                         )

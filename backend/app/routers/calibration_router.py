@@ -14,8 +14,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+
+from app.repositories.db import get_db
 
 from app.services.calibration_config_service import (
     clear_calibration_config,
@@ -82,8 +84,12 @@ def calibration_status() -> dict[str, Any]:
 
 
 @router.post("/calibration/save")
-def calibration_save(payload: CalibrationSaveRequest) -> dict[str, Any]:
-    return save_calibration_config(payload.model_dump())
+def calibration_save(payload: CalibrationSaveRequest, db=Depends(get_db)) -> dict[str, Any]:
+    saved = save_calibration_config(payload.model_dump())
+    from app.services.config_revision_service import activate_revision, create_revision
+    revision = create_revision(db, "calibration", payload.camera_id, saved, "visual-calibration")
+    activate_revision(db, int(revision["revision_id"]))
+    return {**saved, "config_revision_id": revision["revision_id"]}
 
 
 @router.post("/calibration/clear")

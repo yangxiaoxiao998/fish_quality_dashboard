@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 from app.paths import DATA_DIR, PROJECT_ROOT
 from app.services.algorithm_cli_service import (
     algorithm_path_to_static_url,
-    algorithm_path_to_static_url,
     error_conclusion_path,
     pipeline_result_path,
     read_error_conclusion,
@@ -112,7 +111,33 @@ def _make_fish_id(video_id: str, item: dict[str, Any]) -> str:
 
 
 def load_pipeline_result(video_id: str) -> dict[str, Any]:
-    return read_pipeline_result(video_id)
+    try:
+        return read_pipeline_result(video_id)
+    except FileNotFoundError:
+        from sqlalchemy import select
+        from app.repositories.db import SessionLocal
+        from app.repositories.models import StoredObject
+        from app.services.object_storage_service import object_storage
+        db = SessionLocal()
+        try:
+            row = db.execute(select(StoredObject).where(
+                StoredObject.owner_type == "algorithm_result",
+                StoredObject.owner_id == video_id,
+                StoredObject.object_key.like(f"%/{video_id}/reports/pipeline_result.json"),
+                StoredObject.status == "ready",
+            )).scalars().first()
+            if row is None:
+                raise
+            cache = RESULTS_DIR / video_id / "reports" / "pipeline_result.json"
+            # The owner query above selects the exact result object; use the
+            # stored key directly so multiple artifacts cannot be confused.
+            result = object_storage.get_file(row.bucket, row.object_key, cache)
+            if row.sha256 and result["sha256"] != row.sha256:
+                cache.unlink(missing_ok=True)
+                raise ValueError(f"pipeline result checksum mismatch: {row.object_key}")
+            return json.loads(cache.read_text(encoding="utf-8"))
+        finally:
+            db.close()
 
 
 def load_pipeline_result_from_path(path: str | Path) -> dict[str, Any]:

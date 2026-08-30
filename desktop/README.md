@@ -52,6 +52,9 @@ bash scripts/test_desktop_launcher.sh
 ## 运行行为
 
 - 双击“鱼品质智能检测系统”后自动启动项目服务。
+- 桌面启动器会自动启动本机 MinIO Server；MinIO 数据默认保存到 `$HOME/minio-data`，已有 9000 端口服务会直接复用。
+- MinIO 自动启动需要提前设置 `MINIO_ROOT_USER` 和 `MINIO_ROOT_PASSWORD`；开发启动脚本默认不自动启动 MinIO，可设置 `FISH_MINIO_AUTOSTART=1` 开启。
+- 也可以创建项目外配置文件 `$HOME/.config/fish-quality-dashboard/minio.env`，内容仅包含 `MINIO_ROOT_USER=...` 和 `MINIO_ROOT_PASSWORD=...`；不要把密码写入项目脚本。
 - Electron 使用 Chromium 内核加载 `http://127.0.0.1:5173`。
 - 默认全屏、kiosk、置顶，普通应用窗口不能覆盖其上。
 - 用户仍可启动其他程序；开发维护快捷键为 `Ctrl + Shift + P`。

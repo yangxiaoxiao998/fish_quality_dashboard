@@ -75,6 +75,14 @@ FISH_CAMERA_NETWORK_INTERFACE="${FISH_CAMERA_NETWORK_INTERFACE:-enp3s0}"
 # 本机读取摄像头流时使用的地址。
 FISH_CAMERA_READ_URL="${FISH_CAMERA_READ_URL:-rtmp://127.0.0.1:1935/fish_camera}"
 
+# MinIO is optional for local development and enabled by the desktop launcher.
+FISH_MINIO_AUTOSTART="${FISH_MINIO_AUTOSTART:-0}"
+FISH_MINIO_BIN="${FISH_MINIO_BIN:-$(command -v minio 2>/dev/null || true)}"
+FISH_MINIO_DATA_DIR="${FISH_MINIO_DATA_DIR:-$HOME/minio-data}"
+FISH_MINIO_API_PORT="${FISH_MINIO_API_PORT:-9000}"
+FISH_MINIO_CONSOLE_PORT="${FISH_MINIO_CONSOLE_PORT:-9001}"
+FISH_MINIO_ENV_FILE="${FISH_MINIO_ENV_FILE:-$HOME/.config/fish-quality-dashboard/minio.env}"
+
 
 # ----------------------------------------------------------------------
 # 3. 项目内部路径
@@ -93,12 +101,14 @@ RUNTIME_DIR="$PROJECT_DIR/.runtime"
 LOG_DIR="$PROJECT_DIR/data/logs/dev"
 
 MEDIAMTX_PID_FILE="$RUNTIME_DIR/mediamtx.pid"
+MINIO_PID_FILE="$RUNTIME_DIR/minio.pid"
 WORKER_PID_FILE="$RUNTIME_DIR/rq-worker.pid"
 BACKEND_PID_FILE="$RUNTIME_DIR/backend.pid"
 FRONTEND_PID_FILE="$RUNTIME_DIR/frontend.pid"
 UPGRADE_MANAGER_PID_FILE="$RUNTIME_DIR/upgrade-manager.pid"
 
 MEDIAMTX_LOG="$LOG_DIR/mediamtx.log"
+MINIO_LOG="$LOG_DIR/minio.log"
 WORKER_LOG="$LOG_DIR/rq-worker.log"
 BACKEND_LOG="$LOG_DIR/backend.log"
 FRONTEND_LOG="$LOG_DIR/frontend.log"
@@ -234,6 +244,7 @@ export FISH_CAMERA_PUSH_URL
 export FISH_CAMERA_AUTO_PUSH_URL
 export FISH_CAMERA_NETWORK_INTERFACE
 export FISH_CAMERA_READ_URL
+export FISH_MINIO_AUTOSTART FISH_MINIO_BIN FISH_MINIO_DATA_DIR
 export VITE_API_PROXY_TARGET
 export UPGRADE_MANAGER_PORT
 export UPGRADE_MANAGER_ALLOWED_ORIGINS
@@ -477,6 +488,40 @@ port_is_listening() {
 
     return 1
 }
+
+start_minio_if_enabled() {
+    case "$FISH_MINIO_AUTOSTART" in
+        1|true|yes|on) ;;
+        *) echo "[INFO] MinIO 自动启动已关闭（FISH_MINIO_AUTOSTART=$FISH_MINIO_AUTOSTART）"; return 0 ;;
+    esac
+    if [[ -f "$FISH_MINIO_ENV_FILE" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "$FISH_MINIO_ENV_FILE"
+        set +a
+    fi
+    export MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-${MINIO_ROOT_USER:-}}"
+    export MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-}}"
+    if port_is_listening "$FISH_MINIO_API_PORT"; then
+        echo "[INFO] MinIO 已监听端口 $FISH_MINIO_API_PORT，复用现有服务"
+        return 0
+    fi
+    if [[ -z "$FISH_MINIO_BIN" || ! -x "$FISH_MINIO_BIN" ]]; then
+        echo "[ERROR] 已启用 MinIO 自动启动，但找不到 MinIO：${FISH_MINIO_BIN:-未找到}"
+        exit 1
+    fi
+    if [[ -z "${MINIO_ROOT_USER:-}" || -z "${MINIO_ROOT_PASSWORD:-}" ]]; then
+        echo "[ERROR] MinIO 自动启动需要 MINIO_ROOT_USER 和 MINIO_ROOT_PASSWORD"
+        echo "[ERROR] 可设置环境变量，或创建：$FISH_MINIO_ENV_FILE"
+        exit 1
+    fi
+    mkdir -p "$FISH_MINIO_DATA_DIR"
+    start_detached_process "MinIO" "$PROJECT_DIR" "$MINIO_LOG" "$MINIO_PID_FILE" \
+        "$FISH_MINIO_BIN" server "$FISH_MINIO_DATA_DIR" \
+        --address ":$FISH_MINIO_API_PORT" --console-address ":$FISH_MINIO_CONSOLE_PORT"
+}
+
+start_minio_if_enabled
 
 
 # ----------------------------------------------------------------------

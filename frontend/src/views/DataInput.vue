@@ -676,15 +676,26 @@ function formatSeconds(v: number | null | undefined, digits = 2): string {
 // ============================================================
 let cameraStatusTimer: number | null = null
 let remainingTickTimer: number | null = null
+let cameraStatusRequestActive = false
+let cameraStatusFailureCount = 0
 
 async function pollCameraStatus(): Promise<void> {
+  if (cameraStatusRequestActive) return
+  cameraStatusRequestActive = true
   try {
     const resp = await http.get('/api/camera_yzt/status', {
-      params: { _t: Date.now() }
+      params: { _t: Date.now() },
+      timeout: 30000,
     })
     applyCameraTimingFromStatus(resp.data)
+    cameraStatusFailureCount = 0
   } catch (err) {
-    console.warn('[DataInput][Camera] status poll failed', err)
+    cameraStatusFailureCount += 1
+    if (cameraStatusFailureCount === 1 || cameraStatusFailureCount % 10 === 0) {
+      console.warn('[DataInput][Camera] status poll failed', err)
+    }
+  } finally {
+    cameraStatusRequestActive = false
   }
 }
 

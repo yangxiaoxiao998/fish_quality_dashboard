@@ -15,6 +15,11 @@ from app.services.video_id_service import generate_video_id
 from app.repositories.db import get_db
 from app.repositories import session_repo
 from app.workers.queue import enqueue_algorithm_video_pipeline_from_video_task
+from app.services.object_storage_service import (
+    object_key_for_video,
+    store_file_metadata,
+)
+from app.settings import settings
 
 router = APIRouter()
 
@@ -53,6 +58,28 @@ async def _upload_video_impl(
 
     async with aiofiles.open(video_path, "wb") as f:
         await f.write(content)
+
+    # Keep the local copy for immediate playback and algorithm processing, but
+    # make the object upload an explicit, auditable step before queueing.
+    try:
+        object_key = object_key_for_video(video_id, file.filename or "video.mp4")
+        store_file_metadata(
+            db,
+            owner_type="video_source",
+            owner_id=video_id,
+            path=video_path,
+            bucket=settings.minio_raw_bucket,
+            object_key=object_key,
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail={
+            "ok": False,
+            "error": "video object upload failed",
+            "video_id": video_id,
+            "message": str(exc),
+        }) from exc
 
     rel_video_path = to_data_relative(video_path)
     session_repo.create_video_task(

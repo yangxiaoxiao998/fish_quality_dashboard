@@ -478,13 +478,14 @@ def batch_delete_videos(body: dict, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=400, detail="video_ids must be a non-empty list")
     import shutil
     from app.paths import DATA_DIR
-    from app.repositories.models import DetectionReport, Fish, VideoTask
+    from app.repositories.models import DetectionReport, Fish, StoredObject, VideoTask
     from app.services.path_service import to_abs_data_path
     ids = list(dict.fromkeys(str(v).strip() for v in video_ids if str(v).strip()))
     tasks = db.query(VideoTask).filter(VideoTask.video_id.in_(ids)).all()
     found = {task.video_id for task in tasks}
     if not found:
         raise HTTPException(status_code=404, detail="video tasks not found")
+    stored_objects = db.query(StoredObject).filter(StoredObject.owner_id.in_(found)).all()
     affected_dates = {task.created_at.date() for task in tasks if task.created_at}
     db.query(DetectionReport).filter(DetectionReport.video_id.in_(found)).delete(synchronize_session=False)
     db.query(Fish).filter(Fish.video_id.in_(found)).delete(synchronize_session=False)
@@ -497,6 +498,15 @@ def batch_delete_videos(body: dict, db: Session = Depends(get_db)) -> dict:
                 else:
                     path.unlink(missing_ok=True)
         db.delete(task)
+    from app.services.object_storage_service import object_storage
+    for obj in stored_objects:
+        try:
+            object_storage.remove(obj.bucket, obj.object_key)
+        except Exception as exc:
+            obj.status = "missing"
+            obj.last_error = f"delete failed: {exc}"[:2000]
+        else:
+            db.delete(obj)
     db.commit()
     _refresh_daily_reports(db, affected_dates)
     return {"ok": True, "deleted_video_ids": sorted(found), "deleted_count": len(found)}
@@ -536,7 +546,7 @@ def _refresh_daily_reports(db: Session, dates: set) -> None:
 def delete_video(video_id: str, db: Session = Depends(get_db)) -> dict:
     import shutil
     from app.paths import DATA_DIR
-    from app.repositories.models import DetectionReport, Fish, VideoTask
+    from app.repositories.models import DetectionReport, Fish, StoredObject, VideoTask
     from app.services.path_service import to_abs_data_path
 
     task = db.get(VideoTask, video_id)
@@ -544,6 +554,7 @@ def delete_video(video_id: str, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=404, detail="video task not found")
     affected_dates = {task.created_at.date()} if task.created_at else set()
     stored_paths = (task.source_path, task.result_dir)
+    stored_objects = db.query(StoredObject).filter(StoredObject.owner_id == video_id).all()
     db.query(DetectionReport).filter(
         DetectionReport.video_id == video_id,
     ).delete(synchronize_session=False)
@@ -551,6 +562,15 @@ def delete_video(video_id: str, db: Session = Depends(get_db)) -> dict:
         Fish.video_id == video_id,
     ).delete(synchronize_session=False)
     db.delete(task)
+    from app.services.object_storage_service import object_storage
+    for obj in stored_objects:
+        try:
+            object_storage.remove(obj.bucket, obj.object_key)
+        except Exception as exc:
+            obj.status = "missing"
+            obj.last_error = f"delete failed: {exc}"[:2000]
+        else:
+            db.delete(obj)
     db.commit()
     _refresh_daily_reports(db, affected_dates)
     for stored_path in stored_paths:
@@ -712,9 +732,19 @@ def play_video(video_id: str, db: Session = Depends(get_db)):
     if obj.status != "done":
         return JSONResponse(content={"error": "视频仍在处理中，请等待完成后播放"}, status_code=400)
 
+    source_path = _canonical_source_path(video_id, obj.source_path)
     abs_video_path = to_abs_data_path(source_path)
     if not abs_video_path or not os.path.exists(abs_video_path):
-        return JSONResponse(content={"error": "Video file not found"}, status_code=404)
+        try:
+            from app.services.object_storage_service import download_owned_object
+            abs_video_path = DATA_DIR / "jobs" / video_id / "input" / f"{video_id}_playback.mp4"
+            download_owned_object(db, owner_type="video_source", owner_id=video_id,
+                                  destination=abs_video_path)
+        except Exception:
+            abs_video_path = None
+    if not abs_video_path or not os.path.exists(abs_video_path):
+        return JSONResponse(content={"ok": False, "error_code": "OBJECT_MISSING",
+                                     "error": "视频对象缺失，无法播放"}, status_code=404)
 
     return FileResponse(str(abs_video_path), media_type="video/mp4", filename=f"{video_id}.mp4")
 
@@ -750,7 +780,20 @@ def get_video_playback(video_id: str, db: Session = Depends(get_db)):
     obj = session_repo.get_video_task(db, video_id=video_id)
     video_status = obj.status if obj else None
 
-    result = ensure_browser_playable_video(video_id, stored_path=obj.source_path if obj else None)
+    stored_path = obj.source_path if obj else None
+    source_file = to_abs_data_path(stored_path) if stored_path else None
+    if (source_file is None or not source_file.is_file()) and obj is not None:
+        try:
+            from app.services.object_storage_service import download_owned_object
+            source_file = DATA_DIR / "jobs" / video_id / "input" / f"{video_id}_playback_source.mp4"
+            download_owned_object(
+                db, owner_type="video_source", owner_id=video_id,
+                destination=source_file,
+            )
+            stored_path = to_data_relative(source_file)
+        except Exception:
+            source_file = None
+    result = ensure_browser_playable_video(video_id, stored_path=stored_path)
     if not result.get("ok"):
         code = result.get("error_code") or "VIDEO_PLAYBACK_FAILED"
         if code == "VIDEO_FILE_NOT_FOUND":

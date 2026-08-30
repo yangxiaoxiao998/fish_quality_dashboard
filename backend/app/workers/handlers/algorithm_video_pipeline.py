@@ -17,6 +17,99 @@ from app.services import algorithm_cli_service, algorithm_result_service
 logger = logging.getLogger("algorithm_video_pipeline")
 
 
+def _download_source_object(video_id: str, destination: Path) -> str | None:
+    """Recover a missing local source into the job cache from stored_object."""
+    from sqlalchemy import select
+    from app.repositories.models import StoredObject
+    from app.services.object_storage_service import object_storage
+
+    db = SessionLocal()
+    try:
+        row = db.execute(select(StoredObject).where(
+            StoredObject.owner_type == "video_source",
+            StoredObject.owner_id == video_id,
+            StoredObject.status == "ready",
+        ).order_by(StoredObject.created_at.desc())).scalars().first()
+        if row is None:
+            return None
+        object_storage.get_file(row.bucket, row.object_key, destination)
+        return str(destination)
+    finally:
+        db.close()
+
+
+def _publish_algorithm_objects(video_id: str, result_dir: str | None) -> dict[str, int]:
+    """Publish stable algorithm outputs after the CLI has completed."""
+    if not result_dir:
+        return {"uploaded": 0, "failed": 0}
+    from app.paths import DATA_DIR
+    from app.settings import settings
+    from app.services.object_storage_service import store_file_metadata
+
+    root = Path(result_dir)
+    if not root.is_absolute():
+        root = DATA_DIR / str(result_dir).removeprefix("data/")
+    if not root.is_dir():
+        return {"uploaded": 0, "failed": 0}
+    # Do not publish transient frames or logs; these remain local job evidence.
+    allowed = {"pipeline_result.json", "error_conclusion.txt", "result.csv",
+               "measurements.csv", "chart_meta.json"}
+    candidates = [p for p in root.rglob("*") if p.is_file() and (
+        p.name in allowed or p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    )]
+    db = SessionLocal()
+    uploaded = failed = 0
+    try:
+        for path in candidates:
+            key = f"results/{video_id}/{path.relative_to(root).as_posix()}"
+            try:
+                store_file_metadata(db, owner_type="algorithm_result", owner_id=video_id,
+                                    path=path, bucket=settings.minio_results_bucket,
+                                    object_key=key)
+                uploaded += 1
+            except Exception as exc:
+                failed += 1
+                logger.error("publish algorithm object failed: %s: %s", path, exc)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return {"uploaded": uploaded, "failed": failed}
+
+
+def _publish_report_objects(video_id: str) -> dict[str, int]:
+    from app.paths import DATA_DIR
+    from app.settings import settings
+    from app.services.object_storage_service import store_file_metadata
+
+    root = DATA_DIR / "results" / video_id / "reports"
+    if not root.is_dir():
+        return {"uploaded": 0, "failed": 0}
+    db = SessionLocal()
+    uploaded = failed = 0
+    try:
+        for path in root.iterdir():
+            if not path.is_file() or path.suffix.lower() not in {".pdf", ".docx"}:
+                continue
+            try:
+                store_file_metadata(db, owner_type="video_report", owner_id=video_id,
+                                    path=path, bucket=settings.minio_reports_bucket,
+                                    object_key=f"reports/video/{video_id}/{path.name}")
+                uploaded += 1
+            except Exception as exc:
+                failed += 1
+                logger.error("publish report object failed: %s: %s", path, exc)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return {"uploaded": uploaded, "failed": failed}
+
+
 def _generation_key(video_id: str) -> str:
     return f"fish:algorithm-task:generation:{video_id}"
 
@@ -265,6 +358,15 @@ def run_algorithm_video_pipeline(
             abs_input = canonical
 
     if not abs_input or not Path(abs_input).is_file():
+        if upload_video_id:
+            recovered = _download_source_object(
+                upload_video_id,
+                Path(__file__).resolve().parents[4] / "data" / "jobs" /
+                upload_video_id / "input" / f"{upload_video_id}_source_video.mp4",
+            )
+            if recovered:
+                abs_input = recovered
+    if not abs_input or not Path(abs_input).is_file():
         err_summary = f"算法输入视频不存在：{abs_input or '(empty)'}"
         _mark_video_task_failed(upload_video_id, err_summary)
         return {
@@ -349,6 +451,23 @@ def run_algorithm_video_pipeline(
     if isinstance(pipeline_result, dict) and not pipeline_result.get("video_id"):
         pipeline_result["video_id"] = video_id
 
+    artifact_result = _publish_algorithm_objects(
+        str(video_id), result.get("result_dir") or pipeline_result.get("result_dir")
+    )
+    if artifact_result.get("failed", 0):
+        error = f"algorithm object publication failed: {artifact_result['failed']} object(s)"
+        _mark_video_task_failed(upload_video_id or str(video_id), error)
+        return {
+            "ok": False,
+            "upload_video_id": upload_video_id,
+            "video_id": video_id,
+            "status": "failed",
+            "error_message": error,
+            "object_result": artifact_result,
+            "log_path": cli_log_path,
+            "returncode": cli_returncode,
+        }
+
     # 兜底 video_id 标注（CLI 跑出来的 video_id 与上传 video_id 不一致时记录到 last_error）
     if upload_video_id and video_id and video_id != upload_video_id:
         try:
@@ -411,6 +530,7 @@ def run_algorithm_video_pipeline(
     report_result: dict[str, Any] = {"ok": False, "skipped": True, "error": "skipped"}
     if import_result and import_result.get("ok") and status == "done" and video_id:
         report_result = _generate_video_report_after_import(video_id)
+        report_result["object_result"] = _publish_report_objects(str(video_id))
         daily_report_result = _generate_daily_report_after_task(video_id)
         # 报告生成也结束后才清理输入副本，保证算法及其后处理不再需要源文件。
         _cleanup_video_copies(upload_video_id or video_id)
@@ -432,4 +552,5 @@ def run_algorithm_video_pipeline(
             and report_result.get("ok")
             and report_result.get("status") == "generated"
         ),
+        "object_result": artifact_result,
     }

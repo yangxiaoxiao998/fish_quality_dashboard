@@ -55,7 +55,7 @@ import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 import { http, toErrorMessage } from '@/api/http'
 import type { FishDetail } from '@/types/fish'
 import { getVideoState, setVideoState, clearVideoState } from '@/store/video'
-import { runAlgorithmVideo, getAlgorithmVideoResult } from '@/api/algorithm'
+import { getAlgorithmVideoResult } from '@/api/algorithm'
 
 const emit = defineEmits<{
   (e: 'upload-success', data: { video_id: string, videoSrc: string }): void
@@ -148,9 +148,11 @@ function shortVideoId(value: string): string {
 }
 
 function buildAbsoluteUrl(playbackUrl: string) {
-  const base = import.meta.env.VITE_API_DOMAIN || 'http://localhost:8000'
   if (!playbackUrl) return ''
   if (playbackUrl.startsWith('http://') || playbackUrl.startsWith('https://')) return playbackUrl
+  // Keep relative URLs under Vite/Electron so the configured API proxy is
+  // used; hard-coding localhost:8000 breaks alternate test and deployment ports.
+  const base = import.meta.env.VITE_API_DOMAIN || ''
   return `${base.replace(/\/+$/, '')}/${playbackUrl.replace(/^\/+/, '')}`
 }
 
@@ -178,57 +180,9 @@ async function onUpload() {
 
     emit('upload-success', { video_id: videoId.value, videoSrc: videoSrc.value })
 
-    // 第一阶段：上传完成后调用真实算法 CLI。
-    // 后端第一阶段同步阻塞接口，因此放到 finally 前。
-    // 注意：uploadVideo 在新版后端实际会返回 input_video / source_path，
-    // 这里使用 playback_url 作为兜底，避免后端字段不一致时调用失败。
-    const inputVideo = resp.data.video_path || resp.data.source_path || resp.data.playback_url || ''
-    if (inputVideo) {
-      try {
-        algorithmRunning.value = true
-        const algoResp = await runAlgorithmVideo({
-          input_video: inputVideo,
-          camera_id: 'default',
-          device: 'cuda',
-          video_fps: 25,
-          overwrite: true,
-          import_to_db: true,
-        })
-        if (algoResp.data?.ok && algoResp.data.status === 'done' && algoResp.data.video_id) {
-          algorithmVideoId.value = algoResp.data.video_id
-          algorithmStatus.value = 'done'
-          // 立即拉一次结果保存到 store（不阻塞 UI）
-          getAlgorithmVideoResult(algoResp.data.video_id)
-            .then((r) => {
-              if (r.data?.data?.fish) {
-                fishes.value = r.data.data.fish.map((f) => ({
-                  fish_id: String(f.track_id ?? f.fish_uid ?? ''),
-                  track_id: f.track_id,
-                  crop_image_url: f.crop_image_url,
-                  crop_image_path: f.crop_image_path,
-                  body_length_cm: f.body_length_cm,
-                  body_length_no_tail_cm: f.body_length_no_tail_cm,
-                  body_height_cm: f.body_height_cm,
-                  pred_weight_g: f.pred_weight_g,
-                  condition_factor: f.condition_factor,
-                  surface_damage_ratio: f.surface_damage_ratio,
-                  status: f.status as any,
-                  error_message: f.error_message,
-                } as FishDetail))
-              }
-            })
-            .catch(() => {})
-        } else {
-          algorithmStatus.value = algoResp.data?.status ?? 'failed'
-          algorithmError.value =
-            algoResp.data?.error_conclusion || algoResp.data?.error_message || '算法处理失败'
-        }
-      } catch (e: any) {
-        algorithmError.value = e?.message || '调用算法 CLI 失败'
-      } finally {
-        algorithmRunning.value = false
-      }
-    }
+    // /api/videos 已经创建任务并入队；不要再次调用算法接口，避免重复任务。
+    algorithmVideoId.value = videoId.value
+    algorithmStatus.value = 'queued'
 
     startPollingFishes()
   } catch (err) {
@@ -248,6 +202,15 @@ async function pollFishes() {
     const videoData = resp.data
     if (videoData.status === 'done' || videoData.status === 'failed') {
       stopPollingFishes()
+      algorithmStatus.value = videoData.status
+      algorithmRunning.value = false
+      if (videoData.status === 'done') {
+        getAlgorithmVideoResult(videoId.value).then((r) => {
+          if (r.data?.data?.fish) fishes.value = r.data.data.fish as FishDetail[]
+        }).catch(() => {})
+      } else {
+        algorithmError.value = videoData.last_error || '算法处理失败'
+      }
     }
   } catch (err) {
     console.error('Failed to poll video status:', err)
