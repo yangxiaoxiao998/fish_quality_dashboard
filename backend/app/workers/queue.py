@@ -9,6 +9,7 @@ from rq import Queue
 from rq.job import Retry
 
 from app.infra.redis_client import get_redis
+from app.paths import JOBS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -197,8 +198,25 @@ def recover_missing_queued_video_tasks() -> dict[str, Any]:
 
                 source_path = resolve_canonical_video_path(video_id)
             if not source_path or not source_path.is_file() or source_path.stat().st_size <= 0:
-                skipped.append({"video_id": video_id, "reason": "source_file_missing"})
-                continue
+                try:
+                    from app.services.object_storage_service import object_storage
+                    from app.repositories.models import StoredObject
+                    object_row = (
+                        db.query(StoredObject)
+                        .filter(StoredObject.owner_type == "video_source",
+                                StoredObject.owner_id == video_id,
+                                StoredObject.status == "ready")
+                        .order_by(StoredObject.created_at.desc())
+                        .first()
+                    )
+                    if object_row is not None:
+                        source_path = JOBS_DIR / video_id / "input" / f"{video_id}_source_video.mp4"
+                        object_storage.get_file(object_row.bucket, object_row.object_key, source_path)
+                except Exception as exc:
+                    logger.warning("recover source object failed for %s: %s", video_id, exc)
+                if not source_path or not source_path.is_file() or source_path.stat().st_size <= 0:
+                    skipped.append({"video_id": video_id, "reason": "source_file_missing"})
+                    continue
             try:
                 task.status = "queued"
                 task.last_error = None

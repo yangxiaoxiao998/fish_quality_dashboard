@@ -245,6 +245,7 @@ FISH_ALGO_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_fish_video_damage ON fish(video_id, surface_damage_ratio)",
 ]
 
+
 VIDEO_TASK_ALGO_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_video_task_status_created ON video_task(status, created_at)",
 ]
@@ -287,6 +288,19 @@ def run_algorithm_result_tables_migration() -> None:
         # 不让启动失败；只记录日志
         logger.error(f"[migration] algorithm result tables migration failed: {e}")
         print(f"[DB][WARN] algorithm result tables migration failed: {e}")
+
+
+def run_storage_tables_migration() -> None:
+    """Create stage-two storage/config metadata tables without touching data."""
+    try:
+        from app.repositories.models import StoredObject, SystemConfigRevision
+
+        StoredObject.__table__.create(engine, checkfirst=True)
+        SystemConfigRevision.__table__.create(engine, checkfirst=True)
+        print("[DB] storage/config revision tables migration: OK")
+    except Exception as exc:
+        logger.error("[migration] storage tables migration failed: %s", exc)
+        print(f"[DB][WARN] storage tables migration failed: {exc}")
 
 
 # ---------------------------------------------------------------------------

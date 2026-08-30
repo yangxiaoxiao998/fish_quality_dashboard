@@ -64,6 +64,7 @@ function cleanCalibrationErrorMessage(message: string): string {
 
 const loading = ref(false)
 const actionLoading = ref(false)
+const calibrationFileInput = ref<HTMLInputElement | null>(null)
 const realLengthMm = ref<number | null>(null)
 const realLengthSaving = ref(false)
 const status = ref<any | null>(null)
@@ -502,7 +503,30 @@ function handleUpload() {
     action: 'upload_calibration_image',
     message: '点击上传标定图片',
   })
-  Message.info('上传标定图片入口待后端上传接口确认后接入。')
+  calibrationFileInput.value?.click()
+}
+
+async function uploadCalibrationImage(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  actionLoading.value = true
+  try {
+    const form = new FormData()
+    form.append('file', file)
+    const resp = await http.post('/api/algorithm/calibration/upload', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    })
+    lastResult.value = { ...(lastResult.value || {}), ...(resp.data || {}) }
+    applyCalibrationData(lastResult.value)
+    Message.success('标定图片已上传，请继续执行视觉矫正')
+  } catch (err: any) {
+    Message.error(toErrorMessage(err))
+  } finally {
+    actionLoading.value = false
+  }
 }
 
 function formatMatrixCell(cell: any): string {
@@ -645,7 +669,8 @@ async function saveRealLength() {
           >
             从当前摄像头抓拍标定
           </a-button>
-          <a-button @click="handleUpload">上传标定图片</a-button>
+           <a-button :disabled="actionLoading" @click="handleUpload">上传标定图片</a-button>
+           <input ref="calibrationFileInput" type="file" accept=".jpg,.jpeg,.png,.bmp,.webp" hidden @change="uploadCalibrationImage" />
           <a-button
             status="success"
             :loading="actionLoading"

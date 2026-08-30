@@ -23,6 +23,21 @@ class Settings(BaseSettings):
     database_url: str
     redis_url: str
 
+    # Storage remains local in stage two. MinIO is opt-in after its health and
+    # migration checks pass.
+    storage_backend: Literal["local", "minio"] = "local"
+    minio_endpoint: str = "127.0.0.1:9000"
+    minio_access_key: Optional[str] = None
+    minio_secret_key: Optional[str] = None
+    minio_secure: bool = False
+    minio_region: str = "us-east-1"
+    minio_raw_bucket: str = "fish-raw"
+    minio_results_bucket: str = "fish-results"
+    minio_reports_bucket: str = "fish-reports"
+    minio_config_bucket: str = "fish-config"
+    minio_backups_bucket: str = "fish-backups"
+    minio_temp_bucket: str = "fish-temp"
+
     # 处理参数（后续可写入 config/app.yaml，再由 loader 合并）
     sample_fps: int = 25
     snapshot_strategy: str = "first_seen"  # first_seen / best_sharpness / etc.

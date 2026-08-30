@@ -23,6 +23,7 @@ from app.routers.system_router import router as system_router
 from app.routers.algorithm_router import router as algorithm_router
 from app.routers.operation_log_router import router as operation_log_router
 from app.routers.ops_algorithm_task_router import router as ops_algorithm_task_router
+from app.routers.storage_router import router as storage_router
 from app.repositories.db import SessionLocal
 from app.services.operation_log_service import log_operation
 
@@ -140,6 +141,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         run_camera_schedule_integrity_migration,
         run_detection_report_video_report_migration,
         run_camera_record_schedule_migration,
+        run_storage_tables_migration,
     )
 
     run_track_id_migration()
@@ -154,7 +156,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     run_camera_schedule_integrity_migration()
     run_detection_report_video_report_migration()
     run_camera_record_schedule_migration()
-
+    run_storage_tables_migration()
+    try:
+        from app.paths import DATA_DIR
+        from app.services.config_revision_service import ensure_file_revision
+        config_db = SessionLocal()
+        try:
+            ensure_file_revision(config_db, "camera_settings", "default", DATA_DIR / "config" / "camera_settings.json")
+            ensure_file_revision(config_db, "focus_settings", "default", DATA_DIR / "config" / "focus_settings.json")
+            ensure_file_revision(config_db, "calibration", "default", DATA_DIR / "calibration" / "current_calibration.json")
+        finally:
+            config_db.close()
+    except Exception as exc:
+        print(f"[config_revision] local bootstrap failed: {exc!r}")
     # Redis/RQ can lose queued jobs while the database keeps the queued state.
     # Restore only missing jobs before declaring the API ready.
     try:
@@ -303,6 +317,7 @@ def create_app() -> FastAPI:
         prefix="/api",
         tags=["ops-algorithm-tasks"],
     )
+    app.include_router(storage_router, prefix="/api", tags=["storage"])
 
     return app
 

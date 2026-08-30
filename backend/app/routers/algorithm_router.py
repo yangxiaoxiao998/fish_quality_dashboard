@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from typing import Any, Optional
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -77,6 +78,33 @@ class CaptureCalibrationRequest(BaseModel):
     # 新增：标定拍摄后自动停止摄像头（不污染视频历史）
     stop_after_capture: bool = True
     real_length_mm: Optional[float] = Field(None, gt=0)
+
+
+@router.post("/algorithm/calibration/upload")
+async def upload_calibration_image(
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    """Save a user-selected calibration image for the next calibration run."""
+    suffix = Path(file.filename or "calibration.jpg").suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+        raise HTTPException(status_code=400, detail="unsupported calibration image type")
+    target_dir = DATA_DIR / "uploads" / "calibration"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{suffix}"
+    try:
+        with target.open("wb") as stream:
+            while chunk := await file.read(1024 * 1024):
+                stream.write(chunk)
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="calibration image save failed") from exc
+    if target.stat().st_size <= 0:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="empty calibration image")
+    rel = f"data/uploads/calibration/{target.name}"
+    return {"ok": True, "source_image_path": rel,
+            "source_image_url": algorithm_cli_service.algorithm_path_to_static_url(rel),
+            "message": "标定图片已上传"}
 
 
 class BatchImportResultsRequest(BaseModel):
@@ -368,7 +396,15 @@ def save_calibration_config(payload: CalibrationConfigRequest) -> dict[str, Any]
     CALIBRATION_CONFIG_JSON.write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    return {"ok": True, **data}
+    from app.repositories.db import SessionLocal
+    from app.services.config_revision_service import activate_revision, create_revision
+    db = SessionLocal()
+    try:
+        revision = create_revision(db, "algorithm_runtime", "calibration", data, "visual-calibration")
+        activate_revision(db, int(revision["revision_id"]))
+    finally:
+        db.close()
+    return {"ok": True, **data, "config_revision_id": revision["revision_id"]}
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +593,7 @@ def get_pipeline_result(video_id: str, db: Session = Depends(get_db)) -> dict:
     """
     payload: dict | None = None
     try:
-        payload = algorithm_cli_service.read_pipeline_result(video_id)
+        payload = algorithm_result_service.load_pipeline_result(video_id)
     except FileNotFoundError:
         payload = None
     except Exception as exc:
@@ -582,10 +618,6 @@ def get_pipeline_result(video_id: str, db: Session = Depends(get_db)) -> dict:
 
     resp = algorithm_result_service.pipeline_result_to_response(payload)
     return {"ok": True, "data": resp, "_source": "pipeline_result.json"}
-
-    resp = algorithm_result_service.pipeline_result_to_response(payload)
-    return {"ok": True, "data": resp}
-
 
 # ---------------------------------------------------------------------------
 # 5.4 GET /api/algorithm/videos/{video_id}/error-conclusion
