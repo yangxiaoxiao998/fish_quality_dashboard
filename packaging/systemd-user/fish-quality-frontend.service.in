@@ -1,0 +1,16 @@
+[Unit]
+Description=Fish Quality Vite Frontend
+PartOf=fish-quality.target
+After=fish-quality-backend.service
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@/frontend
+EnvironmentFile=-%h/.config/fish-quality/source.env
+Environment=PATH=@CONDA_ENV_DIR@/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@CONDA_ENV_DIR@/bin/npm run dev -- --host 0.0.0.0 --port 5173 --strictPort
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=fish-quality.target

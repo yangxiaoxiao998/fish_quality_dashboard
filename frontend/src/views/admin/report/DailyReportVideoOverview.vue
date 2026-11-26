@@ -117,7 +117,15 @@ const route = useRoute()
 const router = useRouter()
 
 const todayStr = dayjs().format('YYYY-MM-DD')
-const reportDate = ref<string>(todayStr)
+
+function normalizeReportDate(value: unknown): string {
+  const date = String(value || '').trim()
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : ''
+}
+
+const reportDate = ref<string>(
+  normalizeReportDate(route.query.date) || todayStr,
+)
 
 // route.query.video_id 来自视频历史记录"查看报表"跳转。
 // 一旦存在，必须锁定为 video_id 模式：
@@ -281,29 +289,6 @@ async function loadTasks() {
     // 即使后端已经按日期过滤，前端再保险过滤一次，避免混入其它日期。
     items = items.filter((v) => isVideoInReportDate(v, date))
 
-    // video_id 模式：目标 video 不一定在 report_date 当日（跨天录制 / 手动选历史 video），
-    // 因此如果当日的 tasks 列表里没找到目标 video_id，单独再按 keyword 查一次兜底。
-    if (isVideoReportMode.value && routeVideoId.value) {
-      const target = routeVideoId.value
-      const inDay = items.some((v) => String(v.video_id || '') === target)
-      if (!inDay) {
-        try {
-          const r = await http.get('/api/videos', {
-            params: { keyword: target, page: 1, page_size: 1 },
-          })
-          if (seq !== loadTasksSeq) return
-          const arr: any[] =
-            r.data?.data?.items || r.data?.items || []
-          const found = arr.find(
-            (v) => String(v.video_id || '') === target
-          )
-          if (found) items = [found, ...items]
-        } catch (_) {
-          /* tolerate */
-        }
-      }
-    }
-
     // 再次检查 seq，防止请求途中发生新 loadTasks
     if (seq !== loadTasksSeq) return
 
@@ -329,8 +314,11 @@ function syncSelectedVideoAfterDateChange() {
   // 必须锁定到 route.query.video_id，不允许 fallback 到"最近视频"。
   if (isVideoReportMode.value) {
     const target = routeVideoId.value
-    selectedVideoId.value = target
-    selectedReportVideoId.value = target
+    const inSelectedDate = tasks.value.some(
+      (v) => String(v.video_id || '') === target,
+    )
+    selectedVideoId.value = inSelectedDate ? target : ''
+    selectedReportVideoId.value = inSelectedDate ? target : ''
     return
   }
 
@@ -364,6 +352,14 @@ function syncSelectedVideoAfterDateChange() {
 }
 
 function handleDateChange() {
+  selectedVideoId.value = ''
+  selectedReportVideoId.value = ''
+  if (route.query.video_id) {
+    const query = { ...route.query }
+    delete query.video_id
+    query.date = reportDate.value
+    void router.replace({ path: route.path, query, hash: '' })
+  }
   loadTasks()
 }
 
@@ -430,9 +426,13 @@ onMounted(async () => {
 })
 
 watch(
-  () => route.query.video_id,
-  (v) => {
-    const id = String(v || '').trim()
+  () => [route.query.video_id, route.query.date],
+  ([videoId, date]) => {
+    const nextDate = normalizeReportDate(date)
+    if (nextDate && nextDate !== reportDate.value) {
+      reportDate.value = nextDate
+    }
+    const id = String(videoId || '').trim()
     if (id) {
       // 切换到不同 video_id：必须清空旧数据再加载新数据，
       // 避免 EmbeddedVideoReport 短暂展示上一视频的统计与鱼列表。

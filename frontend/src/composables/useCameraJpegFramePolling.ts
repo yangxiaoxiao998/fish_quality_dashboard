@@ -11,7 +11,7 @@
  * 7. 失败日志节流：最多每 5 秒打印一次。
  *
  * 同时只能有一个摄像头主推流。
- * Dashboard 与 DataInput 共享同一份 page-level composable 实例，
+ * Dashboard 使用 page-level composable 实例，
  * 主画面与光圈预览共用 frameUrl。
  */
 import {

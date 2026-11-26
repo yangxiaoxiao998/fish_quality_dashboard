@@ -18,12 +18,66 @@ from sqlalchemy.orm import Session
 from app.repositories.db import get_db
 from app.repositories import session_repo
 from app.services.path_service import to_abs_data_path, to_data_relative, to_static_url
+from app.services.video_task_metrics_service import (
+    effective_finished_at as task_effective_finished_at,
+    processing_duration_seconds as task_processing_duration_seconds,
+    recording_finished_at as task_recording_finished_at,
+    recording_started_at as task_recording_started_at,
+    video_duration_seconds as task_video_duration_seconds,
+)
 from app.utils.time_utils import to_beijing
 from app.paths import DATA_DIR
 
 router = APIRouter()
 _webm_jobs: set[tuple[str, bool]] = set()
 _webm_jobs_lock = threading.Lock()
+
+
+def _remove_data_path(path: Path | None) -> None:
+    """Remove a file/tree only when it is inside DATA_DIR."""
+    if path is None or not path.exists():
+        return
+    try:
+        path.resolve().relative_to(DATA_DIR.resolve())
+    except ValueError:
+        return
+    import shutil
+
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _refresh_video_task_counts(db: Session, video_ids: set[str]) -> None:
+    """Keep task summaries aligned after manual fish deletion."""
+    from sqlalchemy import select
+    from app.repositories.models import Fish, Stats5Min, VideoTask
+
+    for video_id in video_ids:
+        task = db.get(VideoTask, video_id)
+        if task is None:
+            continue
+        rows = db.execute(
+            select(Fish.status, Fish.surface_damage_ratio)
+            .where(Fish.video_id == video_id)
+        ).all()
+        task.total_fish = len(rows)
+        task.processed_fish = len(rows)
+        task.complete_fish = sum(str(status) in {"done", "complete"} for status, _ in rows)
+        task.incomplete_fish = sum(str(status) == "incomplete" for status, _ in rows)
+        task.failed_fish = sum(str(status) == "failed" for status, _ in rows)
+        damage_values = [float(value) for _, value in rows if value is not None]
+        task.damaged_fish = sum(value > 0 for value in damage_values)
+        task.avg_surface_damage_ratio = (
+            sum(damage_values) / len(damage_values) if damage_values else None
+        )
+        task.max_surface_damage_ratio = max(damage_values) if damage_values else None
+        # The optional 5-minute table is rebuilt only by the import pipeline;
+        # clear stale buckets after manual deletion rather than serving wrong data.
+        db.query(Stats5Min).filter(Stats5Min.video_id == video_id).delete(
+            synchronize_session=False
+        )
 
 
 def _pipeline_metrics(video_id: str) -> dict[str, float | None]:
@@ -74,30 +128,37 @@ def _pipeline_metrics(video_id: str) -> dict[str, float | None]:
             values[key].append(value)
 
     summary = payload.get("summary") or {}
+
+    def count_or_default(value: Any, default: int) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return default
+
     result = {
-        "total_fish": summary.get("total_fish", len(fish_records)),
-        "complete_fish": summary.get(
-            "complete_fish",
+        "total_fish": count_or_default(summary.get("total_fish"), len(fish_records)),
+        "complete_fish": count_or_default(
+            summary.get("complete_fish"),
             sum(
                 str(fish.get("status") or "").lower() in complete_statuses
                 for fish in fish_records
             ),
         ),
-        "incomplete_fish": summary.get(
-            "incomplete_fish",
+        "incomplete_fish": count_or_default(
+            summary.get("incomplete_fish"),
             sum(
                 str(fish.get("status") or "").lower() == "incomplete"
                 for fish in fish_records
             ),
         ),
-        "failed_fish": summary.get(
-            "failed_fish",
+        "failed_fish": count_or_default(
+            summary.get("failed_fish"),
             sum(
                 str(fish.get("status") or "").lower() == "failed"
                 for fish in fish_records
             ),
         ),
-        "damaged_fish": summary.get("damaged_fish", 0),
+        "damaged_fish": count_or_default(summary.get("damaged_fish"), 0),
     }
     result.update({
         key: (sum(items) / len(items) if items else None)
@@ -116,7 +177,7 @@ def _canonical_source_path(video_id: str, stored_path: str | None) -> str | None
             return to_data_relative(path)
     except Exception:
         pass
-    return stored_path
+    return to_data_relative(stored_path)
 
 
 def _normalize_damage_ratio(value) -> float | None:
@@ -201,24 +262,16 @@ def _build_fish_display_id(
 
 
 def _probe_video_duration_seconds(source_path: str | None) -> float | None:
-    """通过 cv2 探测视频文件真实时长。失败返回 None。"""
+    """Probe a stored runtime video with the same ffprobe rule as reports."""
     if not source_path:
         return None
     try:
-        from app.services.path_service import to_abs_data_path
         abs_path = to_abs_data_path(source_path)
         if abs_path is None:
             return None
-        import cv2
-        cap = cv2.VideoCapture(str(abs_path))
-        if not cap.isOpened():
-            cap.release()
-            return None
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        nframes = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
-        cap.release()
-        if fps > 0 and nframes > 0:
-            return round(float(nframes) / float(fps), 2)
+        from app.services.video_playback_service import probe_media_duration_seconds
+
+        return probe_media_duration_seconds(abs_path)
     except Exception:
         return None
     return None
@@ -238,7 +291,6 @@ def _format_hms(seconds: float | int | None) -> str | None:
 def list_videos(
     request: Request,
     status: Optional[str] = None,
-    source_type: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     keyword: Optional[str] = None,
@@ -257,9 +309,6 @@ def list_videos(
     filters = []
     if status:
         filters.append(VideoTask.status == status)
-    if source_type:
-        filters.append(VideoTask.source_type == source_type)
-
     if keyword:
         kw = f"%{keyword.strip()}%"
         filters.append(VideoTask.video_id.ilike(kw))
@@ -319,10 +368,10 @@ def list_videos(
         metric_rows = db.execute(
             select(
                 _Fish.video_id,
-                 func.avg(func.coalesce(_Fish.body_length_cm, _Fish.body_length)).label("avg_body_length"),
-                 func.avg(func.coalesce(_Fish.body_length_no_tail_cm, _Fish.body_length_without_tail)).label("avg_body_length_without_tail"),
-                 func.avg(func.coalesce(_Fish.body_height_cm, _Fish.body_height)).label("avg_body_height"),
-                 func.avg(func.coalesce(_Fish.pred_weight_g, _Fish.body_weight)).label("avg_body_weight"),
+                  func.avg(_Fish.body_length_cm).label("avg_body_length"),
+                  func.avg(_Fish.body_length_no_tail_cm).label("avg_body_length_without_tail"),
+                  func.avg(_Fish.body_height_cm).label("avg_body_height"),
+                  func.avg(_Fish.pred_weight_g).label("avg_body_weight"),
                 func.avg(_Fish.condition_factor).label("avg_condition_factor"),
                 func.avg(_Fish.surface_damage_ratio).label("avg_surface_damage_ratio_from_fish"),
             )
@@ -343,7 +392,10 @@ def list_videos(
     items = []
     for v in videos:
         m = metric_map.get(v.video_id) or {}
-        pipeline_m = _pipeline_metrics(v.video_id)
+        # Database is authoritative after import. Raw JSON is exposed by the
+        # dedicated algorithm-result endpoint and is not mixed into the list
+        # query, otherwise list/detail counts can diverge.
+        pipeline_m: dict[str, float | None] = {}
         source_path = _canonical_source_path(v.video_id, v.source_path)
         playback_url = to_static_url(source_path)
         abs_video_path = to_abs_data_path(source_path)
@@ -360,29 +412,15 @@ def list_videos(
         finished_at_bj = to_beijing(v.finished_at)
 
         # 视频文件真实时长
-        video_duration_seconds = (
-            float(v.video_duration_seconds)
-            if v.video_duration_seconds is not None and float(v.video_duration_seconds) > 0
-            else _probe_video_duration_seconds(source_path)
-        )
+        video_duration_seconds = task_video_duration_seconds(v, stored_path=source_path)
         duration_error = None
         if video_duration_seconds is None:
             duration_error = "视频文件不存在或无法读取媒体时长"
         # 检测耗时 = finished - started
-        duration_seconds: float | None = (
-            float(v.processing_duration_seconds)
-            if v.processing_duration_seconds is not None
-            else None
+        duration_seconds = task_processing_duration_seconds(
+            v,
+            include_active=str(v.status or "").lower() == "processing",
         )
-        if duration_seconds is None and started_at_bj is not None:
-            from app.utils.time_utils import now_beijing
-            end_for_calc = finished_at_bj if finished_at_bj is not None else now_beijing()
-            try:
-                duration_seconds = round(
-                    (end_for_calc - started_at_bj).total_seconds(), 2
-                )
-            except Exception:
-                duration_seconds = None
 
         # 算法结果 URL（来自 pipeline_result_path / grounded_video_path）
         grounded_video_url = to_static_url(getattr(v, "grounded_video_path", None))
@@ -404,6 +442,8 @@ def list_videos(
                 "duration": _format_hms(video_duration_seconds),
                 # 新增：检测耗时（独立字段）
                 "duration_seconds": duration_seconds,
+                # 明确字段名供报表表格使用；保留 duration_seconds 兼容旧前端。
+                "processing_duration_seconds": duration_seconds,
                  "video_duration_seconds": video_duration_seconds,
                  "video_duration_error": duration_error,
                 "fishCount": v.total_fish or 0,
@@ -412,7 +452,6 @@ def list_videos(
                 "play_url": play_url,
                 "playable": v.status == "done" and video_exists,
                 "video_exists": video_exists,
-                "source_type": v.source_type,
                 "source_path": source_path,
                 # 算法新字段
                 "total_fish": v.total_fish or 0,
@@ -434,13 +473,13 @@ def list_videos(
                  "avg_condition_factor": pipeline_m.get("avg_condition_factor") if pipeline_m.get("avg_condition_factor") is not None else m.get("avg_condition_factor"),
                  "avg_surface_damage_ratio": pipeline_m.get("avg_surface_damage_ratio") if pipeline_m.get("avg_surface_damage_ratio") is not None else getattr(v, "avg_surface_damage_ratio", None) if getattr(v, "avg_surface_damage_ratio", None) is not None else m.get("avg_surface_damage_ratio_fish"),
                 "max_surface_damage_ratio": getattr(v, "max_surface_damage_ratio", None),
-                "pipeline_result_path": getattr(v, "pipeline_result_path", None),
-                "result_dir": getattr(v, "result_dir", None),
-                "error_conclusion_path": getattr(v, "error_conclusion_path", None),
+                 "pipeline_result_path": to_data_relative(getattr(v, "pipeline_result_path", None)),
+                 "result_dir": to_data_relative(getattr(v, "result_dir", None)),
+                 "error_conclusion_path": to_data_relative(getattr(v, "error_conclusion_path", None)),
                 "grounded_video_url": grounded_video_url,
                 "measurement_csv_url": measurement_csv_url,
-                "input_video": getattr(v, "input_video", None),
-                "original_input_video": getattr(v, "original_input_video", None),
+                 "input_video": to_data_relative(getattr(v, "input_video", None)),
+                 "original_input_video": to_data_relative(getattr(v, "original_input_video", None)),
                 "failed_stage": getattr(v, "failed_stage", None),
                 "error_message": getattr(v, "error_message", None),
                 "created_at": created_at_bj.isoformat() if created_at_bj else None,
@@ -476,9 +515,15 @@ def batch_delete_videos(body: dict, db: Session = Depends(get_db)) -> dict:
     video_ids = body.get("video_ids")
     if not isinstance(video_ids, list) or not video_ids:
         raise HTTPException(status_code=400, detail="video_ids must be a non-empty list")
-    import shutil
-    from app.paths import DATA_DIR
-    from app.repositories.models import DetectionReport, Fish, VideoTask
+    from app.repositories.models import (
+        CameraRecordSchedule,
+        DetectionReport,
+        Fish,
+        FrameFishDetection,
+        Stats5Min,
+        VideoFrame,
+        VideoTask,
+    )
     from app.services.path_service import to_abs_data_path
     ids = list(dict.fromkeys(str(v).strip() for v in video_ids if str(v).strip()))
     tasks = db.query(VideoTask).filter(VideoTask.video_id.in_(ids)).all()
@@ -486,18 +531,29 @@ def batch_delete_videos(body: dict, db: Session = Depends(get_db)) -> dict:
     if not found:
         raise HTTPException(status_code=404, detail="video tasks not found")
     affected_dates = {task.created_at.date() for task in tasks if task.created_at}
+    report_paths = [
+        to_abs_data_path(report.file_path)
+        for report in db.query(DetectionReport)
+        .filter(DetectionReport.video_id.in_(found))
+        .all()
+        if report.file_path
+    ]
     db.query(DetectionReport).filter(DetectionReport.video_id.in_(found)).delete(synchronize_session=False)
     db.query(Fish).filter(Fish.video_id.in_(found)).delete(synchronize_session=False)
+    db.query(Stats5Min).filter(Stats5Min.video_id.in_(found)).delete(synchronize_session=False)
+    db.query(VideoFrame).filter(VideoFrame.video_id.in_(found)).delete(synchronize_session=False)
+    db.query(FrameFishDetection).filter(FrameFishDetection.video_id.in_(found)).delete(synchronize_session=False)
+    db.query(CameraRecordSchedule).filter(CameraRecordSchedule.video_id.in_(found)).update(
+        {CameraRecordSchedule.video_id: None}, synchronize_session=False
+    )
     for task in tasks:
         for stored_path in (task.source_path, task.result_dir):
             path = to_abs_data_path(stored_path) if stored_path else None
-            if path and path.exists() and DATA_DIR in path.parents:
-                if path.is_dir():
-                    shutil.rmtree(path, ignore_errors=True)
-                else:
-                    path.unlink(missing_ok=True)
+            _remove_data_path(path)
         db.delete(task)
     db.commit()
+    for report_path in report_paths:
+        _remove_data_path(report_path)
     _refresh_daily_reports(db, affected_dates)
     return {"ok": True, "deleted_video_ids": sorted(found), "deleted_count": len(found)}
 
@@ -534,9 +590,16 @@ def _refresh_daily_reports(db: Session, dates: set) -> None:
 
 @router.delete("/videos/{video_id}")
 def delete_video(video_id: str, db: Session = Depends(get_db)) -> dict:
-    import shutil
     from app.paths import DATA_DIR
-    from app.repositories.models import DetectionReport, Fish, VideoTask
+    from app.repositories.models import (
+        CameraRecordSchedule,
+        DetectionReport,
+        Fish,
+        FrameFishDetection,
+        Stats5Min,
+        VideoFrame,
+        VideoTask,
+    )
     from app.services.path_service import to_abs_data_path
 
     task = db.get(VideoTask, video_id)
@@ -544,22 +607,33 @@ def delete_video(video_id: str, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=404, detail="video task not found")
     affected_dates = {task.created_at.date()} if task.created_at else set()
     stored_paths = (task.source_path, task.result_dir)
+    report_paths = [
+        to_abs_data_path(report.file_path)
+        for report in db.query(DetectionReport)
+        .filter(DetectionReport.video_id == video_id)
+        .all()
+        if report.file_path
+    ]
     db.query(DetectionReport).filter(
         DetectionReport.video_id == video_id,
     ).delete(synchronize_session=False)
     db.query(Fish).filter(
         Fish.video_id == video_id,
     ).delete(synchronize_session=False)
+    db.query(Stats5Min).filter(Stats5Min.video_id == video_id).delete(synchronize_session=False)
+    db.query(VideoFrame).filter(VideoFrame.video_id == video_id).delete(synchronize_session=False)
+    db.query(FrameFishDetection).filter(FrameFishDetection.video_id == video_id).delete(synchronize_session=False)
+    db.query(CameraRecordSchedule).filter(CameraRecordSchedule.video_id == video_id).update(
+        {CameraRecordSchedule.video_id: None}, synchronize_session=False
+    )
     db.delete(task)
     db.commit()
     _refresh_daily_reports(db, affected_dates)
     for stored_path in stored_paths:
         path = to_abs_data_path(stored_path) if stored_path else None
-        if path and path.exists() and DATA_DIR in path.parents:
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                path.unlink(missing_ok=True)
+        _remove_data_path(path)
+    for report_path in report_paths:
+        _remove_data_path(report_path)
     return {"ok": True, "video_id": video_id, "deleted": True}
 
 
@@ -578,7 +652,8 @@ def get_video(video_id: str, db: Session = Depends(get_db)) -> dict:
 
     created_at_bj = to_beijing(obj.created_at)
     started_at_bj = to_beijing(obj.started_at)
-    finished_at_bj = to_beijing(obj.finished_at)
+    raw_finished_at_bj = to_beijing(obj.finished_at)
+    finished_at_bj = to_beijing(task_effective_finished_at(obj))
 
     # 鱼数量统一以 fish 表为准（鱼条数是"产出了多少条鱼"的事实）。
     from app.repositories.models import Fish
@@ -604,27 +679,26 @@ def get_video(video_id: str, db: Session = Depends(get_db)) -> dict:
         )
 
     # 视频文件真实时长（通过 cv2 probe，失败回退 None）
-    video_duration_seconds = (
-        float(obj.video_duration_seconds)
-        if obj.video_duration_seconds is not None
-        else _probe_video_duration_seconds(obj.source_path)
+    video_duration_seconds = task_video_duration_seconds(obj)
+    recording_started = task_recording_started_at(
+        obj,
+        media_duration_seconds=video_duration_seconds,
     )
+    recording_finished = task_recording_finished_at(
+        obj,
+        start=recording_started,
+        media_duration_seconds=video_duration_seconds,
+    )
+    recording_started_at_bj = to_beijing(recording_started)
+    recording_finished_at_bj = to_beijing(recording_finished)
 
     # 检测耗时：finished - started；进行中 = now - started
     from app.utils.time_utils import now_beijing
-    duration_seconds: float | None = (
-        float(obj.processing_duration_seconds)
-        if obj.processing_duration_seconds is not None
-        else None
+    duration_seconds = task_processing_duration_seconds(
+        obj,
+        now=now_beijing(),
+        include_active=str(obj.status or "").lower() == "processing",
     )
-    if duration_seconds is None and started_at_bj is not None:
-        end_for_calc = finished_at_bj if finished_at_bj is not None else now_beijing()
-        try:
-            duration_seconds = round(
-                (end_for_calc - started_at_bj).total_seconds(), 2
-            )
-        except Exception:
-            duration_seconds = None
 
     return {
         "video_id": obj.video_id,
@@ -641,10 +715,14 @@ def get_video(video_id: str, db: Session = Depends(get_db)) -> dict:
         "created_at": created_at_bj.isoformat() if created_at_bj else None,
         "started_at": started_at_bj.isoformat() if started_at_bj else None,
         "finished_at": finished_at_bj.isoformat() if finished_at_bj else None,
+        "raw_finished_at": raw_finished_at_bj.isoformat() if raw_finished_at_bj else None,
+        "recording_started_at": recording_started_at_bj.isoformat() if recording_started_at_bj else None,
+        "recording_finished_at": recording_finished_at_bj.isoformat() if recording_finished_at_bj else None,
         "duration_seconds": duration_seconds,
+        "processing_duration_seconds": duration_seconds,
         "video_duration_seconds": video_duration_seconds,
         "playback_url": playback_url,
-        "source_type": obj.source_type,
+        "aquaculture_bin": obj.aquaculture_bin,
     }
 
 
@@ -664,42 +742,44 @@ def get_video_detail(video_id: str, request: Request, db: Session = Depends(get_
     started_at_bj = to_beijing(obj.started_at)
     finished_at_bj = to_beijing(obj.finished_at)
 
-    video_duration_seconds = (
-        float(obj.video_duration_seconds)
-        if obj.video_duration_seconds is not None
-        else _probe_video_duration_seconds(source_path)
+    video_duration_seconds = task_video_duration_seconds(obj, stored_path=source_path)
+    recording_started = task_recording_started_at(
+        obj,
+        media_duration_seconds=video_duration_seconds,
     )
-    duration_seconds: float | None = (
-        float(obj.processing_duration_seconds)
-        if obj.processing_duration_seconds is not None
-        else None
+    recording_finished = task_recording_finished_at(
+        obj,
+        start=recording_started,
+        media_duration_seconds=video_duration_seconds,
     )
-    if duration_seconds is None and started_at_bj is not None:
-        from app.utils.time_utils import now_beijing
-        end_for_calc = finished_at_bj if finished_at_bj is not None else now_beijing()
-        try:
-            duration_seconds = round(
-                (end_for_calc - started_at_bj).total_seconds(), 2
-            )
-        except Exception:
-            duration_seconds = None
+    recording_started_at_bj = to_beijing(recording_started)
+    recording_finished_at_bj = to_beijing(recording_finished)
+    from app.utils.time_utils import now_beijing
+    duration_seconds = task_processing_duration_seconds(
+        obj,
+        now=now_beijing(),
+        include_active=str(obj.status or "").lower() == "processing",
+    )
 
     return {
         "video_id": obj.video_id,
         "status": obj.status,
-        "source_type": obj.source_type,
         "total_fish": obj.total_fish,
         "processed_fish": obj.processed_fish,
         "created_at": created_at_bj.isoformat() if created_at_bj else None,
         "started_at": started_at_bj.isoformat() if started_at_bj else None,
         "finished_at": finished_at_bj.isoformat() if finished_at_bj else None,
+        "recording_started_at": recording_started_at_bj.isoformat() if recording_started_at_bj else None,
+        "recording_finished_at": recording_finished_at_bj.isoformat() if recording_finished_at_bj else None,
         "video_duration_seconds": video_duration_seconds,
         "duration_seconds": duration_seconds,
+        "processing_duration_seconds": duration_seconds,
         "playback_url": playback_url,
         "video_exists": video_exists,
         "playable": obj.status == "done" and video_exists,
         "play_url": f"{base_url}/api/videos/{video_id}/play" if obj.status == "done" and video_exists else None,
         "source_path": source_path,
+        "aquaculture_bin": obj.aquaculture_bin,
     }
 
 
@@ -712,7 +792,7 @@ def play_video(video_id: str, db: Session = Depends(get_db)):
     if obj.status != "done":
         return JSONResponse(content={"error": "视频仍在处理中，请等待完成后播放"}, status_code=400)
 
-    abs_video_path = to_abs_data_path(source_path)
+    abs_video_path = to_abs_data_path(obj.source_path)
     if not abs_video_path or not os.path.exists(abs_video_path):
         return JSONResponse(content={"error": "Video file not found"}, status_code=404)
 
@@ -744,13 +824,22 @@ def get_video_playback(video_id: str, db: Session = Depends(get_db)):
       - 如果生成失败，返回 5xx + error_message。
       - 视频文件不存在则返回 404。
     """
-    from app.services.video_playback_service import ensure_browser_playable_video
+    from app.services.video_playback_service import (
+        ensure_browser_playable_video,
+        get_result_video_playback,
+    )
 
     # 优先看 video_task，但 video_task 不存在也不强制要求 source_path 有值
     obj = session_repo.get_video_task(db, video_id=video_id)
     video_status = obj.status if obj else None
 
     result = ensure_browser_playable_video(video_id, stored_path=obj.source_path if obj else None)
+    playback_notice = None
+    if not result.get("ok") and result.get("error_code") == "VIDEO_FILE_NOT_FOUND":
+        fallback = get_result_video_playback(video_id)
+        if fallback.get("ok"):
+            result = fallback
+            playback_notice = "源视频文件已缺失，当前播放检测结果视频。"
     if not result.get("ok"):
         code = result.get("error_code") or "VIDEO_PLAYBACK_FAILED"
         if code == "VIDEO_FILE_NOT_FOUND":
@@ -785,6 +874,8 @@ def get_video_playback(video_id: str, db: Session = Depends(get_db)):
         "converted": bool(result.get("converted")),
         "cached": bool(result.get("cached")),
         "video_status": video_status,
+        "playback_kind": result.get("playback_kind", "source"),
+        "playback_notice": playback_notice,
     }
 
 
@@ -860,13 +951,12 @@ def export_videos(db: Session = Depends(get_db)):
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["video_id", "source_type", "status", "total_fish", "created_at", "source_path"])
+    writer.writerow(["video_id", "status", "total_fish", "created_at", "source_path"])
 
     for v in videos:
         created = to_beijing(v.created_at).strftime("%Y-%m-%d %H:%M") if v.created_at else ""
         writer.writerow([
             v.video_id,
-            v.source_type or "",
             v.status or "",
             v.total_fish or 0,
             created,
@@ -994,17 +1084,17 @@ def list_all_fishes(
     if fish_id:
         filters.append(Fish.fish_id.like(f"%{fish_id}%"))
     if min_length is not None:
-        filters.append(Fish.body_length >= min_length)
+        filters.append(Fish.body_length_cm >= min_length)
     if max_length is not None:
-        filters.append(Fish.body_length <= max_length)
+        filters.append(Fish.body_length_cm <= max_length)
     if min_weight is not None:
-        filters.append(Fish.body_weight >= min_weight)
+        filters.append(Fish.pred_weight_g >= min_weight)
     if max_weight is not None:
-        filters.append(Fish.body_weight <= max_weight)
+        filters.append(Fish.pred_weight_g <= max_weight)
     if min_height is not None:
-        filters.append(Fish.body_height >= min_height)
+        filters.append(Fish.body_height_cm >= min_height)
     if max_height is not None:
-        filters.append(Fish.body_height <= max_height)
+        filters.append(Fish.body_height_cm <= max_height)
     if min_condition is not None:
         filters.append(Fish.condition_factor >= min_condition)
     if max_condition is not None:
@@ -1101,10 +1191,10 @@ def list_all_fishes(
                 "display_image_url": display_image_url,
                 "image_source_type": image_source_type,
                 # 体征
-                "body_length": f.body_length,
-                "body_length_without_tail": f.body_length_without_tail,
-                "body_height": f.body_height,
-                "body_weight": f.body_weight,
+                "body_length": f.body_length_cm,
+                "body_length_without_tail": f.body_length_no_tail_cm,
+                "body_height": f.body_height_cm,
+                "body_weight": f.pred_weight_g,
                 "condition_factor": f.condition_factor,
                 # 损伤（数值占比 + 原始类型字符串保留）
                 "surface_damage": f.surface_damage,
@@ -1198,10 +1288,10 @@ def fish_detail(fish_id: str, db: Session = Depends(get_db)) -> dict:
         "bbox": [f.bbox_x1, f.bbox_y1, f.bbox_x2, f.bbox_y2]
         if f.bbox_x1 is not None
         else None,
-        "body_length": f.body_length,
-        "body_length_without_tail": f.body_length_without_tail,
-        "body_height": f.body_height,
-        "body_weight": f.body_weight,
+        "body_length": f.body_length_cm,
+        "body_length_without_tail": f.body_length_no_tail_cm,
+        "body_height": f.body_height_cm,
+        "body_weight": f.pred_weight_g,
         "condition_factor": f.condition_factor,
         "surface_damage": f.surface_damage,
         "surface_damage_ratio": surface_damage_ratio,
@@ -1224,7 +1314,9 @@ def delete_fish(fish_id: str, db: Session = Depends(get_db)) -> dict:
     if f is None:
         return {"status": "not_found", "fish_id": fish_id}
 
+    video_id = f.video_id
     db.execute(delete(Fish).where(Fish.fish_id == fish_id))
+    _refresh_video_task_counts(db, {video_id})
     db.commit()
     return {"status": "deleted", "fish_id": fish_id}
 
@@ -1232,13 +1324,20 @@ def delete_fish(fish_id: str, db: Session = Depends(get_db)) -> dict:
 @router.post("/fishes/batch-delete")
 def batch_delete_fishes(body: dict, db: Session = Depends(get_db)) -> dict:
     from app.repositories.models import Fish
-    from sqlalchemy import delete
+    from sqlalchemy import delete, select
 
     fish_ids = body.get("fish_ids", [])
     if not fish_ids:
         return {"status": "error", "message": "fish_ids is required"}
 
+    video_ids = {
+        str(video_id)
+        for video_id in db.execute(
+            select(Fish.video_id).where(Fish.fish_id.in_(fish_ids))
+        ).scalars().all()
+    }
     result = db.execute(delete(Fish).where(Fish.fish_id.in_(fish_ids)))
+    _refresh_video_task_counts(db, video_ids)
     db.commit()
     return {"status": "deleted", "count": result.rowcount}
 
@@ -1377,7 +1476,7 @@ def export_fishes(body: dict, db: Session = Depends(get_db)):
 
     fields = body.get("fields", [])
     if not fields:
-        fields = ["fish_id", "video_id", "body_length", "body_height", "body_weight", "condition_factor", "surface_damage", "confidence", "created_at"]
+        fields = ["fish_id", "video_id", "body_length_cm", "body_length_no_tail_cm", "body_height_cm", "pred_weight_g", "condition_factor", "surface_damage_ratio", "confidence", "created_at"]
 
     stmt = select(Fish).order_by(Fish.created_at.desc())
     fishes = db.execute(stmt).scalars().all()

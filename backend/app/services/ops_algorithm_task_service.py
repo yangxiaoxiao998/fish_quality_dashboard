@@ -29,9 +29,10 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
@@ -40,6 +41,7 @@ from app.paths import DATA_DIR, JOBS_DIR, RESULTS_DIR, VID_DIR
 from app.repositories.db import SessionLocal
 from app.repositories.models import VideoTask
 from app.services.path_service import to_abs_data_path
+from app.services.video_playback_service import resolve_canonical_video_path
 
 logger = logging.getLogger("ops_algorithm_task_service")
 
@@ -90,6 +92,7 @@ STUCK_THRESHOLD_SECONDS = 10 * 60  # 10 分钟没动 + 仍在 processing/queued 
 # 日志读取限制
 LOG_TAIL_LINES = 200
 LOG_TAIL_CHARS = 12000
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +205,7 @@ def find_worker_log_tail(
     *,
     log_path: Optional[Path] = None,
     max_bytes: int = 2 * 1024 * 1024,
-    context_lines: int = 50,
+    context_lines: int = 15,
     max_chars: int = LOG_TAIL_CHARS,
 ) -> dict[str, Any]:
     """
@@ -210,7 +213,12 @@ def find_worker_log_tail(
     为了避免读巨大文件，只从文件尾部读 max_bytes 字节。
     """
     if log_path is None:
-        log_path = DATA_DIR / "logs" / "backend_worker.log"
+        candidates = [
+            DATA_DIR / "logs" / "runtime" / "worker.log",
+            DATA_DIR / "logs" / "backend_worker.log",
+            DATA_DIR / "logs" / "worker.log",
+        ]
+        log_path = next((p for p in candidates if p.is_file()), candidates[0])
 
     info: dict[str, Any] = {
         "path": str(log_path) if log_path else None,
@@ -466,6 +474,123 @@ def _parse_log_stages(log_text: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _parse_runtime_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=LOCAL_TZ)
+    return parsed.astimezone(timezone.utc)
+
+
+def _timing_entry(value: Any) -> dict[str, Any]:
+    if isinstance(value, (int, float)):
+        return {"elapsed_seconds": float(value), "timing_source": "recorded"}
+    if not isinstance(value, dict):
+        return {}
+    started = _parse_runtime_datetime(value.get("started_at"))
+    finished = _parse_runtime_datetime(value.get("finished_at"))
+    elapsed = value.get("elapsed_seconds")
+    if not isinstance(elapsed, (int, float)) and started and finished:
+        elapsed = max(0.0, (finished - started).total_seconds())
+    return {
+        "started_at": started.isoformat() if started else None,
+        "finished_at": finished.isoformat() if finished else None,
+        "elapsed_seconds": float(elapsed) if isinstance(elapsed, (int, float)) else None,
+        "timing_source": "recorded",
+    }
+
+
+def _historical_stage_estimates(
+    video_id: str, pipeline_state: Optional[dict], video_task: VideoTask
+) -> dict[str, dict[str, Any]]:
+    """Recover approximate timings for tasks created before timing persistence."""
+    if not isinstance(pipeline_state, dict):
+        return {}
+    started = _parse_runtime_datetime(pipeline_state.get("started_at"))
+    finished = _parse_runtime_datetime(
+        pipeline_state.get("finished_at") or pipeline_state.get("updated_at")
+    )
+    if not started:
+        started = _parse_runtime_datetime(getattr(video_task, "started_at", None))
+    if not finished:
+        finished = _parse_runtime_datetime(getattr(video_task, "finished_at", None))
+    if not started or not finished or finished <= started:
+        return {}
+
+    job_root = JOBS_DIR / video_id
+    boundary_paths = {
+        "video_to_frames": job_root / "frames" / "raw",
+        "grounded_sam": job_root / "videos" / "grounded_sam.mp4",
+        "fish_condition": job_root / "measurements" / "long_height_weight_results.csv",
+        "publish_results": RESULTS_DIR / video_id / "reports" / "pipeline_result.json",
+    }
+    boundaries: dict[str, datetime] = {}
+    for key, path in boundary_paths.items():
+        try:
+            if path.exists():
+                boundaries[key] = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            pass
+    filter_candidates = [
+        job_root / "crop_images" / "complete_match",
+        job_root / "crop_images" / "incomplete_match",
+    ]
+    filter_mtimes: list[float] = []
+    for path in filter_candidates:
+        try:
+            if path.exists():
+                filter_mtimes.append(path.stat().st_mtime)
+        except OSError:
+            pass
+    if filter_mtimes:
+        boundaries["filter_complete_fish"] = datetime.fromtimestamp(
+            max(filter_mtimes), tz=timezone.utc
+        )
+
+    def entry(start: datetime, end: datetime) -> dict[str, Any]:
+        return {
+            "started_at": start.isoformat(),
+            "finished_at": end.isoformat(),
+            "elapsed_seconds": max(0.0, (end - start).total_seconds()),
+            "timing_source": "estimated",
+        }
+
+    estimates: dict[str, dict[str, Any]] = {}
+    cursor = started
+    raw_end = boundaries.get("video_to_frames")
+    calibrate_end = started
+    estimates["calibrate"] = entry(started, calibrate_end)
+    if raw_end and cursor <= raw_end <= finished:
+        estimates["video_to_frames"] = entry(cursor, raw_end)
+        cursor = raw_end
+
+    grounded_end = boundaries.get("grounded_sam")
+    if grounded_end and cursor <= grounded_end <= finished:
+        combined = max(0.0, (grounded_end - cursor).total_seconds())
+        adjust_end = cursor + timedelta(seconds=combined * 0.2)
+        estimates["adjust_batch"] = entry(cursor, adjust_end)
+        estimates["grounded_sam"] = entry(adjust_end, grounded_end)
+        cursor = grounded_end
+
+    for key in ("filter_complete_fish", "fish_condition", "publish_results"):
+        boundary = boundaries.get(key)
+        if key == "publish_results" and (
+            not boundary or boundary < cursor or boundary > finished
+        ):
+            boundary = finished
+        if boundary and cursor <= boundary <= finished:
+            estimates[key] = entry(cursor, boundary)
+            cursor = boundary
+    return estimates
+
+
 def _pipeline_state_summary(video_id: str) -> dict[str, Any]:
     """
     读 data/jobs/<video_id>/state/pipeline_state.json，构造一个"日志兜底"摘要。
@@ -640,7 +765,7 @@ def _query_rq_jobs(video_id: str) -> dict[str, Any]:
                         j = Job.fetch(jid, connection=redis)
                     except NoSuchJobError:
                         continue
-                    if j.kwargs.get("upload_video_id") == video_id:
+                    if j.kwargs.get("task_video_id") == video_id:
                         info["job_id"] = jid
                         info["job_state"] = reg_state
                         info["func_name"] = j.func_name
@@ -799,7 +924,7 @@ def _build_stage_timeline(
     completed: set[str] = set()
     failed_stage: Optional[str] = None
     current_stage: Optional[str] = None
-    stage_elapsed: dict[str, float] = {}
+    stage_elapsed: dict[str, dict[str, Any]] = {}
     summary_metrics: dict[str, Any] = {}
 
     if pipeline_result and isinstance(pipeline_result, dict):
@@ -826,8 +951,11 @@ def _build_stage_timeline(
         st = pipeline_state.get("stage_timings") or pipeline_state.get("timings")
         if isinstance(st, dict):
             for k, v in st.items():
-                if isinstance(v, (int, float)):
-                    stage_elapsed[str(k)] = float(v)
+                stage_elapsed[str(k)] = _timing_entry(v)
+
+    historical_timings = _historical_stage_estimates(
+        video_task.video_id, pipeline_state, video_task
+    )
 
     # 日志解析：每个 stage 的 status / input_count / output_count / metrics
     log_stages: dict[str, dict[str, Any]] = _parse_log_stages(log_text or "")
@@ -861,7 +989,16 @@ def _build_stage_timeline(
     for key, name in STAGES:
         # 兼容：把旧 key 映射到新 key
         log_info = log_stages.get(key) or {}
-        elapsed: Optional[float] = stage_elapsed.get(key) or log_info.get("elapsed_seconds")
+        timing = dict(historical_timings.get(key) or {})
+        timing.update(
+            {k: v for k, v in (stage_elapsed.get(key) or {}).items() if v is not None}
+        )
+        elapsed_value = timing.get("elapsed_seconds")
+        elapsed: Optional[float] = (
+            float(elapsed_value)
+            if isinstance(elapsed_value, (int, float))
+            else log_info.get("elapsed_seconds")
+        )
         in_completed = key in completed
         in_failed = failed_stage == key
         in_current = current_stage == key and not in_completed
@@ -882,14 +1019,13 @@ def _build_stage_timeline(
             else:
                 status = "pending"
 
-        if status == "running" and base_started:
+        if status == "running":
             try:
-                base_dt = (
-                    base_started
-                    if base_started.tzinfo
-                    else base_started.replace(tzinfo=timezone.utc)
-                )
-                elapsed = elapsed or max(0.0, (now - base_dt).total_seconds())
+                base_dt = _parse_runtime_datetime(timing.get("started_at"))
+                if base_dt is None and base_started:
+                    base_dt = _parse_runtime_datetime(base_started)
+                if base_dt is not None:
+                    elapsed = max(0.0, (now - base_dt).total_seconds())
             except Exception:
                 pass
 
@@ -898,6 +1034,10 @@ def _build_stage_timeline(
             "name": name,
             "status": status,
             "elapsed_seconds": elapsed,
+            "started_at": timing.get("started_at"),
+            "finished_at": timing.get("finished_at"),
+            "timing_source": timing.get("timing_source")
+            or ("recorded" if elapsed is not None else None),
             "input_count": log_info.get("input_count"),
             "output_count": log_info.get("output_count"),
             "error_message": (
@@ -1183,15 +1323,27 @@ def _read_gpu_info() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _collect_files(video_id: str) -> dict[str, Any]:
+def _collect_files(video_id: str, video_task: Optional[VideoTask] = None) -> dict[str, Any]:
     abs_vid = video_id
     playable = (
         VID_DIR
         / "playable"
         / f"{abs_vid}_h264.mp4"
     )
-    playable_upload = VID_DIR / f"{abs_vid}{'.mp4'}"
     job_root = JOBS_DIR / abs_vid
+    stored_path = video_task.source_path if video_task is not None else None
+    canonical_source = resolve_canonical_video_path(video_id, stored_path=stored_path)
+    source_candidates = [
+        path
+        for path in (
+            to_abs_data_path(stored_path) if stored_path else None,
+            VID_DIR / f"{abs_vid}.mp4",
+            job_root / "input" / f"{abs_vid}_source_video.mp4",
+            RESULTS_DIR / abs_vid / "input" / f"{abs_vid}_source_video.mp4",
+        )
+        if path is not None
+    ]
+    playable_upload = canonical_source or source_candidates[0]
     pipeline_state = job_root / "state" / "pipeline_state.json"
     final_results = RESULTS_DIR / abs_vid
     pipeline_result = final_results / "reports" / "pipeline_result.json"
@@ -1213,7 +1365,10 @@ def _collect_files(video_id: str) -> dict[str, Any]:
     grounded_video = final_results / "videos" / "grounded_sam.mp4"
     return {
         "playable_h264": _file_info(playable),
-        "playable_mp4": _file_info(playable_upload),
+        "playable_mp4": {
+            **_file_info(playable_upload),
+            "candidates": [str(path) for path in source_candidates],
+        },
         "job_root": _file_info(job_root),
         "pipeline_state_json": _file_info(pipeline_state),
         "pipeline_result_json": _file_info(pipeline_result),
@@ -1241,7 +1396,6 @@ def _video_task_to_dict(vt: VideoTask) -> dict[str, Any]:
 
     return {
         "video_id": vt.video_id,
-        "source_type": vt.source_type,
         "status": vt.status,
         "current_algorithm": vt.current_algorithm,
         "total_fish": int(vt.total_fish or 0),
@@ -1318,6 +1472,8 @@ def get_algorithm_summary() -> dict[str, Any]:
         logger.warning("query summary failed: %s", exc)
 
     rq_counts = _count_jobs_by_state()
+    from app.workers.queue import DEFAULT_QUEUE_NAME
+
     # 复用 _count_jobs_by_state 里的 redis_ok / error_message，避免两边不一致
     redis_ok = bool(rq_counts.get("redis_ok", False))
     worker_error = rq_counts.get("error_message")
@@ -1327,7 +1483,7 @@ def get_algorithm_summary() -> dict[str, Any]:
         "data": {
             **counts,
             "worker": {
-                "queue": "fish",
+                "queue": DEFAULT_QUEUE_NAME,
                 **rq_counts,
                 "redis_ok": redis_ok,
                 "error_message": worker_error,
@@ -1376,7 +1532,7 @@ def list_algorithm_tasks(
         log_path = find_latest_algorithm_log(r.video_id)
         log_info = parse_algorithm_log(log_path) if log_path else {}
         log_text = _safe_read_text(log_path) if log_path else ""
-        files = _collect_files(r.video_id)
+        files = _collect_files(r.video_id, r)
         pr, pr_err = _read_json(
             RESULTS_DIR / r.video_id / "reports" / "pipeline_result.json"
         )
@@ -1425,7 +1581,6 @@ def list_algorithm_tasks(
         items.append(
             {
                 "video_id": r.video_id,
-                "source_type": r.source_type,
                 "status": r.status,
                 "display_status": display_status,
                 "is_stuck": is_stuck,
@@ -1560,7 +1715,7 @@ def get_algorithm_task_detail(video_id: str) -> dict[str, Any]:
     log_path = find_latest_algorithm_log(video_id)
     log_info = parse_algorithm_log(log_path) if log_path else {}
     log_text = _safe_read_text(log_path) if log_path else ""
-    files = _collect_files(video_id)
+    files = _collect_files(video_id, vt)
     pr, pr_err = _read_json(
         RESULTS_DIR / video_id / "reports" / "pipeline_result.json"
     )
@@ -1715,8 +1870,26 @@ def get_algorithm_task_detail(video_id: str) -> dict[str, Any]:
         diagnosis_lines.append(
             f"latest algorithm CLI returncode={log_info.get('returncode')}"
         )
-    if not files["playable_h264"]["exists"]:
-        diagnosis_lines.append("缺少 playable H.264 MP4，可能上游没成功生成。")
+    total_elapsed_seconds = getattr(vt, "processing_duration_seconds", None)
+    if not isinstance(total_elapsed_seconds, (int, float)) and isinstance(ps, dict):
+        total_elapsed_seconds = ps.get("elapsed_seconds")
+    if (
+        not isinstance(total_elapsed_seconds, (int, float))
+        and vt.started_at
+        and finished_at_normalized
+    ):
+        start_dt = _parse_runtime_datetime(vt.started_at)
+        end_dt = _parse_runtime_datetime(finished_at_normalized)
+        if start_dt and end_dt:
+            total_elapsed_seconds = max(0.0, (end_dt - start_dt).total_seconds())
+    if display_status in {"processing", "stuck"}:
+        live_start = _parse_runtime_datetime(
+            (ps or {}).get("started_at") if isinstance(ps, dict) else None
+        ) or _parse_runtime_datetime(vt.started_at)
+        if live_start:
+            total_elapsed_seconds = max(
+                0.0, (datetime.now(timezone.utc) - live_start).total_seconds()
+            )
 
     return {
         "ok": True,
@@ -1734,6 +1907,7 @@ def get_algorithm_task_detail(video_id: str) -> dict[str, Any]:
                 "parse_error": pr_err,
             },
             "stages": timeline,
+            "total_elapsed_seconds": total_elapsed_seconds,
             "display_status": display_status,
             "is_stuck": is_stuck,
             "stuck_reason": stuck_reason,

@@ -1,0 +1,7 @@
+[Unit]
+Description=Fish Quality Intelligent Detection System
+Wants=fish-quality-mediamtx.service fish-quality-worker.service fish-quality-upgrade-manager.service fish-quality-backend.service fish-quality-frontend.service fish-quality-watchdog.service
+After=network-online.target
+
+[Install]
+WantedBy=default.target

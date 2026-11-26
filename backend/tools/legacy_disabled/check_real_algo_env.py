@@ -75,7 +75,6 @@ def check_file(path: Path, required: bool = True) -> bool:
 
 
 def main() -> int:
-    os.environ.setdefault("FISH_ALGO_MODE", "real")
 
     ok = True
 

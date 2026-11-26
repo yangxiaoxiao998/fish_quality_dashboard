@@ -51,9 +51,9 @@ class VideoTask(Base):
     # 用户为视频任务填写的养鱼仓名称。
     aquaculture_bin: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    source_type: Mapped[str] = mapped_column(
-        String(32), default="upload"
-    )  # upload / rtsp
+    # 入队时保存的传送带方向设置，确保任务使用入队时的配置而非当前配置
+    conveyor_direction: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
     source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     rtsp_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -110,6 +110,10 @@ class VideoTask(Base):
         DateTime(timezone=True), nullable=True
     )
     finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 摄像头真正收到第一帧的时间。与 started_at（算法开始）严格分开。
+    recording_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 

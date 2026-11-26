@@ -70,6 +70,44 @@ def run_health_check_hook(task: dict[str, Any]) -> dict[str, Any]:
     precheck = metadata.get("precheck") if isinstance(metadata.get("precheck"), dict) else {}
     healthcheck_url = str(precheck.get("healthcheck") or "http://127.0.0.1:8000/api/health").strip()
 
+    # The packaged backend bundles the shell/Python health script inside
+    # PyInstaller's read-only _internal directory.  Use the HTTP endpoint for
+    # frozen/artifact installations instead of trying to execute source-mode
+    # ``python`` helper snippets or mutate bundled files.
+    if bool(getattr(sys, "frozen", False)) or (
+        (storage.INSTALL_ROOT / "fish-quality-backend").is_file()
+        and (storage.INSTALL_ROOT / "config").is_dir()
+    ):
+        deadline = time.time() + 90
+        last_error = ""
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(healthcheck_url, timeout=3) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                if isinstance(payload, dict) and (
+                    payload.get("status") == "ok" or payload.get("ok") is True
+                ):
+                    return {
+                        "ok": True,
+                        "hook": "health_check",
+                        "task_id": task.get("task_id"),
+                        "url": healthcheck_url,
+                        "health": payload,
+                        "fallback": "packaged_http",
+                    }
+                last_error = f"unexpected health payload: {payload!r}"
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+                last_error = str(exc)
+            time.sleep(1)
+        return {
+            "ok": False,
+            "hook": "health_check",
+            "task_id": task.get("task_id"),
+            "url": healthcheck_url,
+            "error": last_error or "packaged backend health check timed out",
+            "fallback": "packaged_http",
+        }
+
     if not script_path.exists():
         deadline = time.time() + 30
         last_error = ""

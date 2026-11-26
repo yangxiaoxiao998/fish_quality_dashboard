@@ -31,8 +31,8 @@ http://raspberrypi.local:9000
 rtmp://192.168.31.254:1935/fish_camera
 主机后端从 MediaMTX 拉流：
 rtmp://192.168.31.254:1935/fish_camera
-# 后台接口查询所有视频（含摄像头）
-curl "http://127.0.0.1:8000/api/videos?source_type=rtsp"
+# 后台接口查询摄像头视频历史
+curl "http://127.0.0.1:8000/api/camera_yzt/history"
 # 启动树莓派摄像头录制
 curl -X POST "http://192.168.31.254:1935/api/camera_yzt/start" -H "Content-Type: application/json" -d '{"stream_url": "rtmp://127.0.0.1:8000/fish_camera"}'
 # 等待一段时间后停止

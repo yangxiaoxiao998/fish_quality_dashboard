@@ -45,9 +45,21 @@ from config.paths import (  # noqa: E402
 
 
 def now_str() -> str:
-    """返回形如 ``2026-07-04 15:30:12`` 的本地时间字符串。"""
+    """返回带本地时区的 ISO 8601 时间字符串。"""
 
-    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _parse_time(value: Any) -> _dt.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.datetime.now().astimezone().tzinfo)
+    return parsed
 
 
 def atomic_write_json(path: Path, payload: dict, *, ensure_ascii: bool = False, indent: int = 2) -> None:
@@ -167,6 +179,9 @@ class PipelineState:
                 "completed_stages": [],
                 "failed_stage": "",
                 "error_message": "",
+                "stage_timings": {},
+                "finished_at": "",
+                "elapsed_seconds": None,
                 "command": list(command) if command is not None else [],
                 "input_video": "",
                 "result_dir": "",
@@ -192,11 +207,30 @@ class PipelineState:
         self.touch()
 
     def start_stage(self, stage: str) -> None:
+        now = now_str()
+        self.payload.setdefault("stage_timings", {})[stage] = {
+            "status": STATE_RUNNING,
+            "started_at": now,
+            "finished_at": "",
+            "elapsed_seconds": None,
+        }
         self.payload["status"] = STATE_RUNNING
         self.payload["current_stage"] = stage
         self.touch()
 
     def complete_stage(self, stage: str) -> None:
+        now = now_str()
+        timing = self.payload.setdefault("stage_timings", {}).setdefault(
+            stage, {"started_at": now}
+        )
+        started = _parse_time(timing.get("started_at"))
+        finished = _parse_time(now)
+        timing.update({
+            "status": STATE_DONE,
+            "finished_at": now,
+            "elapsed_seconds": round(max(0.0, (finished - started).total_seconds()), 3)
+            if started and finished else None,
+        })
         if stage not in self.payload["completed_stages"]:
             self.payload["completed_stages"].append(stage)
         if self.payload.get("current_stage") == stage:
@@ -205,26 +239,64 @@ class PipelineState:
         self.touch()
 
     def fail(self, stage: str, error: str) -> None:
+        now = now_str()
+        timing = self.payload.setdefault("stage_timings", {}).setdefault(
+            stage, {"started_at": now}
+        )
+        started = _parse_time(timing.get("started_at"))
+        finished = _parse_time(now)
+        timing.update({
+            "status": STATE_FAILED,
+            "finished_at": now,
+            "elapsed_seconds": round(max(0.0, (finished - started).total_seconds()), 3)
+            if started and finished else None,
+            "error_message": error,
+        })
         self.payload["status"] = STATE_FAILED
         self.payload["failed_stage"] = stage
         self.payload["current_stage"] = stage
         self.payload["error_message"] = error
+        self.payload["finished_at"] = now
+        pipeline_started = _parse_time(self.payload.get("started_at"))
+        self.payload["elapsed_seconds"] = (
+            round(max(0.0, (finished - pipeline_started).total_seconds()), 3)
+            if pipeline_started and finished else None
+        )
         self.touch()
 
     def interrupted(self, stage: str, reason: str) -> None:
+        now = now_str()
         self.payload["status"] = STATE_INTERRUPTED
         self.payload["failed_stage"] = stage or self.payload.get("failed_stage", "")
         if reason:
             self.payload["error_message"] = reason
+        self.payload["finished_at"] = now
+        started = _parse_time(self.payload.get("started_at"))
+        finished = _parse_time(now)
+        self.payload["elapsed_seconds"] = (
+            round(max(0.0, (finished - started).total_seconds()), 3)
+            if started and finished else None
+        )
         self.touch()
 
     def publishing(self) -> None:
+        self.start_stage("publish_results")
         self.payload["status"] = STATE_PUBLISHING
         self.touch()
 
     def done(self) -> None:
+        if self.payload.get("current_stage") == "publish_results":
+            self.complete_stage("publish_results")
+        finished_at = now_str()
+        started = _parse_time(self.payload.get("started_at"))
+        finished = _parse_time(finished_at)
         self.payload["status"] = STATE_DONE
         self.payload["current_stage"] = ""
+        self.payload["finished_at"] = finished_at
+        self.payload["elapsed_seconds"] = (
+            round(max(0.0, (finished - started).total_seconds()), 3)
+            if started and finished else None
+        )
         self.touch()
 
     def touch(self) -> None:

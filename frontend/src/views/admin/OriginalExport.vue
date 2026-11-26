@@ -77,6 +77,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import dayjs from 'dayjs'
+import fishPlaceholder from '@/assets/images/fish-placeholder.svg'
 
 const startDate = ref('')
 const endDate = ref('')
@@ -98,7 +99,7 @@ interface ImageItem {
 
 const mockImages: ImageItem[] = Array.from({ length: 50 }, (_, i) => ({
   id: `img_${i}`,
-  url: '/src/assets/images/test-thumb.jpg',
+  url: fishPlaceholder,
   name: `original_${String(i + 1).padStart(4, '0')}.jpg`,
   time: `2026-03-0${(i % 9) + 1} ${String((i % 12) + 8).padStart(2, '0')}:${String((i * 7) % 60).padStart(2, '0')}`
 }))

@@ -12,6 +12,12 @@ RUNTIME_DIR="$PROJECT_ROOT_REAL/.runtime"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 
+if command -v systemctl >/dev/null 2>&1 \
+   && systemctl --user is-active --quiet fish-quality.target 2>/dev/null; then
+  echo "[stop_dev] stopping systemd user target..."
+  systemctl --user stop fish-quality.target || true
+fi
+
 MEDIAMTX_BIN="$PROJECT_ROOT_REAL/mediamtx/mediamtx"
 MEDIAMTX_CFG="$PROJECT_ROOT_REAL/mediamtx/mediamtx.yml"
 

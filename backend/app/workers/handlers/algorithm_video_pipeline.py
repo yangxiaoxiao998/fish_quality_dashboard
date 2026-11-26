@@ -125,23 +125,15 @@ def _canonicalize_source_video(video_id: str | None, input_video: str) -> str:
 
 
 def _cleanup_video_copies(video_id: str | None) -> None:
-    if not video_id:
-        return
-    try:
-        from app.paths import DATA_DIR, JOBS_DIR, RESULTS_DIR
+    """保留算法任务的源视频副本。
 
-        canonical = DATA_DIR / "uploads" / "videos" / "playable" / f"{video_id}_h264.mp4"
-        candidates = [
-            DATA_DIR / "uploads" / "videos" / f"{video_id}.mp4",
-            DATA_DIR / "uploads" / "videos" / f"{video_id}_h264.mp4",
-            JOBS_DIR / video_id / "input" / f"{video_id}_source_video.mp4",
-            RESULTS_DIR / video_id / "input" / f"{video_id}_source_video.mp4",
-        ]
-        for path in candidates:
-            if path != canonical:
-                path.unlink(missing_ok=True)
-    except Exception:
-        logger.exception("cleanup source copies failed: %s", video_id)
+    这个函数保留为兼容入口，但不再删除 ``jobs/input`` 或
+    ``results/input`` 中的源视频。原始录像、任务输入副本和长期结果副本
+    都是视频详情回放与故障恢复的候选来源；只有在用户显式删除任务或执行
+    专门的数据迁移/清理操作时，才允许移除这些文件。
+    """
+    if video_id:
+        logger.info("retain source video copies for task: %s", video_id)
 
 
 def _generate_video_report_after_import(video_id: str | None) -> dict[str, Any]:
@@ -237,19 +229,20 @@ def _generate_daily_report_after_task(video_id: str | None) -> dict[str, Any]:
 def run_algorithm_video_pipeline(
     *,
     input_video: str,
-    upload_video_id: str | None = None,
+    task_video_id: str | None = None,
     camera_id: str = "default",
     device: str = "cuda",
     video_fps: int = 25,
     overwrite: bool = True,
     task_token: str | None = None,
     force_all_complete: bool = False,
+    conveyor_direction: str | None = None,
 ) -> dict[str, Any]:
     """
     入口函数：
 
     1. 标记 video_task=processing
-    2. 调用 algorithm_cli_service.run_video_pipeline_cli(input_video=..., video_id=upload_video_id)
+    2. 调用 algorithm_cli_service.run_video_pipeline_cli(input_video=..., video_id=task_video_id)
     3. CLI 失败 → 标记 video_task=failed + last_error，保留现场，立刻返回 ok=False，**不要** import
     4. CLI 成功 → 读 pipeline_result.json，调用 import_pipeline_result_payload_to_db
     5. 更新 video_task 状态（done / failed）
@@ -259,25 +252,37 @@ def run_algorithm_video_pipeline(
     abs_input = str(Path(input_video).expanduser().resolve()) if input_video else ""
     # retry 传入的路径可能来自 dist_release 或旧数据库记录；按 video_id
     # 重新解析本项目的 playable 文件，避免跨部署目录污染算法输入。
-    if upload_video_id:
-        canonical = _canonicalize_source_video(upload_video_id, abs_input)
+    if task_video_id:
+        canonical = _canonicalize_source_video(task_video_id, abs_input)
         if canonical:
             abs_input = canonical
 
     if not abs_input or not Path(abs_input).is_file():
         err_summary = f"算法输入视频不存在：{abs_input or '(empty)'}"
-        _mark_video_task_failed(upload_video_id, err_summary)
+        _mark_video_task_failed(task_video_id, err_summary)
         return {
             "ok": False,
-            "upload_video_id": upload_video_id,
+            "task_video_id": task_video_id,
             "status": "failed",
             "error_message": err_summary,
         }
 
-    if _is_cancelled(upload_video_id, task_token):
-        return {"ok": False, "upload_video_id": upload_video_id, "status": "failed", "cancelled": True}
+    if _is_cancelled(task_video_id, task_token):
+        return {"ok": False, "task_video_id": task_video_id, "status": "failed", "cancelled": True}
 
-    _mark_video_task_processing(upload_video_id)
+    _mark_video_task_processing(task_video_id)
+
+    # 获取入队时保存的传送带方向设置
+    effective_conveyor_direction = conveyor_direction
+    if not effective_conveyor_direction and task_video_id:
+        from app.repositories.models import VideoTask
+        db = SessionLocal()
+        try:
+            video_task = db.get(VideoTask, task_video_id)
+            if video_task and video_task.conveyor_direction:
+                effective_conveyor_direction = video_task.conveyor_direction
+        finally:
+            db.close()
 
     result = algorithm_cli_service.run_video_pipeline_cli(
         input_video=abs_input,
@@ -287,9 +292,10 @@ def run_algorithm_video_pipeline(
         overwrite=overwrite,
         # 摄像头录制时已经生成了 video_id，必须让算法 CLI 沿用同一 video_id，
         # 避免算法结果目录落在 data/results/<随机 video_id>/ 而非 data/results/<摄像头 video_id>/
-        video_id=upload_video_id,
+        video_id=task_video_id,
         force_all_complete=force_all_complete,
-        cancel_check=lambda: _is_cancelled(upload_video_id, task_token),
+        cancel_check=lambda: _is_cancelled(task_video_id, task_token),
+        conveyor_direction=effective_conveyor_direction,
     )
 
     cli_ok = bool(result.get("ok"))
@@ -297,10 +303,10 @@ def run_algorithm_video_pipeline(
     cli_log_path = result.get("log_path")
     cli_error_message = result.get("error_message")
 
-    if result.get("cancelled") or _is_cancelled(upload_video_id, task_token):
+    if result.get("cancelled") or _is_cancelled(task_video_id, task_token):
         return {
             "ok": False,
-            "upload_video_id": upload_video_id,
+            "task_video_id": task_video_id,
             "status": "failed",
             "cancelled": True,
             "log_path": cli_log_path,
@@ -318,18 +324,18 @@ def run_algorithm_video_pipeline(
         )
         logger.error(
             "[algorithm_video_pipeline] CLI failed: "
-            "upload_video_id=%s returncode=%s log_path=%s",
-            upload_video_id,
+            "task_video_id=%s returncode=%s log_path=%s",
+            task_video_id,
             cli_returncode,
             cli_log_path,
         )
-        _mark_video_task_failed(upload_video_id, err_summary)
-        _clear_partial_task_progress(upload_video_id)
+        _mark_video_task_failed(task_video_id, err_summary)
+        _clear_partial_task_progress(task_video_id)
         # 算法 CLI 失败，但视频数据已生成（playable 等），前端应能看到 status=failed
         return {
             "ok": False,
-            "upload_video_id": upload_video_id,
-            "video_id": result.get("video_id") or upload_video_id,
+            "task_video_id": task_video_id,
+            "video_id": result.get("video_id") or task_video_id,
             "status": "failed",
             "error_message": err_summary[:2000],
             "log_path": cli_log_path,
@@ -337,10 +343,39 @@ def run_algorithm_video_pipeline(
         }
 
     # CLI 成功：读 pipeline_result.json + 入库
-    if _is_cancelled(upload_video_id, task_token):
-        return {"ok": False, "upload_video_id": upload_video_id, "status": "failed", "cancelled": True}
-    video_id = result.get("video_id") or upload_video_id
+    if _is_cancelled(task_video_id, task_token):
+        return {"ok": False, "task_video_id": task_video_id, "status": "failed", "cancelled": True}
     pipeline_result = result.get("pipeline_result") or {}
+    reported_video_id = result.get("video_id") or (
+        pipeline_result.get("video_id")
+        if isinstance(pipeline_result, dict)
+        else None
+    )
+    payload_video_id = (
+        pipeline_result.get("video_id")
+        if isinstance(pipeline_result, dict)
+        else None
+    )
+    if task_video_id and (
+        (reported_video_id and reported_video_id != task_video_id)
+        or (payload_video_id and payload_video_id != task_video_id)
+    ):
+        err_summary = (
+            f"算法返回 video_id={reported_video_id}，与摄像头任务 "
+            f"video_id={task_video_id} 不一致；已拒绝导入，避免创建孤儿任务"
+        )
+        _mark_video_task_failed(task_video_id, err_summary)
+        return {
+            "ok": False,
+            "task_video_id": task_video_id,
+            "video_id": task_video_id,
+            "status": "failed",
+            "error_message": err_summary,
+            "log_path": cli_log_path,
+            "returncode": cli_returncode,
+        }
+
+    video_id = task_video_id or reported_video_id
     status = result.get("status") or (
         pipeline_result.get("status") if isinstance(pipeline_result, dict) else None
     )
@@ -349,32 +384,15 @@ def run_algorithm_video_pipeline(
     if isinstance(pipeline_result, dict) and not pipeline_result.get("video_id"):
         pipeline_result["video_id"] = video_id
 
-    # 兜底 video_id 标注（CLI 跑出来的 video_id 与上传 video_id 不一致时记录到 last_error）
-    if upload_video_id and video_id and video_id != upload_video_id:
-        try:
-            db = SessionLocal()
-            try:
-                upload_task = session_repo.get_video_task(db, video_id=upload_video_id)
-                if upload_task is not None and (not upload_task.last_error):
-                    upload_task.last_error = (
-                        f"算法返回 video_id={video_id}（与上传 video_id 不同），"
-                        f"主结果以算法 video_id 为准。"
-                    )
-                    db.commit()
-            finally:
-                db.close()
-        except Exception:
-            logger.exception("annotate upload video_task: %s", upload_video_id)
-
     if not video_id or not isinstance(pipeline_result, dict) or not pipeline_result.get("video_id"):
         # 算法 CLI 返回 ok=True 但 pipeline_result 仍无效：也按失败处理
         err_summary = (
             "algorithm pipeline succeeded (ok=True) but pipeline_result is missing video_id"
         )
-        _mark_video_task_failed(upload_video_id, err_summary)
+        _mark_video_task_failed(task_video_id, err_summary)
         return {
             "ok": False,
-            "upload_video_id": upload_video_id,
+            "task_video_id": task_video_id,
             "video_id": video_id,
             "status": status,
             "error_message": err_summary,
@@ -386,7 +404,10 @@ def run_algorithm_video_pipeline(
     db = SessionLocal()
     try:
         import_result = algorithm_result_service.import_pipeline_result_payload_to_db(
-            db, pipeline_result, commit=True,
+            db,
+            pipeline_result,
+            commit=True,
+            expected_video_id=task_video_id,
         )
     except Exception as exc:
         logger.exception("import pipeline_result failed: %s", video_id)
@@ -401,25 +422,39 @@ def run_algorithm_video_pipeline(
     if not (import_result and import_result.get("ok")):
         # 入库失败：video_task 标记 failed，把异常信息写 last_error
         _mark_video_task_failed(
-            upload_video_id or video_id,
+            task_video_id or video_id,
             (import_result or {}).get("error")
             or "import pipeline_result to db failed",
         )
+    elif status in {"done", "complete"}:
+        # pipeline_result.json owns algorithm outputs but does not own the
+        # task lifecycle timestamps.  Complete it explicitly so the current
+        # worker finish time is persisted and average processing time is valid.
+        try:
+            db = SessionLocal()
+            try:
+                session_repo.update_video_task_status(
+                    db, video_id=task_video_id or video_id, status="done"
+                )
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("mark imported video task done failed: %s", video_id)
 
     # 算法已成功入库 + status=done + video_id 非空 → 自动生成视频鱼品质报告。
     # 报告生成失败不会修改 video_task 状态（保持 done），仅记录到 report_result。
     report_result: dict[str, Any] = {"ok": False, "skipped": True, "error": "skipped"}
-    if import_result and import_result.get("ok") and status == "done" and video_id:
+    if import_result and import_result.get("ok") and status in {"done", "complete"} and video_id:
         report_result = _generate_video_report_after_import(video_id)
         daily_report_result = _generate_daily_report_after_task(video_id)
-        # 报告生成也结束后才清理输入副本，保证算法及其后处理不再需要源文件。
-        _cleanup_video_copies(upload_video_id or video_id)
+        # 源视频副本作为长期回放与恢复兜底保留；兼容入口不再执行删除。
+        _cleanup_video_copies(task_video_id or video_id)
     else:
         daily_report_result = {"ok": False, "skipped": True, "error": "task not done"}
 
     return {
         "ok": bool(import_result and import_result.get("ok")),
-        "upload_video_id": upload_video_id,
+        "task_video_id": task_video_id,
         "video_id": video_id,
         "status": status,
         "import_result": import_result,

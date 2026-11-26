@@ -108,6 +108,8 @@ const videoPreviewLoading = ref<boolean>(false)
 const videoPreviewError = ref<string>('')
 const currentPlayableUrl = ref<string>('')
 const currentPlaybackCodec = ref<string>('')
+const currentPlaybackNotice = ref<string>('')
+const currentPlaybackKind = ref<'source' | 'result'>('source')
 const currentPreviewVideoIndex = ref<number>(-1)
 
 const totalPages = computed<number>(() => {
@@ -116,6 +118,10 @@ const totalPages = computed<number>(() => {
   if (t <= 0 || ps <= 0) return 1
   return Math.ceil(t / ps)
 })
+
+const currentPreviewTitle = computed<string>(() =>
+  currentPlaybackKind.value === 'result' ? '检测结果视频预览' : '源视频预览',
+)
 
 const serialColumnWidth = computed<number>(() => {
   const lastSerial = Math.max(1, total.value)
@@ -184,10 +190,14 @@ function toggleSelectAll(checked: boolean): void {
 
 async function saveAquacultureBin(record: VideoReportListRow): Promise<void> {
   const videoId = record.video_id
+  if (savingAquacultureBin[videoId]) return
+  const nextValue = String(aquacultureBinDrafts[videoId] || '').trim()
+  const savedValue = String(record.aquaculture_bin || '').trim()
+  if (nextValue === savedValue) return
   savingAquacultureBin[videoId] = true
   try {
     const resp = await http.patch(`/api/videos/${encodeURIComponent(videoId)}/aquaculture-bin`, {
-      aquaculture_bin: aquacultureBinDrafts[videoId] || '',
+      aquaculture_bin: nextValue,
     })
     record.aquaculture_bin = resp.data?.aquaculture_bin || null
     aquacultureBinDrafts[videoId] = record.aquaculture_bin || ''
@@ -338,6 +348,8 @@ function openVideoPreview(record: VideoReportListRow): void {
   currentPlayableUrl.value = ''
   videoPreviewError.value = ''
   currentPlaybackCodec.value = ''
+  currentPlaybackNotice.value = ''
+  currentPlaybackKind.value = 'source'
   videoPreviewVisible.value = true
   logUserAction({
     module: '数据报表',
@@ -373,6 +385,8 @@ async function loadPlayableVideo(videoId: string): Promise<void> {
     currentPlaybackCodec.value = data.codec_name
       ? `${data.codec_name}${data.pix_fmt ? ` · ${data.pix_fmt}` : ''}`
       : ''
+    currentPlaybackNotice.value = String(data.playback_notice || '')
+    currentPlaybackKind.value = data.playback_kind === 'result' ? 'result' : 'source'
   } catch (err: any) {
     const detail = err?.response?.data?.detail || err?.response?.data || {}
     videoPreviewError.value =
@@ -390,6 +404,8 @@ function closeVideoPreview(): void {
   currentPlayableUrl.value = ''
   videoPreviewError.value = ''
   currentPlaybackCodec.value = ''
+  currentPlaybackNotice.value = ''
+  currentPlaybackKind.value = 'source'
 }
 
 function previewPrev(): void {
@@ -504,7 +520,7 @@ onMounted(() => {
           <a-range-picker
             v-model="dateRange"
             value-format="YYYY-MM-DD"
-            placeholder="选择开始日期和结束日期"
+            :placeholder="['开始日期', '结束日期']"
             :style="{ width: '260px' }"
             @change="handleDateRangeChange"
           />
@@ -550,7 +566,7 @@ onMounted(() => {
           row-key="video_id"
           :bordered="true"
           :stripe="true"
-           :scroll="{ x: 1860 }"
+           :scroll="{ x: 1890 }"
         >
           <template #columns>
             <a-table-column title="选择" :width="58">
@@ -577,8 +593,10 @@ onMounted(() => {
                 <a-input
                   v-model="aquacultureBinDrafts[record.video_id]"
                   size="small"
-                  placeholder="请输入名称后回车"
+                  placeholder="请输入养鱼仓名称"
+                  :disabled="savingAquacultureBin[record.video_id]"
                   @press-enter="saveAquacultureBinOnEnter(record)"
+                  @blur="saveAquacultureBin(record)"
                 />
               </template>
             </a-table-column>
@@ -593,9 +611,9 @@ onMounted(() => {
                 </a-link>
               </template>
             </a-table-column>
-            <a-table-column title="视频时长" :width="120">
+            <a-table-column title="视频时长" :width="150">
               <template #cell="{ record }">
-                <span :title="durationTitle(record)">
+                <span class="video-duration-value" :title="durationTitle(record)">
                   {{ formatDuration(record.video_duration_seconds) }}
                 </span>
               </template>
@@ -621,7 +639,7 @@ onMounted(() => {
               :width="100"
             /> -->
 
-            <a-table-column title="平均全长(cm)" :width="120">
+            <a-table-column title="平均体长(cm)" :width="120">
               <template #cell="{ record }">
                 {{ formatFixed(record.avg_body_length, 2) }}
               </template>
@@ -652,7 +670,7 @@ onMounted(() => {
               fixed="right"
             >
               <template #cell="{ record }">
-                <a-space :size="6">
+                <a-space class="data-report-operation-actions" :size="6">
                   <a-button
                     size="mini"
                     type="primary"
@@ -714,7 +732,7 @@ onMounted(() => {
 
     <a-modal
       v-model:visible="videoPreviewVisible"
-      title="源视频预览"
+      :title="currentPreviewTitle"
       :width="920"
       :footer="false"
       :mask-closable="true"
@@ -723,7 +741,7 @@ onMounted(() => {
       <div class="fixed-video-preview-card">
         <div class="fixed-video-preview-head">
           <div class="fixed-video-preview-head-info">
-            <div class="fixed-video-preview-title">源视频预览</div>
+            <div class="fixed-video-preview-title">{{ currentPreviewTitle }}</div>
             <div v-if="currentPreviewVideoIndex >= 0" class="fixed-video-preview-id">
               视频编号：{{
                 tableData[currentPreviewVideoIndex]?.video_id || '--'
@@ -759,6 +777,9 @@ onMounted(() => {
             <a-button @click="previewNext">下一条</a-button>
             <span v-if="currentPlaybackCodec" class="fixed-video-preview-meta-info">
               编码：{{ currentPlaybackCodec }}
+            </span>
+            <span v-if="currentPlaybackNotice" class="fixed-video-preview-notice">
+              {{ currentPlaybackNotice }}
             </span>
           </a-space>
         </div>
@@ -840,6 +861,14 @@ onMounted(() => {
 .data-report-list-error {
   margin-top: 8px;
 }
+.data-report-operation-actions {
+  :deep(.arco-btn) {
+    font-size: 13px;
+  }
+}
+.video-duration-value {
+  white-space: nowrap;
+}
 .data-report-list-pagination {
   display: flex;
   align-items: center;
@@ -911,5 +940,8 @@ onMounted(() => {
 }
 .fixed-video-preview-meta-info {
   font-family: SarasaMonoSC, Menlo, Monaco, Consolas, monospace;
+}
+.fixed-video-preview-notice {
+  color: #d46b08;
 }
 </style>

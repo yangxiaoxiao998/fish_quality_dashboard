@@ -2,6 +2,10 @@
   <div class="admin-layout">
     <!-- 顶部Header -->
     <div class="admin-header">
+      <div class="header-brand">
+        <i class="fa-solid fa-fish logo-icon"></i>
+        <span class="header-brand-name">鱼品质智能检测系统</span>
+      </div>
       <div class="header-right">
         <button v-if="isAdministratorRole" class="nav-btn" @click="leaveAdministratorMode">
           退出管理员
@@ -27,10 +31,6 @@
 
     <!-- 左侧侧边栏 -->
     <div class="admin-sidebar">
-      <div class="sidebar-header">
-        <i class="fa-solid fa-fish logo-icon"></i>
-        <span class="system-name">鱼质检测分析系统</span>
-      </div>
       <div class="sidebar-menu">
         <div class="menu-group">
           <div class="menu-group-title">数据管理</div>
@@ -87,7 +87,7 @@ import {
   IconSettings,
   IconBarChart
 } from '@arco-design/web-vue/es/icon'
-import { administratorRole, requestTechnicalDebugAccess, setAdministrator } from '@/utils/technicalDebugAuth'
+import { administratorRole, isAdministrator, requestTechnicalDebugAccess, setAdministrator } from '@/utils/technicalDebugAuth'
 
 // 注：原代码使用了 <IconFish /> 但 arco-design/web-vue 并不导出该组件，
 // 容易在生产构建时出现 Vue 解析告警。这里改用 FontAwesome 的 fa-fish。
@@ -111,7 +111,7 @@ const isAdministratorRole = administratorRole
 
 function leaveAdministratorMode(): void {
   setAdministrator(false)
-  window.location.reload()
+  void router.replace('/')
 }
 
 function goToDashboard() {
@@ -125,6 +125,10 @@ function goToAdmin() {
 function goToPage(page: string) {
   const target = `/admin/${page}`
   if (page === 'system-ops' || page === 'system-settings') {
+    if (isAdministrator()) {
+      router.push(target)
+      return
+    }
     requestTechnicalDebugAccess(target)
     return
   }
@@ -159,12 +163,26 @@ function goToPage(page: string) {
   background: #fff;
   border-bottom: 1px solid #e5e6eb;
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
   align-items: center;
   padding: 0 24px;
   box-sizing: border-box;
   z-index: 100;
   box-shadow: 0 2px 8px rgb(0, 0, 0, 6%);
+  .header-brand {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: #1677ff;
+    .header-brand-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 18px;
+      font-weight: 700;
+    }
+  }
   .header-right {
     display: flex;
     gap: 16px;
@@ -195,33 +213,20 @@ function goToPage(page: string) {
 }
 .admin-sidebar {
   position: fixed;
-  top: 0;
+  top: 60px;
   left: 0;
   width: 200px;
-  height: 100%;
+  height: calc(100% - 60px);
   background: #fff;
   border-right: 1px solid #e5e6eb;
   z-index: 101;
   box-shadow: 2px 0 8px rgb(0, 0, 0, 4%);
-  .sidebar-header {
-    height: 60px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 0 20px;
-    border-bottom: 1px solid #e5e6eb;
-    .system-name {
-      font-size: 15px;
-      font-weight: 600;
-      color: #1677ff;
-    }
-  }
   .sidebar-menu {
     padding: 12px 0;
     .menu-group {
       .menu-group-title {
         padding: 8px 20px;
-        font-size: 12px;
+        font-size: 14px;
         color: #86909c;
         font-weight: 500;
       }
@@ -233,7 +238,7 @@ function goToPage(page: string) {
         color: #1d2129;
         cursor: pointer;
         transition: all 0.2s ease;
-        font-size: 14px;
+         font-size: 16px;
         &:hover {
           background: #e6f7ff;
           color: #1677ff;
@@ -245,7 +250,7 @@ function goToPage(page: string) {
           padding-left: 17px;
         }
         .arco-icon {
-          font-size: 16px;
+          font-size: 18px;
         }
       }
     }

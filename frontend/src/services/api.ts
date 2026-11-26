@@ -1,57 +1,22 @@
 // src/services/api.ts
 //
-// 第一阶段：旧 /api/videos 上传后，会由 VideoWall 组件内部调用
-// /api/algorithm/videos 触发真实算法 CLI。
-//
-// 这里只保留兼容层，让旧 admin 页面继续能读 video_task 与 fish 列表。
-// 新算法结果走 /api/algorithm/videos/{video_id}/result。
+// 兼容层：上传走 /api/videos，后端负责 RQ 入队；新算法结果走
+// /api/algorithm/videos/{video_id}/result。
 import axios from 'axios';
 import type { FishDetail, StatsBucket, FishInVideo, VideoTaskStatus, BatchFishDetailRequest } from '@/types/fish';
 import {
   getAlgorithmVideoResult,
   getAlgorithmErrorConclusion,
-  runAlgorithmVideo,
 } from '@/api/algorithm';
 import { getFishImageUrl, getFishLengthCm, getFishNoTailLengthCm, getFishHeightCm, getFishWeightG, getFishConditionFactor, getFishErrorMessage, getFishDisplayId } from '@/utils/fishFields';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
+const API_KEY = import.meta.env.VITE_API_KEY || "";
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
+  headers: API_KEY ? { "X-API-Key": API_KEY } : undefined,
 });
-
-// 兼容旧业务：上传视频。
-// 注意：第一阶段后端 /api/videos 仍是 upload + enqueue 旧 mock 路径。
-// VideoWall 组件会在 upload 成功后调用 runAlgorithmVideo 触发真实算法 CLI。
-export const uploadVideo = async (file: File): Promise<{
-  video_id: string;
-  status: string;
-  task_id: string;
-  created_at: string;
-  playback_url?: string;
-  source_path?: string;
-  video_path?: string;
-}> => {
-  const formData = new FormData();
-  formData.append('file', file);
-  const response = await apiClient.post('/api/videos', formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
-  });
-  return response.data;
-};
-
-// 直接以 input_video 调用真实算法 CLI。第一阶段主推入口。
-export async function runAlgorithmVideoByPath(input_video: string, video_fps = 25) {
-  const resp = await runAlgorithmVideo({
-    input_video,
-    camera_id: 'default',
-    device: 'cuda',
-    video_fps,
-    overwrite: true,
-    import_to_db: true,
-  });
-  return resp.data;
-}
 
 // 读取新算法结果。返回的 fish 列表字段已是 cm / no_tail_cm / pred_weight_g 等。
 export async function getAlgorithmResult(videoId: string) {

@@ -124,6 +124,22 @@ async function loadPdf(): Promise<void> {
       // 2. /api/reports/history -> /api/reports/history/{id}/preview
       url = await loadFromReportsHistory(videoId)
     }
+    if (!url) {
+      // A newly completed task may be imported before its PDF is created.
+      // Generate it once here so the operation-column action is usable
+      // immediately after algorithm completion.
+      try {
+        await http.post(
+          '/api/reports/fish-quality/video-pdf/generate',
+          { video_id: videoId },
+          { timeout: 180000 },
+        )
+        url = await loadFromAlgorithmResult(videoId)
+        if (!url) url = await loadFromReportsHistory(videoId)
+      } catch {
+        // Keep the normal empty-report message below.
+      }
+    }
     if (url) {
       pdfUrl.value = url
       errorMessage.value = ''

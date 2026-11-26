@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from app.paths import DATA_DIR, PROJECT_ROOT
+from app.paths import ALGORITHMS_ROOT, DATA_DIR, PROJECT_ROOT
 
 
 ALGORITHM_PYTHON = os.getenv("ALGORITHM_PYTHON") or sys.executable
@@ -24,6 +24,26 @@ ALGO_CLI_LOG_DIR = DATA_DIR / "logs" / "algorithm_cli"
 DEFAULT_PIPELINE_TIMEOUT_SECONDS = int(
     os.getenv("ALGORITHM_PIPELINE_TIMEOUT_SECONDS", str(8 * 60 * 60))
 )
+
+
+def _module_command(module_name: str, *module_args: str) -> list[str]:
+    """构造算法子进程命令。
+
+    源码模式由 Python 的 ``-m`` 运行模块；PyInstaller 冻结模式下
+    ``sys.executable`` 是后端自身的二进制，不能把 ``-m`` 当作参数传给
+    它，因此交给统一入口的 ``run-module`` 子命令通过 ``runpy`` 调用。
+    如果用户显式指定了另一套 ``ALGORITHM_PYTHON``，仍保留传统 Python
+    调用方式，方便开发机调试和单独算法环境。
+    """
+
+    same_executable = False
+    try:
+        same_executable = Path(ALGORITHM_PYTHON).resolve() == Path(sys.executable).resolve()
+    except OSError:
+        pass
+    if getattr(sys, "frozen", False) and same_executable:
+        return [ALGORITHM_PYTHON, "run-module", module_name, *module_args]
+    return [ALGORITHM_PYTHON, "-m", module_name, *module_args]
 
 def extract_real_error(
     stdout: str = "",
@@ -197,7 +217,9 @@ def _build_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
 
     backend_dir = PROJECT_ROOT / "backend"
-    algo_dir = PROJECT_ROOT / "algorithms"
+    # app.paths 已根据 FISH_ALGO_ROOT/冻结安装目录解析算法根目录；不要
+    # 再从源码 PROJECT_ROOT 拼接，避免自定义数据目录时模型路径漂移。
+    algo_dir = ALGORITHMS_ROOT
 
     pythonpath_items = [
         str(PROJECT_ROOT),
@@ -208,6 +230,7 @@ def _build_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_items)
 
+    env.setdefault("FISH_INSTALL_ROOT", str(PROJECT_ROOT))
     env.setdefault("FISH_PROJECT_ROOT", str(PROJECT_ROOT))
     env.setdefault("FISH_ALGO_ROOT", str(algo_dir))
     env.setdefault("FISH_DATA_ROOT", str(DATA_DIR))
@@ -245,7 +268,7 @@ def _build_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env["TRANSFORMERS_OFFLINE"] = "1"
     env["HF_HUB_OFFLINE"] = "1"
 
-    # 注意：不再设置 FISH_ALGO_MODE，不再支持 mock / real 切换。
+    # The production CLI always runs the real algorithm; no mock-mode flag is set.
 
     if extra:
         env.update(extra)
@@ -559,9 +582,7 @@ def run_calibration_cli(
             "calibration_json": _to_project_relative(CALIBRATION_JSON),
         }
 
-    command = [
-        ALGORITHM_PYTHON,
-        "-m",
+    command = _module_command(
         "algorithms.core.adjust_calibration",
         "--source-image",
         str(src),
@@ -569,7 +590,7 @@ def run_calibration_cli(
         str(camera_id),
         "--device",
         str(device),
-    ]
+    )
 
     if real_length_mm is None:
         real_length_mm = 1376.0
@@ -656,6 +677,7 @@ def run_video_pipeline_cli(
     video_id: str | None = None,
     cancel_check: Any | None = None,
     force_all_complete: bool = False,
+    conveyor_direction: str | None = None,
 ) -> dict[str, Any]:
     _ensure_dirs()
 
@@ -694,9 +716,7 @@ def run_video_pipeline_cli(
         if p.is_dir() and not p.name.endswith(".partial")
     } if RESULTS_DIR.exists() else set()
 
-    command = [
-        ALGORITHM_PYTHON,
-        "-m",
+    command = _module_command(
         "algorithms.tools.run_video_pipeline",
         "--input-video",
         str(video),
@@ -706,7 +726,7 @@ def run_video_pipeline_cli(
         str(device),
         "--video-fps",
         str(video_fps),
-    ]
+    )
 
     if overwrite:
         command.append("--overwrite")
@@ -715,6 +735,17 @@ def run_video_pipeline_cli(
         command.extend(["--video-id", str(video_id)])
     if force_all_complete:
         command.append("--force-all-complete")
+
+    # 临时修改配置文件中的conveyor_direction，确保算法使用正确的方向设置
+    import json
+    MARGIN_FILE = ALGORITHMS_ROOT / "config" / "adjust_calibration_margin.json"
+    original_conveyor_direction = None
+    if conveyor_direction and MARGIN_FILE.exists():
+        margin_data = json.loads(MARGIN_FILE.read_text(encoding="utf-8"))
+        if margin_data.get("conveyor_direction") != conveyor_direction:
+            original_conveyor_direction = margin_data.get("conveyor_direction")
+            margin_data["conveyor_direction"] = conveyor_direction
+            MARGIN_FILE.write_text(json.dumps(margin_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     result = _run_cli(
         command,
@@ -725,6 +756,7 @@ def run_video_pipeline_cli(
             "video_id": str(video_id) if video_id else None,
             "camera_id": camera_id,
             "video_fps": video_fps,
+            "conveyor_direction": conveyor_direction,
         },
         cancel_check=cancel_check,
     )
@@ -794,6 +826,12 @@ def run_video_pipeline_cli(
             or result["stdout"]
             or "算法视频处理失败"
         )
+
+    # 恢复原始的 conveyor_direction 设置
+    if original_conveyor_direction is not None and MARGIN_FILE.exists():
+        margin_data = json.loads(MARGIN_FILE.read_text(encoding="utf-8"))
+        margin_data["conveyor_direction"] = original_conveyor_direction
+        MARGIN_FILE.write_text(json.dumps(margin_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     return response
 

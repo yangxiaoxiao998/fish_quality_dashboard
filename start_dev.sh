@@ -42,6 +42,14 @@ set -Eeuo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
+if [[ "${FISH_IGNORE_SYSTEMD_USER:-0}" != "1" ]] \
+   && command -v systemctl >/dev/null 2>&1 \
+   && systemctl --user is-active --quiet fish-quality.target 2>/dev/null; then
+    echo "[INFO] fish-quality.target 已由 systemd user 管理，复用现有自动启动服务。"
+    echo "[INFO] 状态：systemctl --user status fish-quality.target"
+    exit 0
+fi
+
 
 # ----------------------------------------------------------------------
 # 2. 基础配置
@@ -52,17 +60,18 @@ CONDA_ENV_NAME="${CONDA_ENV_NAME:-full}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 VITE_API_PROXY_TARGET="${VITE_API_PROXY_TARGET:-http://127.0.0.1:${BACKEND_PORT}}"
+CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-http://127.0.0.1:${FRONTEND_PORT},http://localhost:${FRONTEND_PORT}}"
 UPGRADE_MANAGER_PORT="${UPGRADE_MANAGER_PORT:-8012}"
 UPGRADE_MANAGER_ALLOWED_ORIGINS="${UPGRADE_MANAGER_ALLOWED_ORIGINS:-http://127.0.0.1:${FRONTEND_PORT},http://localhost:${FRONTEND_PORT}}"
 
 DATABASE_URL="${DATABASE_URL:-postgresql://fish:fish@127.0.0.1:5432/fishdb}"
 REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379/0}"
 
-# 算法运行模式：real 表示执行真实算法。
-FISH_ALGO_MODE="${FISH_ALGO_MODE:-real}"
-
 # 树莓派服务地址。
-FISH_PI_BASE_URL="${FISH_PI_BASE_URL:-http://10.42.0.2:9000}"
+FISH_PI_BASE_URL="${FISH_PI_BASE_URL:-http://raspberrypi.local:9000}"
+# Set this to the Pi's current address if the wired network is not 10.42.0.0/24.
+FISH_PI_HOST="${FISH_PI_HOST:-}"
+FISH_PI_PORT="${FISH_PI_PORT:-}"
 
 # 如果留空，后端根据自身配置决定推流地址。
 FISH_CAMERA_PUSH_URL="${FISH_CAMERA_PUSH_URL:-}"
@@ -74,6 +83,8 @@ FISH_CAMERA_NETWORK_INTERFACE="${FISH_CAMERA_NETWORK_INTERFACE:-enp3s0}"
 
 # 本机读取摄像头流时使用的地址。
 FISH_CAMERA_READ_URL="${FISH_CAMERA_READ_URL:-rtmp://127.0.0.1:1935/fish_camera}"
+FISH_CAMERA_RECONNECT_GRACE_SECONDS="${FISH_CAMERA_RECONNECT_GRACE_SECONDS:-180}"
+FISH_CAMERA_RECONNECT_REQUEST_INTERVAL_SECONDS="${FISH_CAMERA_RECONNECT_REQUEST_INTERVAL_SECONDS:-10}"
 
 
 # ----------------------------------------------------------------------
@@ -228,13 +239,16 @@ export PYTHONNOUSERSITE=1
 
 export DATABASE_URL
 export REDIS_URL
-export FISH_ALGO_MODE
 export FISH_PI_BASE_URL
 export FISH_CAMERA_PUSH_URL
 export FISH_CAMERA_AUTO_PUSH_URL
 export FISH_CAMERA_NETWORK_INTERFACE
 export FISH_CAMERA_READ_URL
+export FISH_CAMERA_RECONNECT_GRACE_SECONDS
+export FISH_CAMERA_RECONNECT_REQUEST_INTERVAL_SECONDS
+export FISH_PI_HOST FISH_PI_PORT FISH_PI_BASE_URL
 export VITE_API_PROXY_TARGET
+export CORS_ALLOWED_ORIGINS
 export UPGRADE_MANAGER_PORT
 export UPGRADE_MANAGER_ALLOWED_ORIGINS
 
@@ -439,11 +453,10 @@ start_detached_process() {
 
     (
         cd "$work_dir"
-
+        export PYTHONPATH="$work_dir:${PYTHONPATH:-}"
         # 使用 exec 让记录的 PID 直接对应目标程序。
         exec setsid nohup "$@" >>"$log_file" 2>&1
     ) &
-
     local process_pid=$!
     printf '%s\n' "$process_pid" >"$pid_file"
 
@@ -561,13 +574,17 @@ fi
 
 chmod +x "$MEDIAMTX_BIN"
 
-start_detached_process \
-    "MediaMTX" \
-    "$MEDIAMTX_DIR" \
-    "$MEDIAMTX_LOG" \
-    "$MEDIAMTX_PID_FILE" \
-    "$MEDIAMTX_BIN" \
-    "$MEDIAMTX_CONFIG"
+if port_is_listening 1935 && port_is_listening 8554 && port_is_listening 8888; then
+    echo "[INFO] MediaMTX 已监听 RTMP/RTSP/HLS 端口，复用现有实例。"
+else
+    start_detached_process \
+        "MediaMTX" \
+        "$MEDIAMTX_DIR" \
+        "$MEDIAMTX_LOG" \
+        "$MEDIAMTX_PID_FILE" \
+        "$MEDIAMTX_BIN" \
+        "$MEDIAMTX_CONFIG"
+fi
 
 
 # ----------------------------------------------------------------------
@@ -584,13 +601,17 @@ start_detached_process \
     "$PY" \
     -m app.workers.worker_main
 
-start_detached_process \
-    "Upgrade Manager" \
-    "$BACKEND_DIR" \
-    "$UPGRADE_MANAGER_LOG" \
-    "$UPGRADE_MANAGER_PID_FILE" \
-    "$PY" \
-    -m app.services.update.upgrade_manager
+if port_is_listening "$UPGRADE_MANAGER_PORT"; then
+    echo "[INFO] Upgrade Manager 已监听端口 $UPGRADE_MANAGER_PORT，复用现有实例。"
+else
+    start_detached_process \
+        "Upgrade Manager" \
+        "$BACKEND_DIR" \
+        "$UPGRADE_MANAGER_LOG" \
+        "$UPGRADE_MANAGER_PID_FILE" \
+        "$PY" \
+        -m app.services.update.upgrade_manager
+fi
 
 
 # ----------------------------------------------------------------------

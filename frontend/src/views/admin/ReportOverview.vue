@@ -17,6 +17,8 @@ const errorMessage = ref('')
 const rows = ref<any[]>([])
 const selectedVideoIds = ref<string[]>([])
 const selectedReportIds = ref<number[]>([])
+const reportNameDrafts = ref<Record<number, string>>({})
+const renamingReportIds = ref<Set<number>>(new Set())
 const customReportName = ref('自定义报表')
 const videoPage = ref(1)
 const videoPageSize = ref(10)
@@ -29,10 +31,6 @@ const videoPreviewId = ref('')
 const currentPlaybackCodec = ref('')
 const currentPreviewVideoIndex = ref(-1)
 
-const serialColumnWidth = computed(() => {
-  const lastSerial = Math.max(1, reportTotal.value)
-  return Math.max(52, String(lastSerial).length * 10 + 24)
-})
 const reportTabs = ref([
   { key: 'video', title: '视频报表', closable: false },
   { key: 'daily', title: '当日报表', closable: false },
@@ -174,6 +172,11 @@ async function loadCustomReports(): Promise<void> {
       },
     })
     rows.value = resp.data?.items || []
+    reportNameDrafts.value = Object.fromEntries(
+      rows.value
+        .filter((record) => record.report_id)
+        .map((record) => [Number(record.report_id), String(record.report_name || '')])
+    )
     reportTotal.value = Number(resp.data?.total) || rows.value.length
   } catch (err) {
     errorMessage.value = toErrorMessage(err) || '加载自定义报表失败'
@@ -246,15 +249,32 @@ function toggleReportSelection(reportId: number, checked: boolean): void {
 
 async function renameReport(record: any, value: string): Promise<void> {
   const name = value.trim()
-  if (!name || !record.report_id || name === record.report_name) return
+  const reportId = Number(record.report_id)
+  if (!reportId || renamingReportIds.value.has(reportId)) return
+  if (!name) {
+    reportNameDrafts.value[reportId] = String(record.report_name || '')
+    Message.warning('报表名称不能为空')
+    return
+  }
+  if (name === String(record.report_name || '').trim()) {
+    reportNameDrafts.value[reportId] = String(record.report_name || '')
+    return
+  }
+
+  renamingReportIds.value = new Set([...renamingReportIds.value, reportId])
   try {
-    const resp = await http.patch(`/api/reports/history/${record.report_id}/name`, { report_name: name })
+    const resp = await http.patch(`/api/reports/history/${reportId}/name`, { report_name: name })
     record.report_name = resp.data?.report_name || name
-    const tab = reportTabs.value.find((item) => item.key === `report-pdf-${record.report_id}`)
+    reportNameDrafts.value[reportId] = record.report_name
+    const tab = reportTabs.value.find((item) => item.key === `report-pdf-${reportId}`)
     if (tab) tab.title = record.report_name
     Message.success('报表名称已保存')
   } catch (err) {
     Message.error(toErrorMessage(err) || '报表名称保存失败')
+  } finally {
+    const pending = new Set(renamingReportIds.value)
+    pending.delete(reportId)
+    renamingReportIds.value = pending
   }
 }
 
@@ -394,7 +414,10 @@ function openReport(reportId: number): void {
 }
 
 async function generateCustomReport(): Promise<void> {
-  if (!selectedVideoIds.value.length) return
+  if (!selectedVideoIds.value.length) {
+    Message.warning('请先选择要生成报表的视频')
+    return
+  }
   try {
     const reportName = customReportName.value.trim()
     if (!reportName) {
@@ -471,7 +494,7 @@ onMounted(() => {
                 <a-range-picker
               v-model="dateRange"
               value-format="YYYY-MM-DD"
-              placeholder="选择开始日期和结束日期"
+              :placeholder="['开始日期', '结束日期']"
               :style="{ width: '260px' }"
               @change="handleDateRangeChange"
             />
@@ -496,14 +519,20 @@ onMounted(() => {
           </a-space>
         </div>
         <a-alert v-if="errorMessage" type="error">{{ errorMessage }}</a-alert>
-        <a-table :data="rows" :loading="loading" :pagination="false" :row-key="baseTab === 'video' ? 'video_id' : 'report_id'">
+        <a-table
+          class="report-overview-table"
+          :data="rows"
+          :loading="loading"
+          :pagination="false"
+          :row-key="baseTab === 'video' ? 'video_id' : 'report_id'"
+        >
           <template #columns>
-            <a-table-column v-if="baseTab === 'video'" title="序号" :width="serialColumnWidth">
+            <a-table-column v-if="baseTab === 'video'" title="序号" :width="72">
               <template #cell="{ rowIndex }">
                 {{ (videoPage - 1) * videoPageSize + rowIndex + 1 }}
               </template>
             </a-table-column>
-            <a-table-column v-if="baseTab === 'video'" title="选择" :width="60">
+            <a-table-column v-if="baseTab === 'video'" title="选择" :width="72">
               <template #header>
                 <a-checkbox
                   :model-value="isCurrentPageSelected()"
@@ -522,7 +551,7 @@ onMounted(() => {
                 />
               </template>
             </a-table-column>
-            <a-table-column v-else title="选择" :width="60">
+            <a-table-column v-else title="选择" :width="72">
               <template #cell="{ record }">
                 <a-checkbox
                   :model-value="selectedReportIds.includes(record.report_id)"
@@ -530,14 +559,14 @@ onMounted(() => {
                 />
               </template>
             </a-table-column>
-            <a-table-column v-if="baseTab === 'video'" title="视频编号" :width="220">
+            <a-table-column v-if="baseTab === 'video'" title="视频编号">
               <template #cell="{ record }">
                 <a-link v-if="baseTab === 'video'" @click="openVideo(record.video_id)">{{ record.video_id }}</a-link>
                 <span v-else-if="baseTab === 'custom'">{{ record.video_id || '--' }}</span>
                 <span v-else>--</span>
               </template>
             </a-table-column>
-            <a-table-column v-if="baseTab === 'video'" title="操作" :width="130">
+            <a-table-column v-if="baseTab === 'video'" title="操作">
               <template #cell="{ record }">
                 <a-button
                   size="small"
@@ -548,14 +577,15 @@ onMounted(() => {
             </a-table-column>
             <a-table-column v-if="baseTab === 'video'" title="养鱼仓" data-index="aquaculture_bin" />
             <a-table-column v-if="baseTab === 'video'" title="总鱼数" data-index="total_fish" />
-            <a-table-column v-if="baseTab !== 'video'" title="报表名称" :width="280">
+            <a-table-column v-if="baseTab !== 'video'" title="报表名称">
               <template #cell="{ record }">
                 <a-input
                   v-if="baseTab === 'custom'"
-                  :model-value="record.report_name"
+                  :model-value="reportNameDrafts[record.report_id] ?? record.report_name"
                   allow-clear
-                  @update:model-value="(value: string) => { record.report_name = value }"
-                  @press-enter="renameReport(record, record.report_name)"
+                  :disabled="renamingReportIds.has(Number(record.report_id))"
+                  @update:model-value="(value: string) => { reportNameDrafts[record.report_id] = value }"
+                  @press-enter="renameReport(record, reportNameDrafts[record.report_id] ?? record.report_name)"
                 />
                 <span v-else>{{ record.report_name }}</span>
               </template>
@@ -563,7 +593,7 @@ onMounted(() => {
             <a-table-column v-if="baseTab !== 'video'" title="生成时间">
               <template #cell="{ record }">{{ formatChinaDateTime(record.created_at) }}</template>
             </a-table-column>
-            <a-table-column v-if="baseTab !== 'video'" title="操作" :width="180">
+            <a-table-column v-if="baseTab !== 'video'" title="操作">
               <template #cell="{ record }">
                 <a-button size="small" @click="openReport(record.report_id)">查看报表</a-button>
               </template>
@@ -591,6 +621,7 @@ onMounted(() => {
           allow-clear
           class="custom-report-name-input"
           @press-enter="generateCustomReport"
+          @keydown.enter="generateCustomReport"
         />
       </div>
     </AdminTabbedWorkspace>
@@ -653,6 +684,25 @@ onMounted(() => {
 .report-overview-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
 .report-overview-filter { display: flex; align-items: center; gap: 10px; }
 .report-overview-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
+.report-overview-pane :deep(.report-overview-table),
+.report-overview-pane :deep(.arco-table-container),
+.report-overview-pane :deep(.arco-table-content),
+.report-overview-pane :deep(.arco-table-element) {
+  width: 100%;
+}
+.report-overview-pane :deep(.arco-table-element) {
+  table-layout: fixed;
+}
+.report-overview-pane :deep(.arco-table-td-content),
+.report-overview-pane :deep(.arco-table-th-content) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.report-overview-pane :deep(.arco-table-td) {
+  vertical-align: middle;
+}
 .report-overview-pdf { width: 100%; height: 720px; margin-top: 16px; border: 1px solid #e5e6eb; background: #fff; }
 .fixed-video-preview-card { display: flex; flex-direction: column; gap: 12px; }
 .fixed-video-preview-head { display: flex; justify-content: space-between; align-items: flex-start; }

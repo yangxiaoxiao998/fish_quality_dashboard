@@ -3,7 +3,7 @@
     <!-- 图像展示区域：算法新字段 crop_image_url 优先 -->
     <div class="image-container">
       <img v-if="displayImageUrl" :src="displayImageUrl" alt="Fish Crop Image" />
-      <img v-else src="/src/assets/images/test-thumb.jpg" alt="Default Fish Image" />
+       <img v-else :src="fishPlaceholder" alt="Default Fish Image" />
     </div>
 
     <!-- 检测数据 -->
@@ -49,6 +49,7 @@
 import { computed } from 'vue'
 import type { PropType } from 'vue'
 import type { FishDetail } from '@/types/fish'
+import fishPlaceholder from '@/assets/images/fish-placeholder.svg'
 import {
   getFishImageUrl,
   getFishLengthCm,

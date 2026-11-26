@@ -11,7 +11,7 @@ from sqlalchemy import select, and_
 
 from app.repositories.db import get_db
 from app.repositories import stats_repo
-from app.repositories.models import Stats5Min, Fish
+from app.repositories.models import Stats5Min, Fish, VideoTask
 from app.services.fish_distribution_service import build_fixed_distribution
 from app.utils.time_utils import to_beijing
 
@@ -208,14 +208,18 @@ def stats_distribution(
         - 单点 → 1 个 bin，ratio=1
         - ratio 之和 = 1（最后一个用 1-之前之和修正浮点误差）
     """
-    stmt = select(Fish).where(Fish.status == "done")
+    stmt = (
+        select(Fish)
+        .join(VideoTask, Fish.video_id == VideoTask.video_id)
+        .where(Fish.status == "done")
+    )
 
     start_dt = _parse_range_dt(start_time)
     if start_dt:
-        stmt = stmt.where(Fish.created_at >= start_dt)
+        stmt = stmt.where(VideoTask.created_at >= start_dt)
     end_dt = _parse_range_dt(end_time)
     if end_dt:
-        stmt = stmt.where(Fish.created_at <= end_dt)
+        stmt = stmt.where(VideoTask.created_at <= end_dt)
 
     fishes = db.execute(stmt).scalars().all()
 
@@ -239,8 +243,7 @@ def stats_distribution(
         if bl is not None and bw is not None:
             ratios.append(bl / bw)
 
-        # surface_damage 是字符串：'无' / '轻微' / '严重'，异常指非"无"
-        if f.surface_damage and f.surface_damage != "无":
+        if f.surface_damage_ratio is not None and float(f.surface_damage_ratio) > 0:
             abnormal_count += 1
         else:
             normal_count += 1

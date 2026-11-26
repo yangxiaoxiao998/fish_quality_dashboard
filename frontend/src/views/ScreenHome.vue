@@ -26,9 +26,9 @@
           class="action-button"
           role="button"
           tabindex="0"
-          @click="goDataInput"
-          @keydown.enter="goDataInput"
-          @keydown.space.prevent="goDataInput"
+          @click="goDashboard"
+          @keydown.enter="goDashboard"
+          @keydown.space.prevent="goDashboard"
         >
           <img
             class="action-button-background"
@@ -62,7 +62,7 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
 import { IconSettings } from '@arco-design/web-vue/es/icon'
-import { requestTechnicalDebugAccess } from '@/utils/technicalDebugAuth'
+import { isAdministrator, requestTechnicalDebugAccess } from '@/utils/technicalDebugAuth'
 
 import screenBackground from '@/assets/images/screen_fish_quality_bg.png'
 import baseButton from '@/assets/images/btn_base_dark_blue.png'
@@ -70,8 +70,8 @@ import universityLogo from '@/assets/images/shandong_university_logo.png'
 
 const router = useRouter()
 
-function goDataInput(): void {
-  router.push('/data-input')
+function goDashboard(): void {
+  router.push('/dashboard')
 }
 
 function goReportView(): void {
@@ -79,6 +79,10 @@ function goReportView(): void {
 }
 
 function goSystemSettings(): void {
+  if (isAdministrator()) {
+    router.push('/admin/system-settings')
+    return
+  }
   requestTechnicalDebugAccess('/admin/system-settings')
 }
 </script>

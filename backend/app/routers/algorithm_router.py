@@ -4,7 +4,6 @@ algorithm_router.py - 算法 CLI 对接接口
 提供 /api/algorithm/* 接口：
 - POST /api/algorithm/calibration
 - GET  /api/algorithm/calibration/status
-- POST /api/algorithm/videos
 - GET  /api/algorithm/videos/{video_id}/result
 - GET  /api/algorithm/videos/{video_id}/error-conclusion
 - POST /api/algorithm/import-result/{video_id}
@@ -21,6 +20,7 @@ from typing import Any, Optional
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -30,6 +30,7 @@ from app.services import algorithm_cli_service, algorithm_result_service
 from app.paths import DATA_DIR
 from app.services import algorithm_calibration_capture_service
 from app.services.video_report_pdf_service import generate_video_pdf_report
+from app.services.video_playback_service import resolve_result_video_path
 
 router = APIRouter()
 logger = logging.getLogger("algorithm_router")
@@ -85,15 +86,6 @@ class BatchImportResultsRequest(BaseModel):
     overwrite: bool = True
 
 
-class VideoPipelineRequest(BaseModel):
-    input_video: str = Field(..., description="输入视频绝对路径或相对项目根路径")
-    camera_id: str = "default"
-    device: str = "cuda"
-    video_fps: int = 25
-    overwrite: bool = True
-    import_to_db: bool = True
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -106,9 +98,37 @@ def _path_for_response(value: Any) -> Optional[str]:
 
 
 def _strip_path_summary(data: dict[str, Any]) -> dict[str, Any]:
-    """去掉返回里包含绝对路径的字段，避免暴露给前端。"""
-    blocked = {"original_input_video", "input_video", "absolute_paths"}
-    return {k: v for k, v in data.items() if k not in blocked}
+    """去掉或规范化结果中的绝对路径，避免暴露服务器目录。"""
+    blocked = {
+        "original_input_video",
+        "input_video",
+        "calibration_source_image",
+        "source_image",
+        "absolute_paths",
+    }
+    path_keys = {
+        "result_dir",
+        "pipeline_result_path",
+        "error_conclusion",
+        "error_conclusion_path",
+        "grounded_video",
+        "grounded_video_path",
+        "measurement_csv",
+        "measurement_csv_path",
+        "complete_match_dir",
+        "incomplete_match_dir",
+    }
+    sanitized: dict[str, Any] = {}
+    from app.services.algorithm_result_service import _path_to_data_relative
+
+    for key, value in data.items():
+        if key in blocked:
+            continue
+        if key in path_keys and value not in (None, ""):
+            sanitized[key] = _path_to_data_relative(str(value))
+        else:
+            sanitized[key] = value
+    return sanitized
 
 
 # ---------------------------------------------------------------------------
@@ -250,15 +270,23 @@ def _normalize_calibration_field_aliases(raw: dict[str, Any] | None) -> dict[str
         "homography",
     )
 
-    source_path = _first("source_image_path", "source_image", "source_path", "image_path", "input_image_path")
-    mask_path = _first("belt_mask_path", "belt_mask", "mask_path", "belt_rectified_mask_path")
-    preview_path = _first(
-        "rectified_preview_path",
-        "adjusted_preview_path",
-        "preview_path",
-        "corrected_preview_path",
-        "rectified_image_path",
-        "adjusted_preview",
+    from app.services.path_service import to_data_relative
+
+    source_path = to_data_relative(
+        _first("source_image_path", "source_image", "source_path", "image_path", "input_image_path")
+    )
+    mask_path = to_data_relative(
+        _first("belt_mask_path", "belt_mask", "mask_path", "belt_rectified_mask_path")
+    )
+    preview_path = to_data_relative(
+        _first(
+            "rectified_preview_path",
+            "adjusted_preview_path",
+            "preview_path",
+            "corrected_preview_path",
+            "rectified_image_path",
+            "adjusted_preview",
+        )
     )
 
     normalized: dict[str, Any] = {
@@ -448,102 +476,6 @@ def post_capture_calibration_frame(payload: CaptureFrameRequest) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 5.2 POST /api/algorithm/videos
-# ---------------------------------------------------------------------------
-
-@router.post("/algorithm/videos")
-def post_run_video_pipeline(
-    payload: VideoPipelineRequest,
-    db: Session = Depends(get_db),
-) -> dict:
-    """
-    调用算法工程师提供的 run_video_pipeline CLI，并把结果导入数据库。
-
-    真实命令：
-        python -m algorithms.tools.run_video_pipeline \
-            --input-video <path> --camera-id default \
-            --device cuda --video-fps 25 --overwrite
-
-    显式禁止 --calibration-source-image / --frame-start / --frame-end /
-              --device cpu / --disable-wound / --video-id / --keep-* / --no-publish
-
-    输出：data/results/<video_id>/reports/pipeline_result.json
-          data/results/<video_id>/reports/error_conclusion.txt
-    """
-    result = algorithm_cli_service.run_video_pipeline_cli(
-        input_video=payload.input_video,
-        camera_id=payload.camera_id,
-        device=payload.device,
-        video_fps=payload.video_fps,
-        overwrite=payload.overwrite,
-    )
-
-    video_id = _path_for_response(result.get("video_id"))
-
-    payload_resp: dict[str, Any] = {
-        "ok": bool(result.get("ok")),
-        "video_id": video_id,
-        "status": _path_for_response(result.get("status")),
-        "result_dir": _path_for_response(result.get("result_dir")),
-        "pipeline_result_path": _path_for_response(result.get("pipeline_result_path")),
-        "error_conclusion_path": _path_for_response(result.get("error_conclusion_path")),
-        "log_path": _path_for_response(result.get("log_path")),
-        "returncode": result.get("returncode"),
-        "summary": None,
-        "import_result": None,
-    }
-
-    pipeline_result = result.get("pipeline_result") or {}
-    if isinstance(pipeline_result, dict):
-        summary = pipeline_result.get("summary")
-        if isinstance(summary, dict):
-            payload_resp["summary"] = summary
-
-    if not payload_resp["ok"]:
-        payload_resp["failed_stage"] = (
-            pipeline_result.get("failed_stage") if isinstance(pipeline_result, dict) else None
-        )
-        payload_resp["error_message"] = _path_for_response(result.get("error_message"))
-        payload_resp["error_conclusion"] = _path_for_response(
-            result.get("error_conclusion_text")
-        )
-
-    if (
-        payload.import_to_db
-        and payload_resp["ok"]
-        and video_id
-        and isinstance(pipeline_result, dict)
-        and pipeline_result.get("status") == "done"
-    ):
-        try:
-            import_result = algorithm_result_service.import_pipeline_result_payload_to_db(
-                db, pipeline_result, commit=True,
-            )
-            payload_resp["import_result"] = import_result
-        except Exception as exc:
-            logger.exception("import pipeline_result failed: %s", exc)
-            payload_resp["import_result"] = {
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-
-        # 算法完成且入库成功后，自动生成 DOCX/PDF 报表
-        try:
-            if bool(payload_resp["import_result"].get("ok")):
-                report_res = generate_video_pdf_report(video_id)
-                payload_resp["report_result"] = report_res
-        except Exception as exc:
-            logger.exception("generate video pdf report failed: %s", exc)
-            payload_resp["report_result"] = {
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "video_id": video_id,
-            }
-
-    return payload_resp
-
-
-# ---------------------------------------------------------------------------
 # 5.3 GET /api/algorithm/videos/{video_id}/result
 # ---------------------------------------------------------------------------
 
@@ -571,6 +503,10 @@ def get_pipeline_result(video_id: str, db: Session = Depends(get_db)) -> dict:
         )
 
     if payload is None:
+        db_payload = algorithm_result_service.video_task_to_response_payload(db, video_id)
+        if db_payload is not None:
+            resp = algorithm_result_service.pipeline_result_to_response(db_payload)
+            return {"ok": True, "data": resp, "_source": "database"}
         raise HTTPException(
             status_code=404,
             detail={
@@ -580,11 +516,31 @@ def get_pipeline_result(video_id: str, db: Session = Depends(get_db)) -> dict:
             },
         )
 
-    resp = algorithm_result_service.pipeline_result_to_response(payload)
-    return {"ok": True, "data": resp, "_source": "pipeline_result.json"}
-
-    resp = algorithm_result_service.pipeline_result_to_response(payload)
+    resp = algorithm_result_service.pipeline_result_to_response(
+        _strip_path_summary(payload)
+    )
     return {"ok": True, "data": resp}
+
+
+@router.get("/algorithm/videos/{video_id}/result-video")
+def get_result_video(video_id: str):
+    """Stream the Grounded-SAM result from the active runtime data directory."""
+    video_path = resolve_result_video_path(video_id)
+    if video_path is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "ok": False,
+                "video_id": video_id,
+                "error_code": "RESULT_VIDEO_NOT_FOUND",
+                "error_message": "grounded_sam.mp4 不存在，请检查任务结果文件是否已部署。",
+            },
+        )
+    return FileResponse(
+        str(video_path),
+        media_type="video/mp4",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +642,17 @@ def get_results_discover(db: Session = Depends(get_db)) -> dict:
     }
 
 
+@router.get("/algorithm/results/reconcile")
+def get_results_reconcile(
+    video_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """对账原始 JSON、数据库导入结果和数据库报表文件。"""
+    from app.services.result_reconciliation_service import reconcile_results
+
+    return reconcile_results(db, video_ids=[video_id] if video_id else None)
+
+
 @router.post("/algorithm/import-results/batch")
 def post_import_results_batch(
     payload: BatchImportResultsRequest,
@@ -716,7 +683,7 @@ def post_import_results_batch(
                 success += 1
                 # 单个 video 导入成功时尝试自动生成报表
                 try:
-                    report_res = generate_video_pdf_report(entry["video_id"])
+                    report_res = generate_video_pdf_report(entry["video_id"], db=db)
                     result["report_result"] = report_res
                 except Exception as exc:
                     logger.exception(
@@ -805,7 +772,7 @@ def post_import_result(
     # 导入成功后自动补一次 DOCX/PDF 报表（失败不影响导入主流程）
     try:
         if bool(result.get("ok")):
-            report_res = generate_video_pdf_report(video_id)
+            report_res = generate_video_pdf_report(video_id, db=db)
             result["report_result"] = report_res
     except Exception as exc:
         logger.exception("generate video pdf report failed: %s", exc)

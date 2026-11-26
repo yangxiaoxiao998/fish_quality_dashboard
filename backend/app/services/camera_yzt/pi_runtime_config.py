@@ -42,7 +42,7 @@ from urllib.parse import urlparse
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_PI_BASE_URL = "http://10.42.0.2:9000"
+DEFAULT_PI_BASE_URL = "http://raspberrypi.local:9000"
 DEFAULT_RTMP_PORT = 1935
 DEFAULT_RTMP_PATH = "fish_camera"
 

@@ -83,6 +83,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
 import { http } from '@/api/http'
+import fishPlaceholder from '@/assets/images/fish-placeholder.svg'
 
 interface ImageRecord {
   id: string
@@ -156,7 +157,8 @@ function handlePageSizeChange(size: number) {
 
 function handleImageError(e: Event) {
   const img = e.target as HTMLImageElement
-  img.src = '/src/assets/images/test-thumb.jpg'
+  img.onerror = null
+  img.src = fishPlaceholder
 }
 
 function handleDownload(img: ImageRecord) {

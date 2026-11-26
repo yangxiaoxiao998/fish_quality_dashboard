@@ -8,8 +8,10 @@
    ``--calibration-json`` 或默认的 ``data/calibration/current_calibration.json``。
 2. ``tools.video_to_frames``：把输入视频抽帧到 ``frames/raw/``。
 3. ``core.adjust batch``：把 raw 帧矫正到 ``frames/adjusted/``，按需删除 raw。
-4. ``core.grounded_sam_mmdet_batch``：检测 + 分割 + 跟踪，写 ``annotated_frames/``、
-   ``first_match/``、``videos/grounded_sam.mp4``。
+4. ``core.grounded_sam_mmdet_batch_fix``：检测 + 分割 + 跟踪，写 ``annotated_frames/``、
+   ``first_match/``、``videos/grounded_sam.mp4``。传送带运动方向和位置边界
+   从 ``algorithms/config/adjust_calibration_margin.json`` 读取；缺少方向字段时
+   默认按自上而下处理。
 5. ``core.filter_complete_fish``：分完整鱼到 ``complete_match/``、不完整鱼到
    ``incomplete_match/``。
 6. ``core.fish_condition``：计算含尾全长、体长、体高、体重、肥满度，输出
@@ -60,6 +62,7 @@ for import_root in (PROJECT_DIR, ALGORITHMS_ROOT):
 
 from config.cleanup import remove_dir, remove_dir_contents  # noqa: E402
 from config.paths import (  # noqa: E402
+    ADJUST_CALIBRATION_MARGIN_CONFIG_PATH,
     CALIBRATION_CURRENT_JSON,
     CALIBRATION_SESSIONS_DIR,
     JOBS_DIR,
@@ -116,6 +119,10 @@ from config.state import (  # noqa: E402
     now_str,
     scan_interrupted_jobs,
 )
+from algorithms.core.filter_complete_fish import (  # noqa: E402
+    DEFAULT_COMPLETE_THRESHOLD,
+    validate_complete_threshold,
+)
 
 
 def _resolve_input(path: str | Path | None) -> Path | None:
@@ -126,6 +133,41 @@ def _resolve_input(path: str | Path | None) -> Path | None:
 
 def _log(p: Path) -> str:
     return to_project_relative(p)
+
+
+def _load_complete_threshold_from_config() -> float | None:
+    """从 ``algorithms/config/adjust_calibration_margin.json`` 读取管理员设置的完整性阈值。
+
+    配置文件缺失、字段缺失或数值非法时返回 ``None``，由调用方回退到默认值。
+    """
+
+    try:
+        if not ADJUST_CALIBRATION_MARGIN_CONFIG_PATH.exists():
+            return None
+        raw = json.loads(
+            ADJUST_CALIBRATION_MARGIN_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+        value = raw.get("complete_threshold")
+        if value is None:
+            return None
+        return validate_complete_threshold(value)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def resolve_complete_threshold(cli_value: float | None) -> float:
+    """解析最终使用的完整性阈值。
+
+    优先级：显式 CLI 参数 > 管理员配置（adjust_calibration_margin.json）> 默认值。
+    这样管理员在界面上设置的数值会应用到后续所有视频 pipeline 任务。
+    """
+
+    if cli_value is not None:
+        return validate_complete_threshold(cli_value)
+    configured = _load_complete_threshold_from_config()
+    if configured is not None:
+        return configured
+    return DEFAULT_COMPLETE_THRESHOLD
 
 
 def _call_submodule_main(module_name: str, argv: list[str]) -> int:
@@ -397,14 +439,20 @@ def step_grounded_sam(args, ctx: dict) -> int:
         argv.append("--use-sam-hq")
     if getattr(args, "transform_matrix", None):
         argv.extend(["--transform-matrix", str(args.transform_matrix)])
-    rc = _call_submodule_main("algorithms.core.grounded_sam_mmdet_batch", argv)
+    # 该 902 修复版使用配套的检测核心；核心会从共享标定边界配置读取
+    # conveyor_direction，并将其应用到检测门控和首帧样本选择。
+    rc = _call_submodule_main("algorithms.core.grounded_sam_mmdet_batch_fix", argv)
     maybe_simulate_failure(args, FAULT_AFTER_GROUNDED_SAM)
     return rc
 
 
 def step_filter_complete(args, ctx: dict) -> int:
+    complete_threshold = resolve_complete_threshold(
+        getattr(args, "complete_threshold", None)
+    )
     argv = [
         "--video-id", args.video_id,
+        "--complete-threshold", str(complete_threshold),
     ]
     if getattr(args, "force_all_complete", False):
         argv.append("--force-all-complete")
@@ -1300,6 +1348,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="wound 检测 score 阈值，默认 0.5",
     )
     parser.add_argument(
+        "--complete-threshold",
+        type=validate_complete_threshold,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "完整类别概率阈值；只有 P(complete) >= 此值才归为完整。"
+            "未显式传入时读取 algorithms/config/adjust_calibration_margin.json 的 "
+            f"complete_threshold；配置文件缺失时回退默认 {DEFAULT_COMPLETE_THRESHOLD:.1f}"
+        ),
+    )
+    parser.add_argument(
         "--force-all-complete",
         action="store_true",
         help=(
@@ -1628,8 +1687,8 @@ def _run_pipeline(args, state: PipelineState, ctx=None) -> int:
             print(f"[publish] 长期结果：{_log(final_dir)}")
         except FileExistsError as exc:
             print(f"[ERROR] {exc}")
-            state.fail("publish", str(exc))
-            _ensure_failure_results(state, args, "publish", str(exc), selected=selected)
+            state.fail("publish_results", str(exc))
+            _ensure_failure_results(state, args, "publish_results", str(exc), selected=selected)
             return 2
     else:
         print("[publish] --no-publish，跳过发布到 results/")

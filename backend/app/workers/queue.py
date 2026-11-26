@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 import logging
 from pathlib import Path
@@ -13,7 +14,10 @@ from app.infra.redis_client import get_redis
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_QUEUE_NAME = "fish"
+# Source mode keeps the historical ``fish`` queue. Packaged mode sets a
+# separate name so a source worker can never consume a packaged job (or vice
+# versa) when both installations share the same Redis instance.
+DEFAULT_QUEUE_NAME = os.getenv("FISH_RQ_QUEUE", "fish").strip() or "fish"
 
 
 def get_queue(name: str = DEFAULT_QUEUE_NAME) -> Queue:
@@ -54,7 +58,7 @@ def cancel_algorithm_jobs(video_id: str) -> int:
             from rq.job import Job
             job = item if hasattr(item, "get_call_string") else Job.fetch(job_id, connection=q.connection)
             kwargs = job.kwargs or {}
-            if kwargs.get("upload_video_id") != video_id:
+            if kwargs.get("task_video_id") != video_id:
                 continue
             if job.get_status() in {"queued", "scheduled", "deferred"}:
                 job.cancel()
@@ -111,6 +115,7 @@ def enqueue_algorithm_video_pipeline_from_video_task(
     video_id: str,
     input_video: str,
     force_all_complete: bool = False,
+    conveyor_direction: str | None = None,
 ) -> str:
     """
     视频上传 / 摄像头停止时使用的便捷入口。
@@ -128,10 +133,11 @@ def enqueue_algorithm_video_pipeline_from_video_task(
     job = q.enqueue(
         run_algorithm_video_pipeline,
         kwargs={
-            "upload_video_id": video_id,
+            "task_video_id": video_id,
             "input_video": input_video,
             "task_token": task_token,
             "force_all_complete": force_all_complete,
+            "conveyor_direction": conveyor_direction,
         },
         retry=Retry(max=2, interval=[10, 30]),
         # 长视频需要先完整抽帧；RQ 超时必须覆盖算法 CLI 超时。
@@ -158,7 +164,7 @@ def recover_missing_queued_video_tasks() -> dict[str, Any]:
     known_video_ids: set[str] = set()
     try:
         for job in q.get_jobs():
-            known_video_ids.add(str((job.kwargs or {}).get("upload_video_id") or ""))
+            known_video_ids.add(str((job.kwargs or {}).get("task_video_id") or ""))
         for registry_name in ("started", "scheduled", "deferred"):
             registry = (
                 q.started_job_registry
@@ -170,7 +176,7 @@ def recover_missing_queued_video_tasks() -> dict[str, Any]:
                     from rq.job import Job
 
                     job = Job.fetch(job_id, connection=q.connection)
-                    known_video_ids.add(str((job.kwargs or {}).get("upload_video_id") or ""))
+                    known_video_ids.add(str((job.kwargs or {}).get("task_video_id") or ""))
                 except Exception:
                     continue
     except Exception:
@@ -217,33 +223,3 @@ def recover_missing_queued_video_tasks() -> dict[str, Any]:
     result = {"recovered": recovered, "skipped": skipped}
     logger.info("startup queue recovery: %s", result)
     return result
-
-
-# ---------------------------------------------------------------------------
-# 旧接口兼容
-# ---------------------------------------------------------------------------
-
-
-def enqueue_stream_ingest(*args: Any, **kwargs: Any) -> str:
-    """
-    兼容旧调用者：transition 期间保留旧函数名。
-
-    旧语义是抽帧 + 单鱼五维，本阶段已切到整视频算法 CLI pipeline。
-    调用方应改用：
-        enqueue_algorithm_video_pipeline_from_video_task(...)
-    """
-    raise RuntimeError(
-        "enqueue_stream_ingest 已废弃；请使用 "
-        "app.workers.queue.enqueue_algorithm_video_pipeline 或 "
-        "enqueue_algorithm_video_pipeline_from_video_task。"
-    )
-
-
-def enqueue_fish_pipeline(*args: Any, **kwargs: Any) -> str:
-    """
-    兼容旧调用者：单鱼 pipeline 已废弃。
-    """
-    raise RuntimeError(
-        "enqueue_fish_pipeline 已废弃；请使用 "
-        "app.workers.queue.enqueue_algorithm_video_pipeline。"
-    )

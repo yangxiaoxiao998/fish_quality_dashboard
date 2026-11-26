@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional
 
 from sqlalchemy import func, select, update
@@ -489,6 +489,20 @@ def recover_stale_schedules(
         else:
             next_status = SCHEDULE_PENDING
             error_message = "backend_restart_recovered_schedule"
+            # Rebase the remaining recording window. Keeping the original
+            # start time would make the scheduler treat a recovered recording
+            # as a misfire and skip it after the grace period.
+            remaining_seconds = max(
+                60,
+                int((r.planned_end_at - now).total_seconds()),
+            ) if r.planned_end_at else 60
+            planned_start_at = now
+            planned_end_at = now + timedelta(seconds=remaining_seconds)
+            duration_minutes = max(1, (remaining_seconds + 59) // 60)
+        if next_status == SCHEDULE_COMPLETED:
+            planned_start_at = r.planned_start_at
+            planned_end_at = r.planned_end_at
+            duration_minutes = r.duration_minutes
         db.execute(
             update(CameraRecordSchedule)
             .where(CameraRecordSchedule.schedule_id == r.schedule_id)
@@ -496,6 +510,12 @@ def recover_stale_schedules(
                 status=next_status,
                 error_message=error_message,
                 actual_stop_at=now if next_status == SCHEDULE_COMPLETED else None,
+                planned_start_at=planned_start_at,
+                planned_end_at=planned_end_at,
+                duration_minutes=duration_minutes,
+                actual_start_at=None if next_status == SCHEDULE_PENDING else r.actual_start_at,
+                claimed_at=None,
+                video_id=None if next_status == SCHEDULE_PENDING else r.video_id,
                 claim_token=None,
             )
             .execution_options(synchronize_session=False)

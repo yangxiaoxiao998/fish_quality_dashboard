@@ -1,4 +1,5 @@
 // 模拟数据
+import fishPlaceholder from '@/assets/images/fish-placeholder.svg'
 
 export interface FishRecord {
   fish_id: string
@@ -38,8 +39,8 @@ export function generateFishData(count: number = 50): FishRecord[] {
     fish_id: `F20260309${String(i + 1).padStart(4, '0')}`,
     video_id: `V20260309${String(Math.floor(i / 10) + 1).padStart(3, '0')}`,
     created_at: `2026-03-09 ${String(Math.floor(i / 2) + 9).padStart(2, '0')}:${String((i * 3) % 60).padStart(2, '0')}:${String((i * 7) % 60).padStart(2, '0')}`,
-    original_image_url: '/src/assets/images/test-thumb.jpg',
-    corrected_image_url: '/src/assets/images/test-thumb.jpg',
+    original_image_url: fishPlaceholder,
+    corrected_image_url: fishPlaceholder,
     body_length: 20 + Math.random() * 15,
     body_height: 5 + Math.random() * 3,
     body_weight: 100 + Math.random() * 200,
@@ -64,7 +65,7 @@ export function generateVideoData(count: number = 20): VideoRecord[] {
 export function generateImageData(count: number = 50): ImageRecord[] {
   return Array.from({ length: count }, (_, i) => ({
     id: `img_${i}`,
-    url: '/src/assets/images/test-thumb.jpg',
+    url: fishPlaceholder,
     name: `fish_${String(i + 1).padStart(4, '0')}.jpg`,
     time: `2026-03-0${(i % 9) + 1} ${String((i % 12) + 8).padStart(2, '0')}:${String((i * 7) % 60).padStart(2, '0')}`,
     fish_id: `F20260309${String(i + 1).padStart(4, '0')}`,

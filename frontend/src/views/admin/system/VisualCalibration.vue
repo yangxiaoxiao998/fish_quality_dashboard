@@ -76,7 +76,9 @@ const marginConfig = reactive({
   vertical_margin_ratio: 0.05,
   tracking_start_ratio: 0.4,
   crop_save_ratio: 0.7,
+  complete_threshold: 0.9,
 })
+const conveyorDirection = ref<'left_to_right' | 'top_to_bottom'>('top_to_bottom')
 const marginSaving = ref(false)
 
 const calibrationForm = reactive<CalibrationFormState>({
@@ -295,6 +297,10 @@ async function loadMarginConfig(): Promise<void> {
     for (const key of Object.keys(marginConfig) as Array<keyof typeof marginConfig>) {
       if (resp.data?.[key] !== undefined) marginConfig[key] = Number(resp.data[key])
     }
+    const direction = resp.data?.conveyor_direction
+    if (direction === 'left_to_right' || direction === 'top_to_bottom') {
+      conveyorDirection.value = direction
+    }
   } catch (err) {
     console.warn('[VisualCalibration] load margin config failed:', err)
   }
@@ -309,6 +315,54 @@ async function saveMarginConfig(): Promise<void> {
     Message.error(toErrorMessage(err) || '检测区域参数保存失败')
   } finally {
     marginSaving.value = false
+  }
+}
+
+const completeThresholdSaving = ref(false)
+
+async function saveCompleteThreshold(): Promise<void> {
+  const value = Number(marginConfig.complete_threshold)
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    Message.warning('请输入 0 到 1 之间的完整性阈值')
+    return
+  }
+  completeThresholdSaving.value = true
+  try {
+    await http.post('/api/calibration/margin-config', {
+      complete_threshold: value,
+    })
+    marginConfig.complete_threshold = value
+    Message.success('完整性阈值已保存，后续视频任务将使用最新配置')
+  } catch (err) {
+    Message.error(toErrorMessage(err) || '完整性阈值保存失败')
+  } finally {
+    completeThresholdSaving.value = false
+  }
+}
+
+async function loadConveyorDirection(): Promise<void> {
+  try {
+    const resp = await http.get('/api/calibration/margin-config')
+    if (resp.data?.conveyor_direction) {
+      conveyorDirection.value = resp.data.conveyor_direction
+    }
+  } catch (err) {
+    console.warn('[VisualCalibration] load conveyor direction failed:', err)
+  }
+}
+
+async function toggleConveyorDirection(): Promise<void> {
+  const newDirection = conveyorDirection.value === 'left_to_right' ? 'top_to_bottom' : 'left_to_right'
+  try {
+    await http.post('/api/calibration/margin-config', {
+      ...marginConfig,
+      conveyor_direction: newDirection,
+    })
+    conveyorDirection.value = newDirection
+    const directionText = newDirection === 'left_to_right' ? '从左到右' : '从上到下'
+    Message.success(`传送带移动方向已切换为：${directionText}`)
+  } catch (err) {
+    Message.error(toErrorMessage(err) || '切换传送带方向失败')
   }
 }
 
@@ -432,7 +486,7 @@ async function runCalibration() {
       lastResult.value?.image_path
     if (!sourceImage) {
       Message.warning(
-        '请先抓拍或上传标定图片，确认预览图出现后再执行视觉矫正。',
+        '请先从当前摄像头抓拍标定图片，确认预览图出现后再执行视觉矫正。',
       )
       return
     }
@@ -496,15 +550,6 @@ async function clearCalibration() {
   )
 }
 
-function handleUpload() {
-  logUserAction({
-    module: '视觉矫正',
-    action: 'upload_calibration_image',
-    message: '点击上传标定图片',
-  })
-  Message.info('上传标定图片入口待后端上传接口确认后接入。')
-}
-
 function formatMatrixCell(cell: any): string {
   const n = Number(cell)
   if (!Number.isFinite(n)) return '--'
@@ -519,6 +564,7 @@ onMounted(() => {
   loadStatus(true)
   loadCameraSettings()
   loadMarginConfig()
+  loadConveyorDirection()
   getCalibrationConfig().then((resp) => { realLengthMm.value = resp.data.real_length_mm })
 })
 
@@ -645,7 +691,6 @@ async function saveRealLength() {
           >
             从当前摄像头抓拍标定
           </a-button>
-          <a-button @click="handleUpload">上传标定图片</a-button>
           <a-button
             status="success"
             :loading="actionLoading"
@@ -686,6 +731,33 @@ async function saveRealLength() {
           <a-button type="primary" :loading="marginSaving" @click="saveMarginConfig">确定</a-button>
         </a-space>
         <div class="calibration-margin-hint">左右边缘比例、上下边缘比例、跟踪开始比例、裁剪保存比例</div>
+        <div class="calibration-margin-title" style="margin-top: 12px;">传送带移动方向</div>
+        <a-space wrap>
+          <a-button
+            :type="conveyorDirection === 'left_to_right' ? 'primary' : 'outline'"
+            @click="toggleConveyorDirection"
+          >
+            从左到右
+          </a-button>
+          <a-button
+            :type="conveyorDirection === 'top_to_bottom' ? 'primary' : 'outline'"
+            @click="toggleConveyorDirection"
+          >
+            从上到下
+          </a-button>
+        </a-space>
+        <div class="calibration-margin-title" style="margin-top: 12px;">完整性判断阈值</div>
+        <a-space wrap class="calibration-margin-row">
+          <a-input-number
+            v-model="marginConfig.complete_threshold"
+            :min="0"
+            :max="1"
+            :precision="4"
+            placeholder="完整类别概率阈值"
+          />
+          <a-button type="primary" :loading="completeThresholdSaving" @click="saveCompleteThreshold">确定</a-button>
+        </a-space>
+        <div class="calibration-margin-hint">只有 P(complete) ≥ 此阈值才判定为完整鱼；保存后视频任务将使用该值</div>
       </a-card>
     </div>
 

@@ -120,15 +120,6 @@ export interface CaptureCalibrationResp {
   }
 }
 
-export interface RunAlgorithmVideoPayload {
-  input_video: string
-  camera_id?: string
-  device?: string
-  video_fps?: number
-  overwrite?: boolean
-  import_to_db?: boolean
-}
-
 export interface AlgorithmSummary {
   total_fish?: number
   complete_fish?: number
@@ -160,6 +151,7 @@ export interface AlgorithmFish {
 export interface AlgorithmVideoResultData {
   video_id: string
   status: AlgorithmStatus
+  result_video_url?: string
   grounded_video_url?: string
   measurement_csv_url?: string
   summary?: AlgorithmSummary
@@ -171,22 +163,6 @@ export interface AlgorithmVideoResultData {
 export interface AlgorithmVideoResultResp {
   ok: boolean
   data: AlgorithmVideoResultData
-}
-
-export interface RunAlgorithmVideoResp {
-  ok: boolean
-  video_id?: string | null
-  status?: AlgorithmStatus | null
-  result_dir?: string | null
-  pipeline_result_path?: string | null
-  error_conclusion_path?: string | null
-  log_path?: string | null
-  returncode?: number | null
-  summary?: AlgorithmSummary | null
-  import_result?: any
-  failed_stage?: string | null
-  error_message?: string | null
-  error_conclusion?: string | null
 }
 
 export interface ErrorConclusionResp {
@@ -222,21 +198,6 @@ export function runAlgorithmCalibration(payload: RunCalibrationPayload) {
       ...payload,
     },
     { timeout: 30 * 60 * 1000 }
-  )
-}
-
-export function runAlgorithmVideo(payload: RunAlgorithmVideoPayload) {
-  return http.post<RunAlgorithmVideoResp>(
-    '/api/algorithm/videos',
-    {
-      camera_id: 'default',
-      device: 'cuda',
-      video_fps: 25,
-      overwrite: true,
-      import_to_db: true,
-      ...payload,
-    },
-    { timeout: 3 * 60 * 60 * 1000 }
   )
 }
 

@@ -360,7 +360,7 @@ def capture_frame_via_camera_yzt(
             create_video_task=False,
         )
         # 防回归提示：标定抓拍必须以 calibration_only=True 启动 camera_service_yzt，
-        # 否则会创建 video_task 并污染 /api/videos → VideoHistory。
+        # 否则会创建 video_task 并污染视频历史列表。
         # 这里每次启动都打印一行，便于排查历史记录里出现的 calibration 任务。
         logger.info(
             "[calibration_capture] start_stream calibration_only=True write_video=False create_video_task=False "

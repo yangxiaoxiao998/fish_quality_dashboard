@@ -1,23 +1,23 @@
 ### 必须带配置文件启动 MediaMTX
 
-nohup /home/dsl/Code/yangzt/fish_quality_dashboard/mediamtx/mediamtx  /home/dsl/Code/yangzt/fish_quality_dashboard/mediamtx/mediamtx.yml \
+nohup ./mediamtx ./mediamtx.yml \
 
-> /home/yangzt/Code/fish_quality_dashboard/mediamtx/mediamtx.log 2>&1 &
+> mediamtx.log 2>&1 &
 
 ### 关闭mediamtx
 
 pkill -f mediamtx
 sleep 1
-sudo ss -lunp | grep ':8000' || echo "udp 8000 free"
+sudo ss -lunp | grep ':10000' || echo "udp 10000 free"
 
 ### 重启mediamtx
 
-cd /home/dsl/Code/yangzt/fish_quality_dashboard/mediamtx
+cd /home/dsl/Code/yangzt/test3/mediamtx
 
 pkill -f mediamtx || true
 sleep 1
 
-nohup /home/dsl/Code/yangzt/fish_quality_dashboard/mediamtx/mediamtx.yml > mediamtx.log 2>&1 &
+./mediamtx ./mediamtx.yml > mediamtx.log 2>&1 &
 
 sleep 2
 tail -80 mediamtx.log

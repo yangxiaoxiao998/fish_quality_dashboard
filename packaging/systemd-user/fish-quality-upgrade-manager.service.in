@@ -1,0 +1,19 @@
+[Unit]
+Description=Fish Quality Upgrade Manager
+PartOf=fish-quality.target
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@/backend
+EnvironmentFile=-%h/.config/fish-quality/source.env
+Environment=FISH_RQ_QUEUE=fish
+Environment=PYTHONNOUSERSITE=1
+Environment=PATH=@CONDA_ENV_DIR@/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@CONDA_ENV_DIR@/bin/python -m app.services.update.upgrade_manager
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=fish-quality.target

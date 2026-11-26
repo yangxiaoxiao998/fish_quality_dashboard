@@ -1,0 +1,44 @@
+--- a/main_pi.py
++++ b/main_pi.py
+@@ -252,6 +252,15 @@
+         request.autofocus_window,
+     )
+ 
++    # Pi 4's V4L2 H.264 encoder clamps widths above 1920. Encode these
++    # frames in software so the published stream keeps the requested size.
++    encoder_args = ""
++    if request.width > 1920 or request.height > 1080:
++        encoder_args = (
++            "--libav-video-codec libx264 "
++            "--libav-video-codec-opts 'preset=ultrafast;tune=zerolatency' "
++        )
++
+     cmd = (
+         f"rpicam-vid -t 0 "
+         f"--nopreview "
+@@ -261,20 +270,18 @@
+         f"{focus_args}"
+         f"--bitrate {request.bitrate} "
+         f"--codec libav "
+-        f"--libav-format h264 "
++        f"{encoder_args}"
++        f"--libav-format mpegts "
++        f"--intra {request.fps} "
+         f"--inline "
+         f"-o - | "
+         f"ffmpeg "
+         # f"-loglevel debug "
+         f"-fflags +genpts "
+-        f"-f h264 "
+-        f"-r {request.fps} "
++        f"-f mpegts "
+         f"-i - "
+         f"-an "
+-        # f"-c copy "
+-        f"-c:v libx264 "
+-        f"-preset ultrafast "
+-        f"-tune zerolatency "
++        f"-c:v copy "
+         f"-f flv "
+         f"{request.stream_url}"
+ 

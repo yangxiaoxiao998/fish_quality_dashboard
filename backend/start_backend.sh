@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # backend/start_backend.sh
 #
-# 第二阶段：算法统一走 algorithms.tools.run_video_pipeline / algorithms.core.adjust_calibration，
-# 后端不再写 FISH_ALGO_MODE mock / real 切换。
+# 算法统一走 algorithms.tools.run_video_pipeline / algorithms.core.adjust_calibration。
 #
 # 此脚本只负责启动 uvicorn。worker 推荐通过根目录的 start_dev.sh / restart_fish_dashboard.sh
 # 统一启动，避免重复管理。

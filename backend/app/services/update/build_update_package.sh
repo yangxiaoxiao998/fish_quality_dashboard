@@ -4,6 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd -P)"
 
+# Build packaged releases from the PyInstaller/AppImage artifacts. Source
+# updates remain available for development installations through this script.
+if [[ "${1:-}" == "--packaged" || "${1:-}" == "--artifact" ]]; then
+  shift
+  exec "$SCRIPT_DIR/build_packaged_update_package.sh" "$@"
+fi
+
 # shellcheck source=update/lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 

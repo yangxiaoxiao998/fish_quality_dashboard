@@ -122,7 +122,6 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    os.environ.setdefault("FISH_ALGO_MODE", "real")
     os.environ.setdefault("FISH_PROJECT_ROOT", str(PROJECT_ROOT))
     os.environ.setdefault("FISH_ALGO_ROOT", str(ALGO_ROOT))
     os.environ.setdefault("FISH_DATA_ROOT", str(DATA_ROOT))

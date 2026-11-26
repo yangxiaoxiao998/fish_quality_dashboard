@@ -1,14 +1,21 @@
 # path.py
-from pathlib import Path
+from app.runtime_paths import (
+    ALGORITHMS_ROOT,
+    CONFIG_ROOT,
+    DATA_ROOT,
+    INSTALL_ROOT,
+    RESOURCE_ROOT,
+    resource_path,
+)
 
 
-# 项目根目录（fish_quality_dashboard）
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 源码模式下是仓库根；PyInstaller 模式下是后端可执行文件所在目录。
+PROJECT_ROOT = INSTALL_ROOT
 
 # data 目录
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = DATA_ROOT
 
-# 上传目录（前端仍上传到 data/uploads/videos，video_task.source_path 引用）
+# 运行期摄像头录制和媒体产物目录，video_task.source_path 引用其中的文件。
 UPLOAD_DIR = DATA_DIR / "uploads"
 VID_DIR = UPLOAD_DIR / "videos"
 SRC_IMG_DIR = UPLOAD_DIR / "original_images"
@@ -43,3 +50,23 @@ def ensure_directories() -> None:
         LOG_DIR,
     ]:
         p.mkdir(parents=True, exist_ok=True)
+
+
+__all__ = [
+    "ALGORITHMS_ROOT",
+    "CALIBRATION_CURRENT_JSON",
+    "CALIBRATION_DIR",
+    "CONFIG_ROOT",
+    "DATA_DIR",
+    "DB_FILE",
+    "DB_LOG_FILE",
+    "JOBS_DIR",
+    "LOG_DIR",
+    "PROJECT_ROOT",
+    "RESOURCE_ROOT",
+    "SRC_IMG_DIR",
+    "UPLOAD_DIR",
+    "VID_DIR",
+    "ensure_directories",
+    "resource_path",
+]

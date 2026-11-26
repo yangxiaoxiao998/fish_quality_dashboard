@@ -37,13 +37,13 @@ const loading = ref(false)
 const detailLoading = ref(false)
 const autoRefresh = ref(false)
 let refreshTimer: number | null = null
+let clockTimer: number | null = null
 
 const summary = ref<OpsAlgorithmTaskSummary | null>(null)
 
 const filterForm = reactive({
   date: todayStr,
   videoId: '',
-  sourceType: '' as '' | 'rtsp' | 'upload',
   status: '' as
     | ''
     | 'queued'
@@ -69,6 +69,7 @@ const pagination = reactive({
 // detail drawer
 const detailVisible = ref(false)
 const detail = ref<OpsAlgorithmTaskDetail | null>(null)
+const clockNow = ref(Date.now())
 const detailTab = ref<'basic' | 'stages' | 'files' | 'log' | 'queue'>('basic')
 const markFailedVisible = ref(false)
 const markFailedReason = ref('')
@@ -108,7 +109,7 @@ const STAGE_NAME: Record<string, string> = {
 
 const FILE_LABEL: Record<string, string> = {
   playable_h264: '可播放 H.264',
-  playable_mp4: '原始 MP4',
+  playable_mp4: '源视频（任一副本）',
   job_root: 'job 目录',
   pipeline_state_json: 'pipeline_state.json',
   pipeline_result_json: 'pipeline_result.json',
@@ -125,12 +126,6 @@ const STATUS_OPTIONS = [
   { label: '疑似卡住', value: 'stuck' },
   { label: '已完成', value: 'done' },
   { label: '失败', value: 'failed' },
-]
-
-const SOURCE_OPTIONS = [
-  { label: '全部', value: '' },
-  { label: '摄像头录制 rtsp', value: 'rtsp' },
-  { label: '上传视频 upload', value: 'upload' },
 ]
 
 const STAGE_OPTIONS = [
@@ -170,9 +165,25 @@ function fmtTime(s: string | null | undefined): string {
 function fmtElapsed(seconds: number | null | undefined): string {
   if (seconds == null) return '--'
   if (seconds < 60) return `${seconds.toFixed(1)} 秒`
+  if (seconds >= 3600) {
+    const h = Math.floor(seconds / 3600)
+    const m = Math.floor((seconds % 3600) / 60)
+    const s = Math.floor(seconds % 60)
+    return `${h} 小时 ${m} 分 ${s} 秒`
+  }
   const m = Math.floor(seconds / 60)
   const s = Math.floor(seconds % 60)
   return `${m} 分 ${s} 秒`
+}
+
+function fmtStageElapsed(stage: OpsAlgorithmTaskStage): string {
+  if (stage.status === 'running' && stage.started_at) {
+    const started = dayjs(stage.started_at)
+    if (started.isValid()) {
+      return fmtElapsed(Math.max(0, (clockNow.value - started.valueOf()) / 1000))
+    }
+  }
+  return fmtElapsed(stage.elapsed_seconds)
 }
 
 function progressColor(record: OpsAlgorithmTaskItem): string {
@@ -211,7 +222,6 @@ async function loadList() {
     }
     if (filterForm.date) params.date = filterForm.date
     if (filterForm.videoId.trim()) params.keyword = filterForm.videoId.trim()
-    if (filterForm.sourceType) params.source_type = filterForm.sourceType
     if (filterForm.status) params.status = filterForm.status
     // failed_stage 暂时没在后端加参数过滤，先用前端过滤
     const resp = await listOpsAlgorithmTasks(params)
@@ -250,9 +260,13 @@ function getLogSource(type: 'algorithm_cli' | 'pipeline_state' | 'worker') {
 function resetFilters() {
   filterForm.date = todayStr
   filterForm.videoId = ''
-  filterForm.sourceType = ''
   filterForm.status = ''
   filterForm.failedStage = ''
+  pagination.current = 1
+  void loadList()
+}
+
+function handleDateChange(): void {
   pagination.current = 1
   void loadList()
 }
@@ -295,6 +309,19 @@ async function openDetail(record: OpsAlgorithmTaskItem) {
     Message.error('加载任务详情失败：' + (err as Error).message)
   } finally {
     detailLoading.value = false
+  }
+}
+
+async function refreshOpenDetail(): Promise<void> {
+  const videoId = (detail.value?.video as { video_id?: string } | undefined)?.video_id
+  if (!detailVisible.value || !videoId) return
+  try {
+    const resp = await getOpsAlgorithmTaskDetail(videoId)
+    if (resp.data?.ok && resp.data?.data) {
+      detail.value = resp.data.data as OpsAlgorithmTaskDetail
+    }
+  } catch (err) {
+    console.warn('[AlgorithmTaskMonitor] refresh detail failed', err)
   }
 }
 
@@ -428,7 +455,7 @@ async function retryWithIntegrity(record: OpsAlgorithmTaskItem, forceAllComplete
 
 function jumpToDashboard(record: OpsAlgorithmTaskItem) {
   router.push({
-    path: '/',
+    path: '/dashboard',
     query: { mode: 'result', video_id: record.video_id },
   })
 }
@@ -448,7 +475,7 @@ function setupRefreshTimer() {
   clearRefreshTimer()
   if (!autoRefresh.value) return
   refreshTimer = window.setInterval(() => {
-    void loadAll()
+    void Promise.all([loadAll(), refreshOpenDetail()])
   }, 5000)
 }
 
@@ -461,11 +488,13 @@ watch(autoRefresh, () => {
 // ---------------------------------------------------------------------------
 
 onMounted(async () => {
+  clockTimer = window.setInterval(() => { clockNow.value = Date.now() }, 1000)
   await loadAll()
 })
 
 onBeforeUnmount(() => {
   clearRefreshTimer()
+  if (clockTimer != null) window.clearInterval(clockTimer)
 })
 </script>
 
@@ -593,6 +622,7 @@ onBeforeUnmount(() => {
             value-format="YYYY-MM-DD"
             style="width: 160px"
             allow-clear
+            @change="handleDateChange"
           />
         </a-form-item>
         <a-form-item label="视频 ID">
@@ -601,14 +631,6 @@ onBeforeUnmount(() => {
             placeholder="模糊搜索"
             allow-clear
             style="width: 220px"
-          />
-        </a-form-item>
-        <a-form-item label="来源">
-          <a-select
-            v-model="filterForm.sourceType"
-            :options="SOURCE_OPTIONS"
-            placeholder="全部"
-            style="width: 160px"
           />
         </a-form-item>
         <a-form-item label="状态">
@@ -650,15 +672,6 @@ onBeforeUnmount(() => {
           <a-table-column title="视频 ID" data-index="video_id" :width="220">
             <template #cell="{ record }">
               <a-link @click="openDetail(record)">{{ record.video_id }}</a-link>
-            </template>
-          </a-table-column>
-          <a-table-column title="来源" :width="100">
-            <template #cell="{ record }">
-              <a-tag
-                :color="record.source_type === 'rtsp' ? 'purple' : 'arcoblue'"
-              >
-                {{ record.source_type }}
-              </a-tag>
             </template>
           </a-table-column>
           <a-table-column title="状态" :width="100">
@@ -830,7 +843,6 @@ onBeforeUnmount(() => {
               v-if="detail.video"
               :data="[
                 { label: '视频 ID', value: (detail.video as { video_id?: string }).video_id },
-                { label: '来源', value: (detail.video as { source_type?: string }).source_type },
                 { label: 'DB 状态', value: (detail.video as { status?: string }).status },
                 { label: '显示状态', value: detail.display_status },
                 {
@@ -842,6 +854,7 @@ onBeforeUnmount(() => {
                 { label: '创建时间', value: fmtTime((detail.video as { created_at?: string }).created_at) },
                 { label: '开始时间', value: fmtTime((detail.video as { started_at?: string }).started_at) },
                 { label: '结束时间', value: fmtTime((detail.video as { finished_at?: string }).finished_at) },
+                { label: '算法总处理耗时', value: fmtElapsed(detail.total_elapsed_seconds) },
                 {
                   label: '失败阶段',
                   value: detail.failed_stage
@@ -913,8 +926,11 @@ onBeforeUnmount(() => {
                     {{ s.status }}
                   </a-tag>
                   <span class="stage-elapsed"
-                    >耗时: {{ fmtElapsed(s.elapsed_seconds) }}</span
+                    >耗时: {{ fmtStageElapsed(s) }}</span
                   >
+                  <span v-if="s.timing_source === 'estimated'" class="stage-estimated">历史估算</span>
+                  <span v-if="s.started_at" class="stage-count">开始: {{ fmtTime(s.started_at) }}</span>
+                  <span v-if="s.finished_at" class="stage-count">结束: {{ fmtTime(s.finished_at) }}</span>
                   <span class="stage-count" v-if="s.input_count != null"
                     >输入: {{ s.input_count }}</span
                   >
@@ -1437,6 +1453,13 @@ onBeforeUnmount(() => {
 .stage-count {
   font-size: 12px;
   color: #4e5969;
+}
+.stage-estimated {
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: #fff7e8;
+  color: #d46b08;
+  font-size: 12px;
 }
 .file-path {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

@@ -32,7 +32,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches
 from sqlalchemy.orm import Session
 
-from app.paths import DATA_DIR, PROJECT_ROOT  # noqa: E402
+from app.paths import DATA_DIR, PROJECT_ROOT, resource_path  # noqa: E402
 from app.services.path_service import to_data_relative
 from app.services.report_stats_service import (
     build_daily_report_context,
@@ -101,6 +101,9 @@ FIXED_BODY_DEMO_HEIGHT_INCH = 3.6 / 2.54
 
 def get_template_path() -> Path:
     """日报和视频报表共用的固定模板路径。"""
+    bundled = resource_path("backend", "app", "templates", "report_word_template.docx")
+    if bundled.exists():
+        return bundled
     return PROJECT_ROOT / "backend" / "app" / "templates" / "report_word_template.docx"
 
 
@@ -153,17 +156,17 @@ def resolve_report_image_path(value) -> Path | None:
     if not s:
         return None
     if s.startswith("/static/"):
-        return PROJECT_ROOT / "data" / s[len("/static/"):]
+        return DATA_DIR / s[len("/static/"):]
     if s.startswith("static/"):
-        return PROJECT_ROOT / "data" / s[len("static/"):]
+        return DATA_DIR / s[len("static/"):]
     if s.startswith("data/"):
-        return PROJECT_ROOT / s
+        return DATA_DIR / s[len("data/"):]
     if s.startswith("/data/"):
-        return PROJECT_ROOT / s.lstrip("/")
+        return DATA_DIR / s[len("/data/"):]
     if s.startswith("results/"):
-        return PROJECT_ROOT / "data" / s
+        return DATA_DIR / s
     if s.startswith("/results/"):
-        return PROJECT_ROOT / "data" / s.lstrip("/")
+        return DATA_DIR / s.lstrip("/")
     p = Path(s)
     if p.is_absolute():
         return p

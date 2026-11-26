@@ -35,6 +35,7 @@ export interface ReportSummary {
 
 export interface ReportCharts {
   fish_count_trend: { bucket: string; bucket_kind: string; count: number }[]
+  video_task_trend: { bucket: string; bucket_kind: string; count: number }[]
   body_length_distribution: { label: string; count: number }[]
   body_length_without_tail_distribution: { label: string; count: number }[]
   body_height_distribution: { label: string; count: number }[]
@@ -89,6 +90,7 @@ const EMPTY_SUMMARY: ReportSummary = {
 
 const EMPTY_CHARTS: ReportCharts = {
   fish_count_trend: [],
+  video_task_trend: [],
   body_length_distribution: [],
   body_length_without_tail_distribution: [],
   body_height_distribution: [],

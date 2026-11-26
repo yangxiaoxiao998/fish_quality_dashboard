@@ -32,42 +32,15 @@ def upsert_stats_increment(
     condition_factor: float | None,
     is_abnormal: bool,
 ) -> None:
-    bucket_start, bucket_end = _bucket_range(ts)
+    """Reject unsafe realtime increments until an event identity is defined.
 
-    stmt = select(Stats5Min).where(
-        Stats5Min.video_id == video_id,
-        Stats5Min.bucket_start == bucket_start,
-    )
-    obj = db.execute(stmt).scalar_one_or_none()
-    is_new = obj is None
-
-    if obj is None:
-        obj = Stats5Min(
-            video_id=video_id,
-            bucket_start=bucket_start,
-            bucket_end=bucket_end,
-            count=0,
-            sum_body_length=0.0,
-            sum_body_height=0.0,
-            sum_body_weight=0.0,
-            sum_condition_factor=0.0,
-            abnormal_count=0,
-        )
-        db.add(obj)
-
-    obj.count += 1
-    obj.sum_body_length += float(body_length or 0.0)
-    obj.sum_body_height += float(body_height or 0.0)
-    obj.sum_body_weight += float(body_weight or 0.0)
-    obj.sum_condition_factor += float(condition_factor or 0.0)
-    obj.abnormal_count += 1 if is_abnormal else 0
-
-    db.commit()
-
-    print(
-        f"[DB] stats updated: video_id={video_id!r} "
-        f"bucket={bucket_start.isoformat()} count={obj.count} "
-        f"abnormal_count={obj.abnormal_count} is_new={is_new} committed=True"
+    The formal pipeline rebuilds buckets from one authoritative fish row per
+    ``video_id`` after import.  A frame-level increment has no idempotency key,
+    so accepting it would count retries and repeated frames as new fish.
+    """
+    raise RuntimeError(
+        "realtime stats increments are disabled; rebuild stats_5min after "
+        "algorithm import or add an idempotent fish event key first"
     )
 
 

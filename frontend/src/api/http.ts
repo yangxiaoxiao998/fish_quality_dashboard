@@ -1,13 +1,18 @@
 import axios, { AxiosError } from "axios";
 
 const baseURL = import.meta.env.VITE_API_DOMAIN || "";
+const apiKey = import.meta.env.VITE_API_KEY || "";
 
 export function createHttpClient(base = "", timeout = 8000) {
-  return axios.create({
+  const client = axios.create({
     baseURL: base,
     timeout,
     withCredentials: false,
   });
+  if (apiKey) {
+    client.defaults.headers.common["X-API-Key"] = apiKey;
+  }
+  return client;
 }
 
 export const http = createHttpClient(baseURL, 8000);

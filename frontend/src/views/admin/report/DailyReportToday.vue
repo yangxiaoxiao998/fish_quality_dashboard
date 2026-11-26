@@ -42,7 +42,7 @@
       <!-- 图表板块 -->
       <ReportSection
         id="chart-block"
-        title="图表板块"
+        title="二、可视化统计分析"
         subtitle="以统计图表形式展示鱼数、体征与破损率分布。"
       >
         <a-empty
@@ -50,41 +50,41 @@
           description="暂无可用于绘图的数据"
         />
         <div v-else class="charts-grid">
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">鱼体状态分布</span></template>
-            <div ref="statusPieRef" class="chart-canvas chart-canvas-tall"></div>
-          </a-card>
-          <a-card :bordered="false" class="chart-card">
-             <template #title><span class="chart-title">全长分布 (cm)</span></template>
-            <div ref="lengthDistRef" class="chart-canvas"></div>
-          </a-card>
-           <a-card :bordered="false" class="chart-card">
-              <template #title><span class="chart-title">体高分布 (cm)</span></template>
-            <div ref="noTailDistRef" class="chart-canvas"></div>
-           </a-card>
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">体高分布 (cm)</span></template>
-            <div ref="heightDistRef" class="chart-canvas"></div>
-          </a-card>
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">体重分布 (g)</span></template>
-            <div ref="weightDistRef" class="chart-canvas"></div>
-          </a-card>
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">肥满度分布</span></template>
-            <div ref="conditionDistRef" class="chart-canvas"></div>
-          </a-card>
-          <a-card v-if="hasDamageData" :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">破损率分布 (×100%)</span></template>
-            <div ref="damageDistRef" class="chart-canvas"></div>
-          </a-card>
+           <div class="chart-card">
+             <div class="chart-title">鱼体状态分布</div>
+             <div ref="statusPieRef" class="chart-canvas chart-canvas-tall"></div>
+           </div>
+           <div class="chart-card">
+             <div class="chart-title">体长分布 (cm)</div>
+             <div ref="lengthDistRef" class="chart-canvas"></div>
+           </div>
+           <div class="chart-card">
+             <div class="chart-title">无尾体长分布 (cm)</div>
+             <div ref="noTailDistRef" class="chart-canvas"></div>
+           </div>
+           <div class="chart-card">
+             <div class="chart-title">体高分布 (cm)</div>
+             <div ref="heightDistRef" class="chart-canvas"></div>
+           </div>
+           <div class="chart-card">
+             <div class="chart-title">体重分布 (g)</div>
+             <div ref="weightDistRef" class="chart-canvas"></div>
+           </div>
+           <div class="chart-card">
+             <div class="chart-title">肥满度分布</div>
+             <div ref="conditionDistRef" class="chart-canvas"></div>
+           </div>
+           <div v-if="hasDamageData" class="chart-card">
+             <div class="chart-title">破损率分布 (×100%)</div>
+             <div ref="damageDistRef" class="chart-canvas"></div>
+           </div>
         </div>
       </ReportSection>
 
       <!-- Excel 板块（视频任务表格） -->
       <ReportSection
         id="excel-block"
-        title="Excel 板块"
+        title="三、视频数据表格"
         subtitle="以表格形式展示当日所有视频任务数据。"
       >
         <a-empty v-if="!videoTasks.length" description="当日暂无视频任务" />
@@ -111,7 +111,7 @@
                 <template #cell="{ record }">{{ formatDuration(record.video_duration_seconds) }}</template>
               </a-table-column>
               <a-table-column title="处理耗时" :width="120">
-                <template #cell="{ record }">{{ formatDuration(record.processing_duration_seconds) }}</template>
+                <template #cell="{ record }">{{ formatDuration(getProcessingDuration(record)) }}</template>
               </a-table-column>
             </template>
           </a-table>
@@ -121,7 +121,7 @@
       <!-- 视频板块 -->
       <ReportSection
         id="video-block"
-        title="视频板块"
+        title="四、视频对比展示"
         subtitle="提供当日 done 视频的单视频报表与结果大屏入口。"
       >
         <a-empty
@@ -166,7 +166,7 @@
 
       <ReportSection
         id="daily-pdf-report"
-        title="查看PDF报表"
+        title="五、查看PDF报表"
         subtitle="生成并预览当天鱼品质检测日报 PDF / Word。"
       >
         <div class="daily-pdf-actions">
@@ -276,6 +276,7 @@ function displayValue(value: unknown): string | number {
 }
 
 function formatDuration(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined) return '--'
   const n = Number(seconds)
   if (!Number.isFinite(n) || n < 0) return '--'
   const total = Math.round(n)
@@ -283,6 +284,10 @@ function formatDuration(seconds: number | null | undefined): string {
   const m = Math.floor((total % 3600) / 60)
   const s = total % 60
   return h ? `${h}小时${m}分${s}秒` : m ? `${m}分${s}秒` : `${s}秒`
+}
+
+function getProcessingDuration(record: any): number | null | undefined {
+  return record?.processing_duration_seconds ?? record?.duration_seconds
 }
 
 async function loadVideoTasks() {
@@ -314,6 +319,7 @@ const overviewRows = computed(() => [
 ])
 
 function formatDurationPrecise(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined) return '--'
   const n = Number(seconds)
   if (!Number.isFinite(n) || n < 0) return '--'
   if (n < 60) return `${n.toFixed(2)}秒`
@@ -329,7 +335,7 @@ const metricsRows = computed(() => [
    { key: 'noTail', title: '平均无尾体长', value: summary.value.avg_body_length_without_tail, unit: 'cm' },
   { key: 'height', title: '平均体高', value: summary.value.avg_body_height, unit: 'cm' },
   { key: 'weight', title: '平均体重', value: summary.value.avg_body_weight, unit: 'g' },
-  { key: 'cf', title: '平均肥满度', value: summary.value.avg_condition_factor },
+   { key: 'cf', title: '平均肥满度', value: summary.value.avg_condition_factor },
 ])
 
 function ratePct(v: any): string {
@@ -408,8 +414,12 @@ function goReport(videoId: string) {
     return
   }
   router.push({
-    path: `/admin/data-report/video/${encodeURIComponent(videoId)}`,
-    query: { video_id: videoId },
+    path: '/admin/data-report',
+    query: {
+      type: 'daily-videos',
+      video_id: videoId,
+      date: reportDate.value,
+    },
   })
 }
 
@@ -420,7 +430,7 @@ function goDashboard(videoId: string) {
     return
   }
   router.push({
-    path: '/',
+    path: '/dashboard',
     query: { mode: 'result', video_id: videoId },
   })
 }
@@ -634,26 +644,52 @@ watch(
 }
 .charts-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  min-width: 0;
 }
 .chart-card {
+  width: 100%;
+  min-width: 0;
   box-sizing: border-box;
   background: #fff;
   border: 1px solid #e5e6eb;
   border-radius: 8px;
+  padding: 8px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.charts-grid > .chart-card:first-child {
+  grid-column: 1 / -1;
 }
 .chart-title {
+  width: 100%;
+  margin-bottom: 4px;
+  text-align: center;
   font-size: 14px;
   font-weight: 600;
   color: #1d2129;
 }
 .chart-canvas {
-  width: 100%;
-  height: 220px;
+  width: min(100%, 520px);
+  height: 240px;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0 auto;
+  overflow: hidden;
 }
 .chart-canvas-tall {
-  height: 240px;
+  height: 280px;
+}
+
+@media (width <= 760px) {
+  .charts-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .charts-grid > .chart-card:first-child {
+    grid-column: auto;
+  }
 }
 .table-scroll {
   width: 100%;

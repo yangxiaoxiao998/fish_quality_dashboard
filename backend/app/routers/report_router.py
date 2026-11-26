@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date
+import hashlib
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response
@@ -99,14 +101,17 @@ def generate_custom_pdf(body: dict, db: Session = Depends(get_db)) -> dict:
     report_name = str(body.get("report_name") or "").strip()
     if not report_name:
         raise HTTPException(status_code=400, detail="report_name is required")
-    rows = db.query(VideoTask).filter(VideoTask.video_id.in_(video_ids)).all()
-    if not rows:
-        raise HTTPException(status_code=404, detail="video tasks not found")
+    from app.services.video_report_pdf_service import build_combined_report_data
+    try:
+        report_data = build_combined_report_data(db, video_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    rows = [item["task"] for item in report_data["video_rows"]]
 
     from app.services.video_report_pdf_service import generate_video_pdf_report
     from app.services.path_service import to_abs_data_path
     if len(rows) == 1:
-        result = generate_video_pdf_report(rows[0].video_id, report_name=report_name)
+        result = generate_video_pdf_report(rows[0].video_id, report_name=report_name, db=db)
         if not result.get("ok"):
             raise HTTPException(status_code=500, detail=result.get("error") or "report generation failed")
         report = db.query(DetectionReport).filter(
@@ -124,7 +129,7 @@ def generate_custom_pdf(body: dict, db: Session = Depends(get_db)) -> dict:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
         from app.services.video_report_pdf_service import generate_combined_video_pdf_report
-        result = generate_combined_video_pdf_report(video_ids, report_dir / stamp, report_name)
+        result = generate_combined_video_pdf_report(video_ids, report_dir / stamp, report_name, report_data=report_data)
         if not result.get("ok"):
             raise RuntimeError(result.get("error") or "合并报表生成失败")
         pdf_path = to_abs_data_path(result.get("file_path"))
@@ -136,18 +141,31 @@ def generate_custom_pdf(body: dict, db: Session = Depends(get_db)) -> dict:
 
     report_date = min((row.created_at.date() for row in rows if row.created_at), default=datetime.now().date())
     from app.repositories.models import DetectionReport
+    snapshot = {
+        "video_ids": report_data["video_ids"],
+        "summary": report_data["summary"],
+        "video_rows": [
+            {"video_id": row["video_id"], "duration_seconds": row["duration_seconds"],
+             "processing_seconds": row["processing_seconds"], "fish_count": row["fish_count"]}
+            for row in report_data["video_rows"]
+        ],
+        "fish_rows": report_data["fish_rows"],
+    }
+    snapshot_text = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     report = DetectionReport(
         report_date=report_date,
         report_type="custom_video_fish_quality",
         report_no=f"CUSTOM-{stamp}-{uuid.uuid4().hex[:8].upper()}",
         report_name=report_name,
         file_name=file_name,
-        file_path=str(pdf_path.relative_to(DATA_DIR)),
+        file_path=f"data/{pdf_path.relative_to(DATA_DIR).as_posix()}",
         file_size=pdf_path.stat().st_size,
         total_video=len(rows),
-        total_fish=sum(int(row.total_fish or 0) for row in rows),
+        total_fish=int(report_data["summary"].get("total_fish") or 0),
         status="generated",
-        summary_json={"video_ids": video_ids},
+        summary_json={**snapshot, "snapshot_sha256": hashlib.sha256(snapshot_text.encode("utf-8")).hexdigest(), "report_data": report_data["summary"],
+                      "video_rows": [{"video_id": row["video_id"], "duration_seconds": row["duration_seconds"],
+                                      "fish_count": row["fish_count"]} for row in report_data["video_rows"]]},
     )
     db.add(report)
     db.commit()

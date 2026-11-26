@@ -24,6 +24,11 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_allowed_origins(),
+        # The packaged Electron renderer is served by a local Node server on
+        # an ephemeral port, so it cannot be limited to the Vite port 5173.
+        # Keep the exception loopback-only; the manager itself still binds to
+        # 127.0.0.1 by default.
+        allow_origin_regex=r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?$",
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],

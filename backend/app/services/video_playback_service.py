@@ -63,8 +63,37 @@ def _candidate_source_paths(video_id: str, stored_path: str | None = None) -> li
         PLAYABLE_DIR_ABS / f"{video_id}{PLAYABLE_SUFFIX}",
         base / f"{video_id}.mp4",
         base / f"{video_id}_h264.mp4",
+        DATA_DIR / "jobs" / video_id / "input" / f"{video_id}_source_video.mp4",
+        DATA_DIR / "results" / video_id / "input" / f"{video_id}_source_video.mp4",
     ]
-    return [path for path in candidates if path is not None]
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        if path is None:
+            continue
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            result.append(path)
+    return result
+
+
+def resolve_result_video_path(video_id: str) -> Optional[Path]:
+    """Resolve the published Grounded-SAM video in the runtime data tree.
+
+    A completed task normally lives under ``data/results``. Older packaged
+    runs can still have the generated artifact under ``data/jobs`` while the
+    database already points at ``data/results``.
+    """
+    safe_video_id = str(video_id or "").strip()
+    if not safe_video_id or Path(safe_video_id).name != safe_video_id:
+        return None
+
+    for root in (DATA_DIR / "results", DATA_DIR / "jobs"):
+        candidate = root / safe_video_id / "videos" / "grounded_sam.mp4"
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    return None
 
 
 def _resolve_source_path(video_id: str, stored_path: str | None = None) -> Optional[Path]:
@@ -432,6 +461,40 @@ def ensure_browser_playable_video(
     }
 
 
+def get_result_video_playback(video_id: str) -> dict[str, Any]:
+    """Return the retained detection-result video when the source was lost."""
+    source = resolve_result_video_path(video_id)
+    if source is None:
+        return {
+            "ok": False,
+            "video_id": video_id,
+            "error_code": "RESULT_VIDEO_NOT_FOUND",
+            "error_message": f"检测结果视频不存在：{video_id}",
+        }
+    probe = _probe_codec(source)
+    source_rel = to_data_relative(source) or str(source)
+    source_url = to_static_url(source)
+    if not source_url:
+        return {
+            "ok": False,
+            "video_id": video_id,
+            "error_code": "RESULT_VIDEO_URL_FAILED",
+            "error_message": f"无法生成检测结果视频地址：{source}",
+        }
+    return {
+        "ok": True,
+        "video_id": video_id,
+        "source_path": source_rel,
+        "source_url": source_url,
+        "playable_path": source_rel,
+        "playable_url": source_url,
+        "codec_name": probe.get("codec_name"),
+        "pix_fmt": probe.get("pix_fmt"),
+        "converted": False,
+        "playback_kind": "result",
+    }
+
+
 def ensure_browser_webm_video(
     source: Path,
     output: Path,
@@ -500,7 +563,7 @@ def ensure_browser_webm_video(
 
 def ensure_video_id_webm(video_id: str, *, result_video: bool = False) -> dict[str, Any]:
     source = (
-        DATA_DIR / "results" / video_id / "videos" / "grounded_sam.mp4"
+        resolve_result_video_path(video_id)
         if result_video
         else _resolve_source_path(video_id)
     )

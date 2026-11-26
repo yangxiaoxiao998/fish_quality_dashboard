@@ -234,7 +234,7 @@
             <label>分辨率预设</label>
             <a-radio-group v-model="resolutionPreset" @change="applyResolution">
               <a-radio value="960x540">960×540</a-radio>
-              <a-radio value="1920x1080">1920×1080</a-radio>
+              <a-radio value="1980x1020">1980×1020</a-radio>
               <a-radio value="1280x720">1280×720</a-radio>
               <a-radio value="640x480">640×480</a-radio>
             </a-radio-group>
@@ -438,17 +438,14 @@ const activeTab = ref('focus')
 
 const config = reactive<CameraConfig>({
   stream_url: '',
-  width: 1920,
-  height: 1080,
-  // fps: 25,
-  // width: 960,
-  // height: 540,
+  width: 1980,
+  height: 1020,
   fps: 25,
   recordFormat: 'mp4',
   recordQuality: 'high',
 })
 
-const resolutionPreset = ref('1920x1080')
+const resolutionPreset = ref('1980x1020')
 
 const recordFormat = ref('mp4')
 const recordQuality = ref('high')
@@ -589,8 +586,8 @@ async function handleApplyLedBrightness() {
 
 function applyResolution() {
   const [w, h] = resolutionPreset.value.split('x').map(Number)
-  config.width = w || 1920
-  config.height = h || 1080
+  config.width = w || 1980
+  config.height = h || 1020
 }
 
 async function pollStatus() {
@@ -628,8 +625,8 @@ async function loadSettings() {
     const response = await http.get('/api/camera_yzt/settings')
     const saved = response.data || {}
     config.stream_url = saved.stream_url || ''
-    config.width = Number(saved.width) || 1920
-    config.height = Number(saved.height) || 1080
+    config.width = Number(saved.width) || 1980
+    config.height = Number(saved.height) || 1020
     config.fps = Number(saved.fps) || 25
     resolutionPreset.value = `${config.width}x${config.height}`
   } catch (e) {
@@ -656,8 +653,8 @@ async function handleForceRestart() {
   try {
     const resp = await http.post('/api/camera_yzt/force-restart', {
       stream_url: config.stream_url,
-      width: Number(config.width) || 1920,
-      height: Number(config.height) || 1080,
+      width: Number(config.width) || 1980,
+      height: Number(config.height) || 1020,
       fps: Number(config.fps) || 25,
     })
     const data = resp.data || {}
@@ -763,7 +760,7 @@ const focusFocusedUrl = ref('')
 const focusLogs = ref<string[]>([])
 
 const focusPhotoStageStyle = computed(() => ({
-  aspectRatio: `${Math.max(1, Number(config.width) || 1920)} / ${Math.max(1, Number(config.height) || 1080)}`,
+  aspectRatio: `${Math.max(1, Number(config.width) || 1980)} / ${Math.max(1, Number(config.height) || 1020)}`,
 }))
 
 const {
@@ -875,8 +872,8 @@ async function loadFocusSettings() {
 function focusPayload(): Record<string, any> {
   const payload: Record<string, any> = {
     autofocus_mode: focusMode.value,
-    width: Number(config.width) || 1920,
-    height: Number(config.height) || 1080,
+    width: Number(config.width) || 1980,
+    height: Number(config.height) || 1020,
   }
   if (focusMode.value === 'manual') payload.lens_position = focusLensPosition.value
   else payload.autofocus_window = afWindowText.value
@@ -1010,8 +1007,8 @@ async function startFocusPreview(): Promise<void> {
   try {
     const payload: Record<string, any> = {
       stream_url: config.stream_url || undefined,
-      width: Number(config.width) || 1920,
-      height: Number(config.height) || 1080,
+      width: Number(config.width) || 1980,
+      height: Number(config.height) || 1020,
       fps: Number(config.fps) || 25,
       autofocus_mode: focusMode.value,
     }

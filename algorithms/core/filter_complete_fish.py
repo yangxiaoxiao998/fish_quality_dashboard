@@ -12,6 +12,7 @@ workflow and is saved to ``complete_match``.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import tempfile
 from contextlib import nullcontext
@@ -20,6 +21,68 @@ from typing import Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:  # 仅类型检查，运行时延后加载
     import cv2  # noqa: F401
+
+
+DEFAULT_COMPLETE_THRESHOLD = 0.9
+
+
+def validate_complete_threshold(value: float | str) -> float:
+    """Validate and normalize the completeness score threshold.
+
+    The ViT returns probabilities in ``[0, 1]``.  Keeping this validation in
+    the filtering module lets both its CLI and the top-level pipeline share
+    exactly the same threshold contract.
+    """
+
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"--complete-threshold must be a number in [0, 1], got {value!r}"
+        ) from error
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            f"--complete-threshold must be in [0, 1], got {threshold!r}"
+        )
+    return threshold
+
+
+def is_complete_score(
+    complete_score: float,
+    threshold: float = DEFAULT_COMPLETE_THRESHOLD,
+) -> bool:
+    """Return whether a complete-class probability passes the threshold."""
+
+    threshold = validate_complete_threshold(threshold)
+    try:
+        score = float(complete_score)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"complete score must be a number in [0, 1], got {complete_score!r}"
+        ) from error
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise ValueError(
+            f"complete score must be in [0, 1], got {score!r}"
+        )
+    return score >= threshold
+
+
+def classify_completeness_result(
+    result,
+    complete_threshold: float = DEFAULT_COMPLETE_THRESHOLD,
+) -> tuple[bool, str, float]:
+    """Apply the business threshold to one raw ViT result.
+
+    ``result.label``/``result.is_complete`` describe the model's argmax.  The
+    filtering policy is intentionally evaluated from the raw complete score so
+    a high-confidence requirement can override that argmax without changing
+    the model inference contract.
+    """
+
+    complete_score = float(result.scores["complete"])
+    is_complete = is_complete_score(complete_score, complete_threshold)
+    final_label = "complete" if is_complete else "incomplete"
+    return is_complete, final_label, complete_score
 
 
 def _cv2():
@@ -376,7 +439,9 @@ def process_directory(
     incomplete_dir: Path,
     *,
     force_all_complete: bool = False,
+    complete_threshold: float = DEFAULT_COMPLETE_THRESHOLD,
 ) -> int:
+    complete_threshold = validate_complete_threshold(complete_threshold)
     if not input_dir.is_dir():
         print(f"[ERROR] 输入目录不存在：{_log_path(input_dir)}")
         return 1
@@ -432,6 +497,8 @@ def process_directory(
                 if force_all_complete:
                     is_complete = True
                     label = "forced_complete"
+                    model_label = None
+                    complete_score = None
                     confidence = None
                 else:
                     black_background_fish = make_black_background_fish_from_images(
@@ -440,8 +507,11 @@ def process_directory(
                     temp_image_path = temp_dir / f"{stem}_black_bg.png"
                     _cv2().imwrite(str(temp_image_path), black_background_fish)
                     result = classifier.predict_path(temp_image_path)
-                    is_complete = result.is_complete
-                    label = result.label
+                    is_complete, label, complete_score = classify_completeness_result(
+                        result,
+                        complete_threshold,
+                    )
+                    model_label = result.label
                     confidence = result.confidence
 
                 if is_complete:
@@ -484,7 +554,12 @@ def process_directory(
             if confidence is None:
                 print(f"[{label}] {stem}: completeness classification skipped, {action}")
             else:
-                print(f"[{label}] {stem}: confidence={confidence:.6f}, {action}")
+                print(
+                    f"[{label}] {stem}: model_label={model_label}, "
+                    f"complete_score={complete_score:.6f}, "
+                    f"threshold={complete_threshold:.6f}, "
+                    f"model_confidence={confidence:.6f}, {action}"
+                )
 
     print()
     print("==== filter_complete_fish 完成 ====")
@@ -526,6 +601,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--incomplete-dir", dest="incomplete_dir", default=None,
                         help="兼容旧参数：相当于 --incomplete-output-dir")
     parser.add_argument(
+        "--complete-threshold",
+        type=validate_complete_threshold,
+        default=DEFAULT_COMPLETE_THRESHOLD,
+        metavar="FLOAT",
+        help=(
+            "完整类别概率阈值；只有 P(complete) >= 此值才归为完整，"
+            f"默认 {DEFAULT_COMPLETE_THRESHOLD:.1f}"
+        ),
+    )
+    parser.add_argument(
         "--force-all-complete",
         action="store_true",
         help=(
@@ -552,6 +637,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         complete_dir,
         incomplete_dir,
         force_all_complete=args.force_all_complete,
+        complete_threshold=args.complete_threshold,
     )
 
 

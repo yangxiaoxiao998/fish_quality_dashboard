@@ -113,8 +113,8 @@ PACKAGE_ROOT_NAME=""
 PAYLOAD_VERSION=""
 CURRENT_VERSION=""
 BACKUP_DIR=""
-OLD_ALEMBIC_REVISION=""
-NEW_ALEMBIC_REVISION=""
+OLD_SCHEMA_MIGRATION_STATE=""
+NEW_SCHEMA_MIGRATION_STATE=""
 COMPONENT_RECORDS_TSV=""
 ROOT_RECORDS_TSV=""
 APPLY_STATUS="failed"
@@ -511,7 +511,7 @@ restore_component() {
 write_backup_manifest() {
   local status="$1"
   local payload_path="$2"
-  export BACKUP_DIR CURRENT_VERSION PAYLOAD_VERSION OLD_ALEMBIC_REVISION NEW_ALEMBIC_REVISION
+  export BACKUP_DIR CURRENT_VERSION PAYLOAD_VERSION OLD_SCHEMA_MIGRATION_STATE NEW_SCHEMA_MIGRATION_STATE
   export MANIFEST_STATUS="$status"
   export PACKAGE_PAYLOAD_PATH="$payload_path"
   export COMPONENT_RECORDS_TSV ROOT_RECORDS_TSV
@@ -560,8 +560,8 @@ payload = {
     "new_version": os.environ["PAYLOAD_VERSION"],
     "created_at": os.environ.get("BACKUP_CREATED_AT") or "",
     "updated_at": os.environ.get("BACKUP_UPDATED_AT") or "",
-    "alembic_old_revision": os.environ.get("OLD_ALEMBIC_REVISION") or "",
-    "alembic_new_revision": os.environ.get("NEW_ALEMBIC_REVISION") or "",
+    "schema_migration_state_before": os.environ.get("OLD_SCHEMA_MIGRATION_STATE") or "",
+    "schema_migration_state_after": os.environ.get("NEW_SCHEMA_MIGRATION_STATE") or "",
     "components": components,
     "root_files": root_files,
 }
@@ -692,16 +692,11 @@ sync_frontend_dependencies() {
   fi
 }
 
-get_alembic_revision() {
-  if [[ ! -f "$INSTALL_ROOT/backend/alembic.ini" ]]; then
-    return 0
-  fi
-  (
-    cd "$INSTALL_ROOT/backend"
-    "$PYTHON_BIN" -m alembic -c "$INSTALL_ROOT/backend/alembic.ini" current 2>/dev/null \
-      | tail -n 1 \
-      | awk '{print $1}'
-  ) || true
+get_schema_migration_state() {
+  # Schema changes are applied by app.main.lifespan via the idempotent
+  # startup_migrations module. There is intentionally no second migration
+  # engine in the update process.
+  printf '%s\n' "startup-migrations"
 }
 
 run_migrations() {
@@ -710,29 +705,15 @@ run_migrations() {
     return 0
   fi
   source_backend_env
-  fish_log "[update] alembic upgrade head"
-  (
-    cd "$INSTALL_ROOT/backend"
-    "$PYTHON_BIN" -m alembic -c "$INSTALL_ROOT/backend/alembic.ini" upgrade head
-  )
+  fish_log "[update] database schema migration is owned by FastAPI lifespan"
 }
 
 maybe_downgrade_database() {
   local target_revision="$1"
-  if [[ -z "$target_revision" ]]; then
-    return 0
+  if [[ -n "$target_revision" ]]; then
+    fish_warn "database downgrade is not automatic; startup_migrations are forward-only and backups must be restored separately"
   fi
-  local current_revision=""
-  current_revision="$(get_alembic_revision)"
-  if [[ -z "$current_revision" || "$current_revision" == "$target_revision" ]]; then
-    return 0
-  fi
-  source_backend_env
-  fish_log "[rollback] alembic downgrade $target_revision"
-  (
-    cd "$INSTALL_ROOT/backend"
-    "$PYTHON_BIN" -m alembic -c "$INSTALL_ROOT/backend/alembic.ini" downgrade "$target_revision"
-  )
+  return 0
 }
 
 estimate_required_space_bytes() {
@@ -779,7 +760,7 @@ perform_rollback_from_backup() {
 
   restore_root_files
   restore_permissions
-  maybe_downgrade_database "$OLD_ALEMBIC_REVISION" || fish_warn "database downgrade failed"
+  maybe_downgrade_database "$OLD_SCHEMA_MIGRATION_STATE" || fish_warn "database migration state handling failed"
 
   if [[ -f "$SCRIPT_DIR/backend_requirements.lock.txt" ]]; then
     sync_python_dependencies "$SCRIPT_DIR/backend_requirements.lock.txt" || fish_warn "pip reinstall during rollback failed"
@@ -842,7 +823,7 @@ apply_update() {
 
   parse_manifest_components "$PAYLOAD_ROOT/manifest.json" "$manifest_components_tsv"
   source_backend_env
-  OLD_ALEMBIC_REVISION="$(get_alembic_revision)"
+  OLD_SCHEMA_MIGRATION_STATE="$(get_schema_migration_state)"
 
   while IFS=$'\t' read -r component_name archive_dir target_subdir current_link; do
     [[ -n "$component_name" ]] || continue
@@ -864,7 +845,7 @@ apply_update() {
   sync_python_dependencies "$PAYLOAD_ROOT/backend_requirements.lock.txt"
   sync_frontend_dependencies
   run_migrations
-  NEW_ALEMBIC_REVISION="$(get_alembic_revision)"
+  NEW_SCHEMA_MIGRATION_STATE="$(get_schema_migration_state)"
 
   bash "$INSTALL_ROOT/start_dev.sh"
   run_runtime_health_check_with_retries
@@ -938,7 +919,7 @@ PY
 
   CURRENT_VERSION="$(read_version_field "$INSTALL_ROOT/version.json")"
   PAYLOAD_VERSION="$(fish_json_get "$BACKUP_DIR/manifest.json" "current_version" "$CURRENT_VERSION")"
-  OLD_ALEMBIC_REVISION="$(fish_json_get "$BACKUP_DIR/manifest.json" "alembic_old_revision" "")"
+  OLD_SCHEMA_MIGRATION_STATE="$(fish_json_get "$BACKUP_DIR/manifest.json" "schema_migration_state_before" "")"
 
   perform_rollback_from_backup
   BACKUP_UPDATED_AT="$(fish_now_iso)"

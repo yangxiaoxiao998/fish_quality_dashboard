@@ -5,13 +5,14 @@ import { visualizer } from 'rollup-plugin-visualizer'
 import vue from '@vitejs/plugin-vue'
 import vueJsx from '@vitejs/plugin-vue-jsx'
 import stylelintPlugin from 'vite-plugin-stylelint'
-import viteImagemin from 'vite-plugin-imagemin'
 import path from 'path'
 
 
 export default defineConfig({
-  //打包后资源使用相对路径
-  base: './',
+  // Both Vite and the packaged Electron renderer are served over HTTP at the
+  // origin root. An absolute base keeps assets valid after SPA deep links such
+  // as /dashboard or /admin/data-report are opened directly.
+  base: '/',
   build: {
     outDir: './docs',
     assetsDir: 'assets',
@@ -43,33 +44,6 @@ export default defineConfig({
       exclude: ['src/assets/fontawesome/**', 'node_modules/**'],
     }),
     visualizer({ open: true }),
-    viteImagemin({
-      gifsicle: {
-        optimizationLevel: 7,
-        interlaced: false,
-      },
-      optipng: {
-        optimizationLevel: 7,
-      },
-      mozjpeg: {
-        quality: 20,
-      },
-      pngquant: {
-        quality: [0.8, 0.9],
-        speed: 4,
-      },
-      svgo: {
-        plugins: [
-          {
-            name: 'removeViewBox',
-          },
-          {
-            name: 'removeEmptyAttrs',
-            active: false,
-          },
-        ],
-      },
-    }),
   ],
   resolve: {
     alias: {

@@ -74,10 +74,10 @@
               <div class="chart-title">体长分布 (cm)</div>
               <div ref="lengthDistChartRef" class="chart-canvas"></div>
             </div>
-             <!-- <div class="chart-card">
-               <div class="chart-title">体高分布 (cm)</div>
-              <div ref="noTailDistChartRef" class="chart-canvas"></div>
-            </div> -->
+             <div class="chart-card">
+               <div class="chart-title">无尾体长分布 (cm)</div>
+               <div ref="noTailDistChartRef" class="chart-canvas"></div>
+             </div>
              <div class="chart-card">
                <div class="chart-title">体高分布 (cm)</div>
                <div ref="heightDistChartRef" class="chart-canvas"></div>
@@ -109,7 +109,7 @@
             <div class="video-panel">
               <div class="video-panel-title">Grounded-SAM 检测结果视频</div>
               <video
-                v-if="resultGroundedUrl"
+                 v-if="resultGroundedUrl && !resultVideoErrored"
                 class="report-video"
                 :src="withMediaVersion(resultGroundedUrl)"
                 controls
@@ -118,15 +118,24 @@
                 loop
                 playsinline
                 preload="metadata"
-                @error="onResultVideoError"
-              />
-              <a-empty v-else description="暂无 Grounded-SAM 检测结果视频" />
+                 @error="onResultVideoError"
+               />
+               <a-alert
+                 v-else-if="resultVideoErrored"
+                 type="error"
+                 :show-icon="true"
+                 style="margin-top: 8px"
+               >
+                 <template #title>Grounded-SAM 检测结果视频加载失败</template>
+                 请检查静态文件是否存在，或确认视频为 H.264 / yuv420p 编码。
+               </a-alert>
+               <a-empty v-else description="暂无 Grounded-SAM 检测结果视频" />
             </div>
 
             <div class="video-panel">
               <div class="video-panel-title">源视频</div>
               <video
-                v-if="sourcePlayableUrl"
+                     v-if="sourcePlayableUrl && !sourceVideoErrored"
                 class="report-video"
                 :src="withMediaVersion(sourcePlayableUrl)"
                 controls
@@ -135,9 +144,18 @@
                 loop
                 playsinline
                 preload="metadata"
-                @error="onSourceVideoError"
-              />
-              <a-empty v-else description="暂无可播放源视频" />
+                 @error="onSourceVideoError"
+               />
+               <a-alert
+                 v-else-if="sourceVideoErrored"
+                 type="error"
+                 :show-icon="true"
+                 style="margin-top: 8px"
+               >
+                 <template #title>源视频加载失败</template>
+                 请检查源视频文件是否存在，或确认浏览器支持 H.264 编码。
+               </a-alert>
+               <a-empty v-else description="暂无可播放源视频" />
             </div>
           </div>
         </ReportSection>
@@ -181,7 +199,7 @@
                         row-key="fish_id"
                         stripe
                         hoverable
-                        :scroll="{ x: 1280 }"
+                        :scroll="{ x: 1600 }"
                       >
                         <template #columns>
                           <a-table-column title="序号" data-index="track_id" :width="90" fixed="left">
@@ -250,18 +268,54 @@
                             </template>
                           </a-table-column>
 
-                          <a-table-column title="腹部颜色" data-index="hex_color" :width="110">
-                            <template #cell="{ record }">
-                              <span
-                                v-if="isHexColor(record.hex_color)"
-                                class="color-swatch"
-                                :style="{ backgroundColor: record.hex_color }"
-                              />
-                              <span v-else class="dim">--</span>
-                            </template>
-                          </a-table-column>
+                           <a-table-column title="腹部颜色" data-index="hex_color" :width="110">
+                             <template #cell="{ record }">
+                               <span
+                                 v-if="isHexColor(record.hex_color)"
+                                 class="color-swatch"
+                                 :style="{ backgroundColor: record.hex_color }"
+                               />
+                               <span v-else class="dim">--</span>
+                             </template>
+                           </a-table-column>
 
-                          <a-table-column title="操作" data-index="action" :width="100" fixed="right">
+                           <a-table-column title="弓背比值" data-index="arched_back_ratio" :width="100">
+                             <template #cell="{ record }">
+                               <span :class="{ dim: isEmptyValue(record.arched_back_ratio) }">
+                                 {{ formatCell(record.arched_back_ratio, 3) }}
+                               </span>
+                             </template>
+                           </a-table-column>
+
+                           <a-table-column title="体尺标注图" data-index="fish_condition_image" :width="110">
+                             <template #cell="{ record }">
+                               <div class="fish-thumb-cell">
+                                 <img
+                                   v-if="resultSearchedFishConditionImageUrl(record)"
+                                   :src="resultSearchedFishConditionImageUrl(record)"
+                                   alt="fish-condition"
+                                   @error="onImgError"
+                                 />
+                                 <span v-else class="dim">--</span>
+                               </div>
+                             </template>
+                           </a-table-column>
+
+                           <a-table-column title="弓背标注图" data-index="arched_back_image" :width="110">
+                             <template #cell="{ record }">
+                               <div class="fish-thumb-cell">
+                                 <img
+                                   v-if="resultSearchedArchedBackImageUrl(record)"
+                                   :src="resultSearchedArchedBackImageUrl(record)"
+                                   alt="arched-back"
+                                   @error="onImgError"
+                                 />
+                                 <span v-else class="dim">--</span>
+                               </div>
+                             </template>
+                           </a-table-column>
+
+                           <a-table-column title="操作" data-index="action" :width="100" fixed="right">
                             <template #cell="{ record }">
                               <a-button size="small" type="primary" @click="openFishDetail(record)">
                                 查看
@@ -371,10 +425,10 @@
                     <div class="chart-title">体长分布 (cm)</div>
                   <div ref="lengthDistChartRef" class="chart-canvas"></div>
                 </div>
-                 <!-- <div class="chart-card">
-                    <div class="chart-title">体高分布 (cm)</div>
-                  <div ref="noTailDistChartRef" class="chart-canvas"></div>
-                </div> -->
+                 <div class="chart-card">
+                   <div class="chart-title">无尾体长分布 (cm)</div>
+                   <div ref="noTailDistChartRef" class="chart-canvas"></div>
+                 </div>
                 <div class="chart-card">
                   <div class="chart-title">体高分布 (cm)</div>
                   <div ref="heightDistChartRef" class="chart-canvas"></div>
@@ -406,7 +460,7 @@
                 <div class="video-panel">
                   <div class="video-panel-title">Grounded-SAM 检测结果视频</div>
                   <video
-                    v-if="resultGroundedUrl"
+                    v-if="resultGroundedUrl && !resultVideoErrored"
                     class="report-video"
                     :src="withMediaVersion(resultGroundedUrl)"
                     controls
@@ -432,7 +486,7 @@
                 <div class="video-panel">
                   <div class="video-panel-title">源视频</div>
                   <video
-                    v-if="sourcePlayableUrl"
+                    v-if="sourcePlayableUrl && !sourceVideoErrored"
                     class="report-video"
                     :src="withMediaVersion(sourcePlayableUrl)"
                     controls
@@ -787,10 +841,10 @@ import type { ReportTocItem } from '@/components/report/ReportToc.vue'
 interface SummaryData {
   video_id: string
   status: string
-  source_type: string
   input_video: string
   original_input_video: string
   grounded_video: string
+  result_video_url: string
   grounded_video_url: string
   measurement_csv_url: string
   pipeline_result_path: string
@@ -861,6 +915,7 @@ const conditionDistChartRef = ref<HTMLElement>()
 const damageDistChartRef = ref<HTMLElement>()
 
 let charts: echarts.ECharts[] = []
+let chartResizeObserver: ResizeObserver | null = null
 
 const reportStatus = computed(() => summaryData.value.status || '')
 const statusText = computed(() => statusToText(reportStatus.value))
@@ -944,6 +999,16 @@ function withReportVersion(url: string): string {
   if (!url) return ''
   const separator = url.includes('?') ? '&' : '?'
   return `${url}${separator}_v=${mediaVersion.value}`
+}
+
+async function resolveExistingMediaUrl(url: string): Promise<string> {
+  if (!url) return ''
+  try {
+    await http.head(url, { timeout: 5000 })
+    return url
+  } catch {
+    return ''
+  }
 }
 
 async function regenerateVideoPdfReport() {
@@ -1040,10 +1105,10 @@ function emptySummary(): SummaryData {
   return {
     video_id: '',
     status: '',
-    source_type: '',
     input_video: '',
     original_input_video: '',
     grounded_video: '',
+    result_video_url: '',
     grounded_video_url: '',
     measurement_csv_url: '',
     pipeline_result_path: '',
@@ -1137,7 +1202,8 @@ function isHexColor(value: unknown): boolean {
 function onImgError(e: Event) {
   const img = e.target as HTMLImageElement
   console.warn('[EmbeddedVideoReport] fish image load failed:', img.src)
-  img.style.opacity = '0.3'
+  img.style.opacity = '0.15'
+  img.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHg9IjIiIHk9IjIiIGZpbGw9IiMzMzMiLz48dGV4dCB4PSI1IiB5PSIxNSIgZm9udC1mYW1pbHk9IkFyaWFsIiBmb250LXNpemU9IjE0IiBmaWxsPSIjZmZmIj57fTwvdGV4dD48L3N2Zz4='
 }
 
 async function loadWebmFallback(kind: 'source' | 'result'): Promise<void> {
@@ -1206,6 +1272,18 @@ function resultSearchedFishCropUrl(fish: any): string {
   }
 
   return url
+}
+
+function resultSearchedFishConditionImageUrl(fish: any): string {
+  if (!fish) return ''
+  const picked = fish.fish_condition_image_path || fish.fish_condition_image_url || ''
+  return normalizeReportUrl(picked)
+}
+
+function resultSearchedArchedBackImageUrl(fish: any): string {
+  if (!fish) return ''
+  const picked = fish.arched_back_image_path || fish.arched_back_image_url || ''
+  return normalizeReportUrl(picked)
 }
 
 function loadFishTable() {
@@ -1305,7 +1383,6 @@ async function loadAllData() {
         (v: any) => v?.video_id === reportVideoId.value
       )
       if (t) {
-        summaryData.value.source_type = t.source_type || summaryData.value.source_type
         summaryData.value.status = t.status || summaryData.value.status
         summaryData.value.created_at = t.created_at || summaryData.value.created_at
         if (summaryData.value.total_fish === null) {
@@ -1357,11 +1434,12 @@ async function loadAllData() {
         playback.playable_url || playback.source_url || '',
       )
     } catch (_) {
-      sourcePlayableUrl.value = reportVideoId.value
+      const fallback = reportVideoId.value
         ? `/static/uploads/videos/playable/${reportVideoId.value}_h264.mp4`
         : ''
+      sourcePlayableUrl.value = await resolveExistingMediaUrl(fallback)
     }
-    resultGroundedUrl.value = pickResultGroundedUrl()
+    resultGroundedUrl.value = await resolveResultGroundedUrl()
     resultVideoErrored.value = false
 
     fishPage.value = 1
@@ -1392,17 +1470,17 @@ function mergeSummaryFromAlgo(payload: any) {
     ...emptySummary(),
     video_id: data.video_id || reportVideoId.value,
     status: data.status || '',
-    source_type: '',
     input_video: data.input_video || '',
     original_input_video: data.original_input_video || '',
     grounded_video: data.grounded_video || '',
+    result_video_url: data.result_video_url || '',
     grounded_video_url: data.grounded_video_url || '',
     measurement_csv_url: data.measurement_csv_url || '',
     pipeline_result_path: data.pipeline_result_path || '',
     result_dir: data.result_dir || '',
     total_fish: data.summary?.total_fish ?? null,
     complete_fish: data.summary?.complete_fish ?? null,
-    incomplete_fish: data.summary?.incomplete_fish ?? null,
+    incomplete_fish: data.summary?.incomplete_fish ?? 0,
     failed_fish: data.summary?.failed_fish ?? null,
     damaged_fish: data.summary?.damaged_fish ?? null,
     avg_surface_damage_ratio:
@@ -1444,13 +1522,14 @@ function pickSourceUrl(): string {
     : ''
 }
 
-function pickResultGroundedUrl(): string {
+async function resolveResultGroundedUrl(): Promise<string> {
   // Grounded-SAM 视频 URL 优先级：
   //   1. result.grounded_video_url
   //   2. result.grounded_video
   //   3. task.grounded_video_url / grounded_video_path
   //   4. /static/results/<video_id>/videos/grounded_sam.mp4 兜底
   const candidates: any[] = [
+    summaryData.value.result_video_url,
     summaryData.value.grounded_video_url,
     summaryData.value.grounded_video,
   ]
@@ -1460,21 +1539,40 @@ function pickResultGroundedUrl(): string {
       currentTask.value?.grounded_video_path,
     )
   }
-  if (reportVideoId.value) {
-    candidates.push(
-      `/static/results/${reportVideoId.value}/videos/grounded_sam.mp4`,
-    )
-  }
+  const fallback = reportVideoId.value
+    ? `/static/results/${reportVideoId.value}/videos/grounded_sam.mp4`
+    : ''
   for (const c of candidates) {
     const u = normalizeReportUrl(c)
     if (u) return u
   }
-  return ''
+  return resolveExistingMediaUrl(fallback)
 }
 
 function disposeCharts() {
+  chartResizeObserver?.disconnect()
+  chartResizeObserver = null
   charts.forEach((c) => c.dispose())
   charts = []
+}
+
+function observeChartResize() {
+  if (typeof ResizeObserver === 'undefined') return
+  const refs = [
+    statusDistChartRef,
+    lengthDistChartRef,
+    noTailDistChartRef,
+    heightDistChartRef,
+    weightDistChartRef,
+    conditionDistChartRef,
+    damageDistChartRef,
+  ]
+  chartResizeObserver = new ResizeObserver(() => {
+    charts.forEach((chart) => chart.resize())
+  })
+  refs.forEach((chartRef) => {
+    if (chartRef.value) chartResizeObserver?.observe(chartRef.value)
+  })
 }
 
 function renderCharts() {
@@ -1498,21 +1596,29 @@ function renderCharts() {
           return `${p.name}<br/>数量：${v} 条<br/>占比：${pct.toFixed(2)}%`
         },
       },
-      legend: { bottom: 0 },
-      series: [
-        {
-          type: 'pie',
-          radius: ['38%', '70%'],
-          data: statusData,
-          label: {
+       legend: {
+         orient: 'vertical',
+         right: 4,
+         top: 'middle',
+         itemGap: 12,
+         textStyle: { color: '#4e5969', fontSize: 12 },
+       },
+       series: [
+         {
+           type: 'pie',
+           center: ['34%', '50%'],
+           radius: ['38%', '70%'],
+           data: statusData,
+           label: {
             formatter: (p: any) => {
               const v = Number(p.value || 0)
               const pct = total > 0 ? (v * 100) / total : 0
               return `${p.name} ${pct.toFixed(1)}%`
-            },
-          },
-        },
-      ],
+             },
+           },
+           labelLine: { length: 8, length2: 6 },
+         },
+       ],
     })
     charts.push(c)
   }
@@ -1533,11 +1639,11 @@ function renderCharts() {
     const c = echarts.init(noTailDistChartRef.value)
     c.setOption(buildBarOption(
        buildBarBins(metricFishRows.value, (f: any) => {
-      const v = f?.body_height_cm
+       const v = f?.body_length_no_tail_cm ?? f?.body_length_without_tail
         return v === null || v === undefined ? null : Number(v)
       }, 5, 0, 60),
       '',
-      '体高区间（cm）',
+       '无尾体长区间（cm）',
       ' cm'
     ))
     charts.push(c)
@@ -1611,6 +1717,7 @@ function renderCharts() {
     ))
     charts.push(c)
   }
+  observeChartResize()
 }
 
 interface BarBin {
@@ -1669,7 +1776,13 @@ function buildBarOption(
         ].join('<br/>')
       },
     },
-    grid: { left: 50, right: 16, top: 24, bottom: 56 },
+    grid: {
+      left: 56,
+      right: 12,
+      top: 24,
+      bottom: bins.length > 8 ? 76 : 58,
+      containLabel: true,
+    },
     title: title
       ? { text: title, left: 'center', top: 4, textStyle: { fontSize: 13, color: '#1d2129' } }
       : undefined,
@@ -1679,7 +1792,13 @@ function buildBarOption(
       nameLocation: 'middle',
       nameGap: 42,
       data: bins.map((b) => b.label),
-      axisLabel: { interval: 0, rotate: bins.length > 6 ? 25 : 0 },
+      axisLabel: {
+        interval: bins.length > 8 ? 1 : 0,
+        rotate: bins.length > 8 ? 35 : 0,
+        hideOverlap: true,
+        margin: 10,
+        fontSize: 10,
+      },
       nameTextStyle: { color: '#4e5969', fontSize: 11 },
     },
     yAxis: {
@@ -1758,16 +1877,28 @@ onBeforeUnmount(() => {
 }
 .charts-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  min-width: 0;
+  justify-items: stretch;
 }
 .chart-card {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   background: #fafbfc;
   border: 1px solid #e5e6eb;
   border-radius: 8px;
   padding: 8px 10px 10px;
 }
+.charts-grid > .chart-card:first-child {
+  grid-column: 1 / -1;
+}
 .chart-title {
+  width: 100%;
   margin-bottom: 4px;
   font-size: 13px;
   font-weight: 600;
@@ -1775,8 +1906,15 @@ onBeforeUnmount(() => {
   text-align: center;
 }
 .chart-canvas {
-  width: 100%;
+  width: min(100%, 520px);
   height: 240px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 .chart-canvas-tall {
   height: 280px;
@@ -1833,6 +1971,15 @@ onBeforeUnmount(() => {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
+}
+
+@media (width <= 760px) {
+  .charts-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .charts-grid > .chart-card:first-child {
+    grid-column: auto;
+  }
 }
 .dim {
   color: #c9cdd4;

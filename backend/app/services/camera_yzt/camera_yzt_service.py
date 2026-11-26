@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 import json
 import os
+import subprocess
 import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Deque, Optional
+from typing import Any, Callable, Deque, Optional
 
 import cv2
 import requests
@@ -28,13 +29,17 @@ from app.services.pi_http_client import make_pi_session, pi_get, pi_post
 from app.services.pi_endpoint_resolver import (
     PiResolutionError,
     get_pi_logical_base_url,
+    get_pi_arp_diag,
     get_pi_resolved_base_url,
+    get_pi_resolution_diag,
     invalidate_pi_resolution_cache,
 )
 from app.services.video_id_service import generate_video_id
 from app.services.path_service import to_abs_data_path
 from app.repositories.db import SessionLocal
 from app.repositories import session_repo
+from app.services.camera_yzt.segmented_recording_service import segmented_recording_service
+from app.services.storage_health_service import ensure_recording_capacity, get_storage_health
 
 CAMERA_ENABLE_MOCK_DETECTION = os.getenv(
     "CAMERA_ENABLE_MOCK_DETECTION",
@@ -56,6 +61,15 @@ def _env_float(name: str, default: float) -> float:
 STREAM_READY_TIMEOUT_SECONDS = _env_float(
     "FISH_CAMERA_STREAM_READY_TIMEOUT", 60.0
 )
+# A temporary camera power/network loss must not immediately terminate a
+# recording. Keep the Pi publisher alive and retry the read side for this
+# grace period before marking the task failed.
+CAMERA_RECONNECT_GRACE_SECONDS = _env_float(
+    "FISH_CAMERA_RECONNECT_GRACE_SECONDS", 180.0
+)
+CAMERA_RECONNECT_REQUEST_INTERVAL_SECONDS = _env_float(
+    "FISH_CAMERA_RECONNECT_REQUEST_INTERVAL_SECONDS", 10.0
+)
 
 logger = logging.getLogger("camera_yzt_service")
 
@@ -68,6 +82,7 @@ class CameraRuntimeState(str, Enum):
     IDLE = "idle"
     STARTING = "starting"
     RUNNING = "running"
+    RECONNECTING = "reconnecting"
     STOPPING = "stopping"
     ERROR = "error"
 
@@ -121,6 +136,7 @@ class CameraServiceYzt:
         self._video_id: Optional[str] = None
         self._video_path: Optional[str] = None
         self._started_at: Optional[datetime] = None
+        self._recording_started_at: Optional[datetime] = None
         # 定时录制字段（运行态；与 video_task 持久化字段保持一致）。
         self._record_duration_seconds: Optional[int] = None
         self._scheduled_stop_at: Optional[datetime] = None
@@ -137,8 +153,15 @@ class CameraServiceYzt:
         self._frames_written: int = 0
         self._capture_started_monotonic: Optional[float] = None
         self._last_error: Optional[str] = None
+        self._reconnect_started_at: Optional[datetime] = None
+        self._reconnect_timeout_finalization_started: bool = False
+        self._storage_stop_started: bool = False
         self._read_fail_count: int = 0
         self.READ_FAIL_THRESHOLD: int = 5
+        self._reconnect_grace_seconds = max(0.0, CAMERA_RECONNECT_GRACE_SECONDS)
+        self._reconnect_request_interval_seconds = max(
+            1.0, CAMERA_RECONNECT_REQUEST_INTERVAL_SECONDS
+        )
         # 未来录制计划 ID：start_stream 收到 record_schedule_id 时记录；
         # 正常停止 / 异常停止都会写回计划表。
         self._record_schedule_id: Optional[str] = None
@@ -173,8 +196,8 @@ class CameraServiceYzt:
     def get_saved_settings(self) -> dict:
         defaults = {
             "stream_url": self._get_camera_push_url(),
-            "width": 960,
-            "height": 540,
+            "width": 1980,
+            "height": 1020,
             "fps": self.FPS,
         }
         try:
@@ -207,7 +230,10 @@ class CameraServiceYzt:
 
     @property
     def focus_photo_dir(self) -> Path:
-        return DATA_DIR / "tmp" / "focalLength"
+        # Focus photos are displayed by the frontend after capture. Keep them
+        # under the public calibration tree so /static can serve the returned
+        # photo_url in both Vite and packaged Electron modes.
+        return DATA_DIR / "calibration" / "focus"
 
     def get_focus_settings(self) -> dict:
         defaults = {
@@ -283,6 +309,50 @@ class CameraServiceYzt:
         }
         self._event_history.append(item)
         print(f"[camera_yzt_event] {item}")
+
+    def _begin_reconnect_wait(self, reason: str) -> None:
+        """Enter reconnecting without ending the current recording session."""
+        with self._lock:
+            already_waiting = self.state == CameraRuntimeState.RECONNECTING
+            if self.state in (
+                CameraRuntimeState.STARTING,
+                CameraRuntimeState.RUNNING,
+                CameraRuntimeState.RECONNECTING,
+            ):
+                self.state = CameraRuntimeState.RECONNECTING
+                self.is_active = False
+                self._stream_ready = False
+                self._startup_phase = "reconnecting"
+                if self._reconnect_started_at is None:
+                    self._reconnect_started_at = datetime.now(timezone.utc)
+                self._last_error = (
+                    f"视频流暂时不可读，将等待 {self._reconnect_grace_seconds:.0f} 秒后再判定失败"
+                )
+        if not already_waiting:
+            self._record_event(
+                "stream_reconnect_wait_begin",
+                reason=reason,
+                grace_seconds=self._reconnect_grace_seconds,
+                video_id=self._video_id,
+            )
+
+    def _mark_stream_recovered(self) -> None:
+        with self._lock:
+            was_reconnecting = self.state == CameraRuntimeState.RECONNECTING
+            if self.state in (
+                CameraRuntimeState.STARTING,
+                CameraRuntimeState.RECONNECTING,
+            ):
+                self.state = CameraRuntimeState.RUNNING
+            self.is_active = True
+            self._stream_ready = True
+            self._startup_phase = "running"
+            self._last_error = None
+            self._reconnect_started_at = None
+            self._reconnect_timeout_finalization_started = False
+            self._storage_stop_started = False
+        if was_reconnecting:
+            self._record_event("stream_recovered", video_id=self._video_id)
 
     # ----------------- 定时录制辅助 -----------------
 
@@ -517,7 +587,8 @@ class CameraServiceYzt:
               然后释放锁再调用 ``stop_stream``，避免和 capture_loop / 用户
               手动 stop 的 lock 顺序死锁。
             * watchdog 视频 ID 与当前 ``self._video_id`` 不一致时退出（防 force_restart 残留）。
-            * state 非 active / 已触发过 / 不存在 video_task 会话时退出。
+            * 只有真正离开本次录制会话时退出；RECONNECTING 仍属于本次
+              录制，会继续计时，避免断网恢复后定时停止失效。
         """
         from app.utils.time_utils import now_beijing
 
@@ -538,6 +609,7 @@ class CameraServiceYzt:
                     is_active = state in (
                         CameraRuntimeState.STARTING,
                         CameraRuntimeState.RUNNING,
+                        CameraRuntimeState.RECONNECTING,
                     )
 
                     if (
@@ -905,6 +977,12 @@ class CameraServiceYzt:
 
         # 校验定时录制参数；非法直接抛 ValueError 由 router 转 status=error
         duration_minutes = self._parse_duration_minutes(stream_config)
+        if write_video and create_video_task:
+            storage = ensure_recording_capacity(
+                duration_minutes * 60 if duration_minutes else None
+            )
+            if not storage.get("recording_allowed"):
+                raise ValueError(storage.get("message") or "磁盘空间不足，无法开始录像")
 
         # 记录本次会话关联的 future 计划 ID。
         # preview 不得携带计划；只有正式录制 + write_video + create_video_task 才保存。
@@ -924,6 +1002,7 @@ class CameraServiceYzt:
             if self.state in (
                 CameraRuntimeState.STARTING,
                 CameraRuntimeState.RUNNING,
+                CameraRuntimeState.RECONNECTING,
                 CameraRuntimeState.STOPPING,
             ):
                 return {
@@ -1000,7 +1079,10 @@ class CameraServiceYzt:
             self._frames_captured = 0
             self._frames_written = 0
             self._capture_started_monotonic = None
+            self._recording_started_at = None
             self._last_error = None
+            self._reconnect_started_at = None
+            self._reconnect_timeout_finalization_started = False
             self._startup_error = None
             self._stream_ready = False
             self._startup_phase = "init"
@@ -1035,7 +1117,7 @@ class CameraServiceYzt:
             if create_video_task:
                 db = SessionLocal()
                 try:
-                    self._video_id = generate_video_id(db, source_type="rtsp")
+                    self._video_id = generate_video_id(db)
                 finally:
                     db.close()
 
@@ -1051,7 +1133,6 @@ class CameraServiceYzt:
                     session_repo.create_video_task(
                         db,
                         video_id=self._video_id,
-                        source_type="rtsp",
                         source_path=db_source_path,
                         rtsp_url=self.camera_push_url,
                     )
@@ -1193,6 +1274,7 @@ class CameraServiceYzt:
                     else None
                 ),
                 "auto_stop_triggered": False,
+                "storage": get_storage_health(),
             }
 
     def _capture_loop(self) -> None:
@@ -1206,6 +1288,7 @@ class CameraServiceYzt:
         """
         read_url = self.camera_read_url
         push_url = self.camera_push_url
+        video_path = self._video_path
 
         print(
             f"[camera_yzt] capture_loop: notify pi start stream_url={push_url}"
@@ -1226,6 +1309,20 @@ class CameraServiceYzt:
             rasp_payload["lens_position"] = self._lens_position
         if getattr(self, "_autofocus_window", None):
             rasp_payload["autofocus_window"] = self._autofocus_window
+
+        def request_pi_reconnect() -> None:
+            """Ask the publisher to resume without sending a stop command."""
+            try:
+                reconnect_result = self._post_pi_start(rasp_payload, timeout=10.0)
+                self._record_event(
+                    "pi_reconnect_requested",
+                    ok=bool(reconnect_result.get("ok")),
+                    status_code=reconnect_result.get("status_code"),
+                    already_running=bool(reconnect_result.get("already_running")),
+                    error=reconnect_result.get("error"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._record_event("pi_reconnect_request_failed", error=repr(exc))
 
         # ===== 1) 先查 Pi 端状态，决定是否复用已有推流 =====
         reused_existing = False
@@ -1345,8 +1442,14 @@ class CameraServiceYzt:
         self._record_event("stream_wait_begin", read_url=read_url)
         if not self._wait_until_stream_readable(
             read_url,
-            timeout_seconds=STREAM_READY_TIMEOUT_SECONDS,
+            timeout_seconds=max(
+                STREAM_READY_TIMEOUT_SECONDS,
+                self._reconnect_grace_seconds,
+            ),
+            on_reconnect=request_pi_reconnect,
         ):
+            if self._stop_event.is_set():
+                return
             self._handle_stream_read_failure(read_url, push_url)
             return
 
@@ -1356,11 +1459,14 @@ class CameraServiceYzt:
             if self.state == CameraRuntimeState.STARTING:
                 self.state = CameraRuntimeState.RUNNING
                 self.is_active = True
+        self._mark_stream_recovered()
         self._record_event("stream_readable", read_url=read_url)
 
         reconnect_delay = 1.0
         max_reconnect_delay = 30.0
         loop_error: Optional[Exception] = None
+        stream_lost_at: Optional[float] = None
+        last_reconnect_request_at: Optional[float] = None
 
         try:
             while not self._stop_event.is_set():
@@ -1383,6 +1489,15 @@ class CameraServiceYzt:
                             if ret_probe and frame_probe is not None:
                                 self._cap = cap
                                 open_ok = True
+                                if stream_lost_at is not None:
+                                    self._stream_ready = True
+                                    self._startup_phase = "running"
+                                    self._last_error = None
+                                    self.state = CameraRuntimeState.RUNNING
+                                    self.is_active = True
+                                    self._reconnect_started_at = None
+                                    self._record_event("stream_recovered")
+                                    stream_lost_at = None
                                 print(
                                     f"[camera_yzt] stream reopened: read_url={read_url}"
                                 )
@@ -1391,6 +1506,27 @@ class CameraServiceYzt:
                         time.sleep(1)
 
                     if not open_ok:
+                        now_monotonic = time.monotonic()
+                        if stream_lost_at is None:
+                            stream_lost_at = now_monotonic
+                            self._begin_reconnect_wait("stream_reopen_failed")
+                        if (
+                            last_reconnect_request_at is None
+                            or now_monotonic - last_reconnect_request_at
+                            >= self._reconnect_request_interval_seconds
+                        ):
+                            request_pi_reconnect()
+                            last_reconnect_request_at = now_monotonic
+                        if (
+                            now_monotonic - stream_lost_at
+                            < self._reconnect_grace_seconds
+                        ):
+                            if self._stop_event.wait(reconnect_delay):
+                                break
+                            reconnect_delay = min(
+                                reconnect_delay * 2, max_reconnect_delay
+                            )
+                            continue
                         msg = (
                             f"OpenCV 无法从 {read_url} 读取视频帧；"
                             "MediaMTX 可能已收到树莓派推流，但后端无法读取，"
@@ -1402,11 +1538,7 @@ class CameraServiceYzt:
                         self._startup_error = msg
                         self._startup_phase = "failed"
                         self._stream_ready = False
-                        self._fail_current_video_task(reason=msg)
-                        with self._lock:
-                            self.state = CameraRuntimeState.ERROR
-                            self.is_active = False
-                        self._stop_event.set()
+                        self._finalize_stream_after_reconnect_timeout(reason=msg)
                         return
 
                     reconnect_delay = 1.0
@@ -1429,21 +1561,32 @@ class CameraServiceYzt:
                     self._cap = None
 
                     if self._read_fail_count >= self.READ_FAIL_THRESHOLD:
-                        msg = (
-                            f"OpenCV 连续 {self._read_fail_count} 次从 {read_url} "
-                            "读取帧失败，达到阈值。"
-                        )
-                        self._record_event("capture_error", reason=msg)
-                        self._last_error = msg
-                        self._startup_error = msg
-                        self._startup_phase = "failed"
-                        self._stream_ready = False
-                        self._fail_current_video_task(reason=msg)
-                        with self._lock:
-                            self.state = CameraRuntimeState.ERROR
-                            self.is_active = False
-                            self._stop_event.set()
-                        break
+                        now_monotonic = time.monotonic()
+                        if stream_lost_at is None:
+                            stream_lost_at = now_monotonic
+                            self._begin_reconnect_wait("read_frame_failed")
+                        if (
+                            last_reconnect_request_at is None
+                            or now_monotonic - last_reconnect_request_at
+                            >= self._reconnect_request_interval_seconds
+                        ):
+                            request_pi_reconnect()
+                            last_reconnect_request_at = now_monotonic
+                        if (
+                            now_monotonic - stream_lost_at
+                            >= self._reconnect_grace_seconds
+                        ):
+                            msg = (
+                                f"OpenCV 连续 {self._read_fail_count} 次从 {read_url} "
+                                f"读取帧失败，超过 {self._reconnect_grace_seconds:.0f} 秒恢复等待窗口。"
+                            )
+                            self._record_event("capture_error", reason=msg)
+                            self._last_error = msg
+                            self._startup_error = msg
+                            self._startup_phase = "failed"
+                            self._stream_ready = False
+                            self._finalize_stream_after_reconnect_timeout(reason=msg)
+                            break
 
                     if self._stop_event.wait(reconnect_delay):
                         break
@@ -1455,6 +1598,25 @@ class CameraServiceYzt:
                 self._frames_captured += 1
                 if self._capture_started_monotonic is None:
                     self._capture_started_monotonic = time.monotonic()
+                    from app.utils.time_utils import now_beijing
+
+                    self._recording_started_at = now_beijing()
+                    if self._video_id and self._session_create_video_task:
+                        first_frame_db = SessionLocal()
+                        try:
+                            session_repo.mark_video_task_recording_started(
+                                first_frame_db,
+                                video_id=self._video_id,
+                                recording_started_at=self._recording_started_at,
+                            )
+                        except Exception as first_frame_error:
+                            first_frame_db.rollback()
+                            print(
+                                "[camera_yzt] WARN: 写入录像首帧时间失败: "
+                                f"{first_frame_error!r}"
+                            )
+                        finally:
+                            first_frame_db.close()
                 # 延迟武装：收到第一帧后，立即设置 scheduled_stop_at 和启动 watchdog。
                 # 条件内部已判断（preview / calibration 不参与）。
                 try:
@@ -1465,41 +1627,61 @@ class CameraServiceYzt:
                 _, jpeg = cv2.imencode('.jpg', frame)
                 self.last_frame_bytes = jpeg.tobytes()
                 if (
-                    self._writer is None
-                    and self._video_path is not None
+                    self._video_id
+                    and self._video_path
                     and getattr(self, "_write_video_enabled", True)
                 ):
-                    h, w = frame.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    self._writer = cv2.VideoWriter(
-                        self._video_path, fourcc, float(self.fps), (w, h)
-                    )
-                    self._writer_width = w
-                    self._writer_height = h
-
-                if (
-                    self._writer is not None
-                    and self._writer.isOpened()
-                    and getattr(self, "_write_video_enabled", True)
-                ):
-                    write_frame = frame
-                    fh, fw = frame.shape[:2]
-                    if fh != self._writer_height or fw != self._writer_width:
-                        write_frame = cv2.resize(frame, (self._writer_width, self._writer_height))
-                    elapsed = time.monotonic() - (self._capture_started_monotonic or time.monotonic())
-                    target_frames = max(1, int(elapsed * float(self.fps)))
-                    while self._frames_written < target_frames:
-                        self._writer.write(write_frame)
-                        self._frames_written += 1
+                    recorder_status = segmented_recording_service.status()
+                    if not recorder_status.get("running"):
+                        try:
+                            recorder_status = segmented_recording_service.start(
+                                self._video_id, read_url
+                            )
+                            self._record_event(
+                                "segmented_recording_started",
+                                video_id=self._video_id,
+                                pid=recorder_status.get("pid"),
+                            )
+                        except Exception as recorder_error:
+                            raise RuntimeError(
+                                f"启动断电保护分段录制失败：{recorder_error}"
+                            ) from recorder_error
+                    # 保持旧 API 的 frames_written 非零语义；真实落盘状态见 recording_segments。
+                    self._frames_written = max(self._frames_written, self._frames_captured)
 
                 if self._frames_captured % 100 == 1:
                     print(f"[camera_yzt] 已捕获帧: {self._frames_captured}, 已写入: {self._frames_written}")
+                if (
+                    self._frames_captured % max(1, int(self.fps * 20)) == 1
+                    and getattr(self, "_write_video_enabled", True)
+                ):
+                    storage = get_storage_health()
+                    if storage.get("level") == "block" and not self._storage_stop_started:
+                        self._storage_stop_started = True
+                        self._record_event(
+                            "storage_emergency_stop",
+                            free_bytes=storage.get("free_bytes"),
+                            message=storage.get("message"),
+                        )
+                        threading.Thread(
+                            target=self.stop_stream,
+                            kwargs={
+                                "reason": "storage_space_exhausted",
+                                "source": "storage_health_monitor",
+                                "queue_algorithm": True,
+                            },
+                            name="camera-storage-emergency-stop",
+                            daemon=True,
+                        ).start()
         except Exception as e:
             loop_error = e
             print(f"[camera_yzt] 捕获循环异常: {e}")
             self._record_event("capture_error", reason=str(loop_error))
         finally:
             self._release_runtime_resources()
+            # 无论是用户停止、断流超时还是捕获线程异常，都要结束独立
+            # ffmpeg 进程，避免只剩后台录制进程继续占用摄像头流。
+            segmented_recording_service.stop(timeout=15.0)
 
             measured_duration_seconds = None
             if video_path and Path(video_path).is_file():
@@ -1541,6 +1723,7 @@ class CameraServiceYzt:
         self,
         read_url: str,
         timeout_seconds: float = STREAM_READY_TIMEOUT_SECONDS,
+        on_reconnect: Optional[Callable[[], None]] = None,
     ) -> bool:
         """等到 OpenCV 真正读到第一帧。
 
@@ -1549,6 +1732,7 @@ class CameraServiceYzt:
         """
         deadline = time.time() + max(2.0, timeout_seconds)
         attempt = 0
+        last_reconnect_request_at: Optional[float] = None
 
         while time.time() < deadline and not self._stop_event.is_set():
             attempt += 1
@@ -1563,8 +1747,7 @@ class CameraServiceYzt:
                     if ret and frame is not None:
                         self._cap = cap
                         cap = None  # 已转交所有权
-                        self._stream_ready = True
-                        self._startup_phase = "running"
+                        self._mark_stream_recovered()
                         print(
                             f"[camera_yzt] stream readable: read_url={read_url}, "
                             f"frame_shape={frame.shape}"
@@ -1579,6 +1762,21 @@ class CameraServiceYzt:
                     except Exception:
                         pass
 
+            self._begin_reconnect_wait("initial_stream_unreadable")
+            now_monotonic = time.monotonic()
+            if (
+                on_reconnect is not None
+                and (
+                    last_reconnect_request_at is None
+                    or now_monotonic - last_reconnect_request_at
+                    >= self._reconnect_request_interval_seconds
+                )
+            ):
+                try:
+                    on_reconnect()
+                finally:
+                    last_reconnect_request_at = now_monotonic
+
             # 1s 内响应 stop_event
             if self._stop_event.wait(1.0):
                 return False
@@ -1586,7 +1784,7 @@ class CameraServiceYzt:
         return False
 
     def _handle_stream_read_failure(self, read_url: str, push_url: str) -> None:
-        """OpenCV 在 timeout 内仍读不到第一帧 → ERROR + 失败事件。"""
+        """首帧恢复窗口耗尽后封存任务；有有效视频时继续入队处理。"""
         msg = (
             f"MediaMTX 可能已收到树莓派推流（push_url={push_url}），"
             f"但后端无法从 {read_url} 读取视频帧。"
@@ -1600,23 +1798,12 @@ class CameraServiceYzt:
         self._startup_error = msg
         self._startup_phase = "failed"
         self._stream_ready = False
-        self._fail_current_video_task(reason=msg)
+        # Do not stop the Pi here. A missing stream can be a temporary camera
+        # power/network loss; the user or the reconnect loop must be allowed to
+        # bring the publisher back without destroying the camera session.
+        self._record_event("startup_stream_wait_expired_without_pi_stop")
 
-        # frames_written=0 时尝试清理 Pi 推流，避免 MediaMTX 长时间保留 ghost 流
-        try:
-            pi_stop_resp = self._post_pi_stop(timeout=5.0)
-            self._record_event(
-                "startup_failed_stop_pi",
-                ok=bool(pi_stop_resp.get("ok")),
-                status_code=pi_stop_resp.get("status_code"),
-            )
-        except Exception:
-            pass
-
-        with self._lock:
-            self.state = CameraRuntimeState.ERROR
-            self.is_active = False
-        self._stop_event.set()
+        self._finalize_stream_after_reconnect_timeout(reason=msg)
 
     def _fail_current_video_task(self, *, reason: str) -> None:
         vid = self._video_id
@@ -1636,6 +1823,81 @@ class CameraServiceYzt:
             self._record_event("video_task_failed", video_id=vid, reason=reason)
         except Exception as e:
             print(f"[camera_yzt] mark video_task failed failed: {e!r}")
+
+    def _finalize_stream_after_reconnect_timeout(self, *, reason: str) -> None:
+        """Close a timed-out recording and process it when a usable file exists."""
+        with self._lock:
+            if self._reconnect_timeout_finalization_started:
+                return
+            self._reconnect_timeout_finalization_started = True
+            video_id = self._video_id
+            frames_written = self._frames_written
+            self.state = CameraRuntimeState.ERROR
+            self.is_active = False
+            self._stream_ready = False
+            self._startup_phase = "failed"
+            self._last_error = reason
+            self._startup_error = reason
+            self._stop_event.set()
+
+        self._record_event(
+            "stream_reconnect_timeout",
+            video_id=video_id,
+            frames_written=frames_written,
+            reason=reason,
+            partial_recording=bool(frames_written > 0),
+        )
+
+        # Keep the timeout reason while stop_stream finalizes the file. A valid
+        # partial recording is then queued under the original video_id; a
+        # missing/empty file is marked failed by stop_stream itself.
+        if video_id:
+            try:
+                db = SessionLocal()
+                try:
+                    session_repo.update_video_task_status(
+                        db,
+                        video_id=video_id,
+                        status="recording",
+                        last_error=reason,
+                    )
+                finally:
+                    db.close()
+            except Exception as exc:  # noqa: BLE001
+                self._record_event(
+                    "stream_reconnect_timeout_reason_persist_failed",
+                    video_id=video_id,
+                    error=repr(exc),
+                )
+
+        def finalize() -> None:
+            try:
+                result = self.stop_stream(
+                    queue_algorithm=True,
+                    update_video_task=True,
+                    reason="stream_reconnect_timeout",
+                    source="camera_reconnect",
+                )
+                self._record_event(
+                    "stream_reconnect_timeout_finalized",
+                    video_id=video_id,
+                    queued=bool(result.get("queued")),
+                    job_id=result.get("job_id"),
+                    frames_written=frames_written,
+                    queue_error=result.get("queue_error"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._record_event(
+                    "stream_reconnect_timeout_finalize_failed",
+                    video_id=video_id,
+                    error=repr(exc),
+                )
+
+        threading.Thread(
+            target=finalize,
+            name=f"camera-reconnect-timeout-finalizer-{video_id or 'none'}",
+            daemon=True,
+        ).start()
 
     def stop_stream(
         self,
@@ -1659,6 +1921,7 @@ class CameraServiceYzt:
         # 不再使用 self._stopped_* 实例级字段，避免与并发 stop_stream 调用互相覆盖。
         stopped_record_schedule_id = self._record_schedule_id
         stopped_video_id = self._video_id
+        stopped_recording_started_at = self._recording_started_at
         stopped_actual_stop_at = __import__('datetime').datetime.now(
             __import__('datetime').timezone.utc
         )
@@ -1762,6 +2025,7 @@ class CameraServiceYzt:
 
         transcoded_path = video_path
         transcoded_status = "not_needed"
+        measured_duration_seconds: Optional[float] = None
         rasp_stop_status: int | str = "not_sent"
         rasp_stop_error = None
         db_update_error: Optional[str] = None
@@ -1775,6 +2039,29 @@ class CameraServiceYzt:
                 self._capture_thread.join(timeout=join_timeout)
 
             self._release_runtime_resources()
+            segment_stop = segmented_recording_service.stop(timeout=max(5.0, join_timeout))
+            if video_id and video_path:
+                finalize_result = segmented_recording_service.finalize(
+                    video_id, video_path, cleanup=True
+                )
+                if finalize_result.get("ok"):
+                    stopped_frames_written = max(stopped_frames_written, 1)
+                    transcoded_status = "segmented_finalized"
+                    self._record_event(
+                        "segmented_recording_finalized",
+                        video_id=video_id,
+                        segment_count=finalize_result.get("segment_count"),
+                        bytes=finalize_result.get("bytes"),
+                    )
+                    try:
+                        from app.services.video_playback_service import probe_media_duration_seconds
+                        measured_duration_seconds = probe_media_duration_seconds(video_path)
+                    except Exception as exc:
+                        print(f"[camera_yzt] probe finalized duration failed: {exc!r}")
+                elif stopped_frames_written > 0:
+                    raise RuntimeError(
+                        finalize_result.get("error") or "分段视频合并失败"
+                    )
 
             if video_path and stopped_frames_written > 0 and video_path.endswith(self.VIDEO_EXT):
                 # 通过 video_playback_service 生成 H.264 playable 副本
@@ -1886,12 +2173,10 @@ class CameraServiceYzt:
                     # watchdog 触发的 stop → auto_stop_triggered=True。
                     if video_id:
                         try:
-                            from app.utils.time_utils import now_beijing
-
                             session_repo.update_video_task_stop_info(
                                 db,
                                 video_id=video_id,
-                                actual_stop_at=now_beijing(),
+                                actual_stop_at=stopped_actual_stop_at,
                                 stop_reason=reason or "user",
                                 stop_source=source or "",
                                 auto_stop_triggered=stopped_auto_stop_triggered,
@@ -1955,15 +2240,14 @@ class CameraServiceYzt:
                         queued = True
                         queue_message = (
                             "已切到整视频算法 CLI pipeline，"
-                            "算法 video_id 会在 worker 内重新生成；"
-                            "上传阶段 video_id 仅作为日志 / 数据库追溯。"
+                            "录制 video_id 会沿用到 worker、结果目录、数据库和报表。"
                         )
                         self._record_event(
                             "algorithm_queued", video_id=video_id, job_id=job_id
                         )
                         print(
                             f"[camera_yzt] algorithm pipeline queued: "
-                            f"upload_video_id={video_id} job_id={job_id}"
+                            f"task_video_id={video_id} job_id={job_id}"
                         )
                     elif stopped_frames_written == 0:
                         queue_message = (
@@ -2017,7 +2301,7 @@ class CameraServiceYzt:
                 "raspberry_stop_status": rasp_stop_status,
                 "raspberry_stop_error": rasp_stop_error,
                 "transcoded_status": transcoded_status,
-                "note": "已切到 algorithm_video_pipeline，upload video_id 与算法 video_id 可能不同。",
+                "note": "已切到 algorithm_video_pipeline，摄像头 video_id 会沿用到算法结果。",
                 "pi_stop_called": pi_stop_called_norm,
                 "pi_status_after": pi_status_after_norm,
                 # 定时录制字段（停止时的快照，finally 重置后仍可读）
@@ -2028,6 +2312,12 @@ class CameraServiceYzt:
                     else None
                 ),
                 "auto_stop_triggered": stopped_auto_stop_triggered,
+                "recording_started_at": (
+                    stopped_recording_started_at.isoformat()
+                    if stopped_recording_started_at
+                    else None
+                ),
+                "recording_finished_at": stopped_actual_stop_at.isoformat(),
             }
         except Exception as e:
             print(f"[camera_yzt] stop_stream 异常: {e}")
@@ -2067,6 +2357,7 @@ class CameraServiceYzt:
                 self.is_active = False
                 self.last_frame_bytes = None
                 self._started_at = None
+                self._recording_started_at = None
                 self._last_error = None
                 self._video_id = None
                 self._video_path = None
@@ -2076,6 +2367,8 @@ class CameraServiceYzt:
                 self._writer_height = 0
                 self._capture_thread = None
                 self._read_fail_count = 0
+                self._reconnect_timeout_finalization_started = False
+                self._storage_stop_started = False
                 # 标定/写视频/video_task 标志恢复默认
                 self._write_video_enabled = True
                 self._calibration_only = False
@@ -2242,13 +2535,16 @@ class CameraServiceYzt:
         with self._lock:
             self.last_frame_bytes = None
             self._started_at = None
+            self._recording_started_at = None
             self._last_error = None
+            self._reconnect_started_at = None
             self._video_id = None
             self._video_path = None
             self._frames_captured = 0
             self._frames_written = 0
             self._capture_thread = None
             self._read_fail_count = 0
+            self._reconnect_started_at = None
 
             self._write_video_enabled = True
             self._record_schedule_id = None
@@ -2344,6 +2640,7 @@ class CameraServiceYzt:
             show_current = current_state in (
                 CameraRuntimeState.RUNNING,
                 CameraRuntimeState.STARTING,
+                CameraRuntimeState.RECONNECTING,
                 CameraRuntimeState.STOPPING,
                 CameraRuntimeState.ERROR,
             )
@@ -2355,6 +2652,9 @@ class CameraServiceYzt:
             frames_written = self._frames_written if show_current else 0
             last_error = self._last_error
             started_at = self._started_at if show_current else None
+            recording_started_at = (
+                self._recording_started_at if show_current else None
+            )
             stream_ready = bool(self._stream_ready)
             startup_phase = self._startup_phase
             startup_error = self._startup_error
@@ -2374,11 +2674,13 @@ class CameraServiceYzt:
                 self._timer_pending if show_current else False
             )
             timer_armed_at = self._timer_armed_at if show_current else None
+            reconnect_started_at = self._reconnect_started_at if show_current else None
 
         # 会话类型：idle / recording / preview
         if current_state not in (
             CameraRuntimeState.STARTING,
             CameraRuntimeState.RUNNING,
+            CameraRuntimeState.RECONNECTING,
             CameraRuntimeState.STOPPING,
             CameraRuntimeState.ERROR,
         ):
@@ -2392,6 +2694,37 @@ class CameraServiceYzt:
         runtime = get_pi_runtime_config()
         effective_push_url = camera_push_url or runtime.camera_push_url
         effective_read_url = camera_read_url or runtime.camera_read_url
+        pi_resolution = get_pi_resolution_diag()
+        pi_arp = get_pi_arp_diag(runtime.pi_resolved_ip)
+        previous_pi_mac = getattr(self, "_last_pi_mac", None)
+        pi_mac_changed = bool(
+            previous_pi_mac
+            and pi_arp.get("mac")
+            and previous_pi_mac != pi_arp.get("mac")
+        )
+        if pi_mac_changed:
+            self._record_event(
+                "pi_arp_mac_changed",
+                previous_mac=previous_pi_mac,
+                current_mac=pi_arp.get("mac"),
+                resolved_ip=runtime.pi_resolved_ip,
+            )
+        if pi_arp.get("mac"):
+            self._last_pi_mac = pi_arp.get("mac")
+        previous_resolved_ip = getattr(self, "_last_pi_resolved_ip", None)
+        pi_address_changed = bool(
+            previous_resolved_ip
+            and runtime.pi_resolved_ip
+            and previous_resolved_ip != runtime.pi_resolved_ip
+        )
+        if pi_address_changed:
+            self._record_event(
+                "pi_resolved_ip_changed",
+                previous_ip=previous_resolved_ip,
+                current_ip=runtime.pi_resolved_ip,
+            )
+        if runtime.pi_resolved_ip:
+            self._last_pi_resolved_ip = runtime.pi_resolved_ip
 
         elapsed: Optional[float] = None
         fps: Optional[float] = None
@@ -2400,6 +2733,16 @@ class CameraServiceYzt:
             elapsed = (now_beijing() - started_at).total_seconds()
             if elapsed and elapsed > 0:
                 fps = frames_captured / elapsed
+
+        reconnect_elapsed_seconds: Optional[int] = None
+        reconnect_remaining_seconds: Optional[int] = None
+        if current_state == CameraRuntimeState.RECONNECTING and reconnect_started_at:
+            reconnect_elapsed_seconds = max(
+                0, int((datetime.now(timezone.utc) - reconnect_started_at).total_seconds())
+            )
+            reconnect_remaining_seconds = max(
+                0, int(self._reconnect_grace_seconds - reconnect_elapsed_seconds)
+            )
 
         # ---- 查询 Pi 端状态（失败不影响主流程） ----
         try:
@@ -2422,6 +2765,7 @@ class CameraServiceYzt:
         backend_active = current_state in (
             CameraRuntimeState.RUNNING,
             CameraRuntimeState.STARTING,
+            CameraRuntimeState.RECONNECTING,
         )
 
         # ---- 调试模拟：允许前端强制覆盖状态以验证 desync 判定 ----
@@ -2486,6 +2830,19 @@ class CameraServiceYzt:
                 timer_armed_at.isoformat() if timer_armed_at else None
             ),
             "auto_stop_triggered": auto_stop_triggered,
+            "reconnect_grace_seconds": self._reconnect_grace_seconds,
+            "reconnect_elapsed_seconds": reconnect_elapsed_seconds,
+            "reconnect_remaining_seconds": reconnect_remaining_seconds,
+            "reconnecting": current_state == CameraRuntimeState.RECONNECTING,
+            "pi_resolution": pi_resolution,
+            "pi_address_changed": pi_address_changed,
+            "pi_arp": pi_arp,
+            "pi_mac_changed": pi_mac_changed,
+            "storage": get_storage_health(),
+            "recording_segments": segmented_recording_service.status(),
+            "recording_started_at": (
+                recording_started_at.isoformat() if recording_started_at else None
+            ),
         }
 
         record_schedule_id = self._record_schedule_id
@@ -2522,6 +2879,19 @@ class CameraServiceYzt:
             "desync": desync,
             "desync_reason": desync_reason,
             "event_history": list(self._event_history)[-20:],
+            "reconnect_grace_seconds": self._reconnect_grace_seconds,
+            "reconnect_elapsed_seconds": reconnect_elapsed_seconds,
+            "reconnect_remaining_seconds": reconnect_remaining_seconds,
+            "reconnecting": current_state == CameraRuntimeState.RECONNECTING,
+            "pi_resolution": pi_resolution,
+            "pi_address_changed": pi_address_changed,
+            "pi_arp": pi_arp,
+            "pi_mac_changed": pi_mac_changed,
+            "storage": get_storage_health(),
+            "recording_segments": segmented_recording_service.status(),
+            "recording_started_at": (
+                recording_started_at.isoformat() if recording_started_at else None
+            ),
             # 定时录制字段
             "record_duration_seconds": record_duration_seconds,
             "scheduled_stop_at": (
@@ -2654,6 +3024,7 @@ class CameraServiceYzt:
             self.is_active = False
             self.last_frame_bytes = None
             self._started_at = None
+            self._recording_started_at = None
             self._last_error = None
             self._video_id = None
             self._video_path = None
@@ -2663,6 +3034,8 @@ class CameraServiceYzt:
             self._writer_height = 0
             self._capture_thread = None
             self._read_fail_count = 0
+            self._reconnect_timeout_finalization_started = False
+            self._reconnect_started_at = None
             self._write_video_enabled = True
             self._calibration_only = False
             self._session_create_video_task = True
@@ -2672,6 +3045,8 @@ class CameraServiceYzt:
             self._stream_ready = False
             self._startup_phase = "idle"
             self._startup_error = None
+            self._reconnect_started_at = None
+            self._reconnect_timeout_finalization_started = False
             self._stop_origin = ""
 
         # 通知 watchdog 退出（理论上没有运行，但 set 一下更稳）
@@ -2680,15 +3055,15 @@ class CameraServiceYzt:
         self._watchdog_video_id = None
 
     def recover_interrupted_recordings_on_startup(self) -> dict:
-        """后端启动恢复：清理 DB 残留 recording / running 任务。
+        """后端启动恢复：优先合并残留 TS 分段并继续算法任务。
 
         重要约束：
             * 不调用完整 stop_stream——内存里的 _video_id / _capture_thread
               / _writer / OpenCV VideoCapture / watchdog 全都丢失，
               完整 stop_stream 会产生空 video_task_failed 假事件，
               并可能误把状态从 queued/processing/done/failed 改坏。
-            * 把旧任务标记为 interrupted，写实际停止时间和原因。
-            * 不入队算法、不删除视频、不转码 playable、不恢复旧录制。
+            * 有有效分段时合并为 MP4，测量时长并重新入队算法。
+            * 没有有效分段或合并失败时才标记 interrupted。
             * 尝试清理树莓派残留推流。
             * 任何异常都吞掉，不能阻断后端启动。
         """
@@ -2747,6 +3122,57 @@ class CameraServiceYzt:
                             "进程内采集线程和写视频状态已丢失，"
                             "已在启动恢复阶段标记为 interrupted。"
                         )
+
+                    recovered_path = VID_DIR / f"{task.video_id}{self.VIDEO_EXT}"
+                    try:
+                        recovered = segmented_recording_service.finalize(
+                            task.video_id, recovered_path, cleanup=True
+                        )
+                    except Exception as exc:
+                        recovered = {"ok": False, "error": repr(exc)}
+                    if recovered.get("ok"):
+                        try:
+                            from app.services.path_service import to_data_relative
+                            from app.services.video_playback_service import probe_media_duration_seconds
+                            from app.workers.queue import enqueue_algorithm_video_pipeline_from_video_task
+
+                            duration = probe_media_duration_seconds(str(recovered_path))
+                            rel_path = to_data_relative(str(recovered_path))
+                            if rel_path:
+                                session_repo.update_video_task_source_path(
+                                    db, video_id=task.video_id, source_path=rel_path
+                                )
+                            if duration:
+                                session_repo.update_video_task_duration(
+                                    db, video_id=task.video_id, video_duration_seconds=duration
+                                )
+                            session_repo.update_video_task_stop_info(
+                                db, video_id=task.video_id, actual_stop_at=now,
+                                stop_reason="recording_recovered_after_restart",
+                                stop_source="startup_recovery",
+                                auto_stop_triggered=auto_stop_triggered_flag,
+                            )
+                            session_repo.update_video_task_status(
+                                db, video_id=task.video_id, status="queued",
+                                last_error="检测到异常关机前的视频分段，已自动恢复并重新提交算法。",
+                            )
+                            job_id = enqueue_algorithm_video_pipeline_from_video_task(
+                                video_id=task.video_id, input_video=str(recovered_path)
+                            )
+                            result["recovered_count"] += 1
+                            result["items"].append({
+                                "video_id": task.video_id, "previous_status": previous_status,
+                                "stop_reason": "recording_recovered_after_restart",
+                                "actual_stop_at": now.isoformat(), "queued": True,
+                                "job_id": job_id, "segment_count": recovered.get("segment_count"),
+                            })
+                            self._record_event(
+                                "startup_recovery_task_restored", video_id=task.video_id,
+                                job_id=job_id, segment_count=recovered.get("segment_count"),
+                            )
+                            continue
+                        except Exception as exc:
+                            last_error = f"视频分段已合并，但恢复算法任务失败：{exc!r}"
 
                     try:
                         updated = session_repo.mark_video_task_interrupted(

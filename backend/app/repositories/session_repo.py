@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from math import isfinite
 
 from sqlalchemy.orm import Session
 
@@ -15,13 +16,12 @@ def create_video_task(
     db: Session,
     *,
     video_id: str,
-    source_type: str,
     source_path: str | None,
     rtsp_url: str | None,
 ) -> VideoTask:
     print(
         f"[DB] create video task: "
-        f"video_id={video_id!r} source_type={source_type!r} "
+        f"video_id={video_id!r} "
         f"source_path={source_path!r} rtsp_url={rtsp_url!r}"
     )
 
@@ -32,7 +32,6 @@ def create_video_task(
 
     if existing_task:
         # 如果存在，则更新其信息
-        existing_task.source_type = source_type
         existing_task.source_path = source_path
         existing_task.rtsp_url = rtsp_url
         existing_task.status = "queued"  # 重置状态为排队
@@ -44,6 +43,8 @@ def create_video_task(
         existing_task.fps_estimate = None
         existing_task.started_at = None
         existing_task.finished_at = None
+        existing_task.recording_started_at = None
+        existing_task.processing_duration_seconds = None
         existing_task.last_error = None
 
         db.commit()
@@ -54,7 +55,6 @@ def create_video_task(
         # 如果不存在，则创建新记录
         obj = VideoTask(
             video_id=video_id,
-            source_type=source_type,
             source_path=source_path,
             rtsp_url=rtsp_url,
             status="queued",
@@ -63,6 +63,7 @@ def create_video_task(
             fps_estimate=None,
             started_at=None,
             finished_at=None,
+            recording_started_at=None,
             last_error=None,
             created_at=now_beijing(),  # 确保设置了创建时间
             updated_at=now_beijing(),  # 确保设置了更新时间
@@ -98,8 +99,12 @@ def update_video_task_status(
         obj.finished_at = now
         if obj.started_at:
             elapsed = (now - obj.started_at).total_seconds()
-            if elapsed >= 0:
+            if isfinite(elapsed) and elapsed >= 0:
                 obj.processing_duration_seconds = round(elapsed, 2)
+            else:
+                # Do not preserve an old/stale duration when timestamps are
+                # invalid; reports must treat it as unavailable instead.
+                obj.processing_duration_seconds = None
 
     db.commit()
     print(
@@ -132,9 +137,15 @@ def update_video_task_duration(
 ) -> None:
     """Persist the measured media duration after recording/transcoding."""
     obj = db.get(VideoTask, video_id)
-    if obj is None or video_duration_seconds is None or video_duration_seconds <= 0:
+    if obj is None or video_duration_seconds is None:
         return
-    obj.video_duration_seconds = round(float(video_duration_seconds), 3)
+    try:
+        value = float(video_duration_seconds)
+    except (TypeError, ValueError):
+        return
+    if not isfinite(value) or value <= 0:
+        return
+    obj.video_duration_seconds = round(value, 3)
     db.commit()
 
 
@@ -274,6 +285,31 @@ def update_video_task_stop_info(
         f"stop_reason={stop_reason!r} stop_source={stop_source!r} "
         f"auto_stop_triggered={auto_stop_triggered}"
     )
+
+
+def mark_video_task_recording_started(
+    db: Session,
+    *,
+    video_id: str,
+    recording_started_at: datetime,
+) -> datetime | None:
+    """Persist the first captured-frame timestamp exactly once."""
+    obj = db.get(VideoTask, video_id)
+    if obj is None:
+        print(
+            f"[DB] mark video task recording started: task not found, "
+            f"video_id={video_id!r}"
+        )
+        return None
+
+    if obj.recording_started_at is None:
+        obj.recording_started_at = recording_started_at
+        db.commit()
+        print(
+            f"[DB] video recording started: video_id={video_id!r} "
+            f"recording_started_at={recording_started_at!r}"
+        )
+    return obj.recording_started_at
 
 
 # ---------------------------------------------------------------------------

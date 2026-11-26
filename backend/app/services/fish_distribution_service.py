@@ -15,6 +15,14 @@ FISH_DISTRIBUTION_BINS: dict[str, tuple[tuple[float, float, str], ...]] = {
         (30, 40, "30-40"),
         (40, float("inf"), ">=40"),
     ),
+    "body_length_no_tail_cm": (
+        (-float("inf"), 8, "<8"),
+        (8, 12, "8-12"),
+        (12, 16, "12-16"),
+        (16, 20, "16-20"),
+        (20, 25, "20-25"),
+        (25, float("inf"), ">=25"),
+    ),
     "body_height_cm": (
         (-float("inf"), 2, "<2"),
         (2, 4, "2-4"),
@@ -24,6 +32,14 @@ FISH_DISTRIBUTION_BINS: dict[str, tuple[tuple[float, float, str], ...]] = {
         (10, float("inf"), ">=10"),
     ),
     "body_weight_g": (
+        (-float("inf"), 50, "<50"),
+        (50, 100, "50-100"),
+        (100, 200, "100-200"),
+        (200, 400, "200-400"),
+        (400, 800, "400-800"),
+        (800, float("inf"), ">=800"),
+    ),
+    "pred_weight_g": (
         (-float("inf"), 50, "<50"),
         (50, 100, "50-100"),
         (100, 200, "100-200"),

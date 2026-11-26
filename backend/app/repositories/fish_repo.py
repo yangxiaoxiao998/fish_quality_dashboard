@@ -121,6 +121,12 @@ def update_fish_five_dimensions(
     obj.body_length_without_tail = body_length_without_tail
     obj.body_height = body_height
     obj.body_weight = body_weight
+    # Keep legacy columns synchronized during the compatibility window while
+    # all readers use the new unit-explicit columns.
+    obj.body_length_cm = body_length
+    obj.body_length_no_tail_cm = body_length_without_tail
+    obj.body_height_cm = body_height
+    obj.pred_weight_g = body_weight
     obj.condition_factor = condition_factor
     obj.surface_damage = surface_damage
 
