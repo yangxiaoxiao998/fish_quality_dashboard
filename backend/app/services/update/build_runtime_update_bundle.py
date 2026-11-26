@@ -7,13 +7,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+from app.runtime_paths import INSTALL_ROOT as RUNTIME_INSTALL_ROOT
+from app.runtime_paths import resource_path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-BUILD_SCRIPT = PROJECT_ROOT / "backend" / "app" / "services" / "update" / "build_update_package.sh"
-OUTPUT_ROOT = PROJECT_ROOT / "backend" / "app" / "services" / "update" / "dist"
+PROJECT_ROOT = RUNTIME_INSTALL_ROOT
+BUILD_SCRIPT = resource_path("backend", "app", "services", "update", "build_update_package.sh")
+OUTPUT_ROOT = PROJECT_ROOT / "data" / "state" / "software_update" / "build"
 
 
-def build_bundle(*, skip_frontend_build: bool, output_root: Path) -> Path:
+def build_bundle(
+    *,
+    skip_frontend_build: bool,
+    output_root: Path,
+    packaged: bool = False,
+    release_root: Path | None = None,
+) -> Path:
     if not BUILD_SCRIPT.exists():
         raise RuntimeError(f"build script not found: {BUILD_SCRIPT}")
 
@@ -27,6 +35,10 @@ def build_bundle(*, skip_frontend_build: bool, output_root: Path) -> Path:
         "--output-dir",
         str(output_root),
     ]
+    if packaged:
+        command.insert(2, "--packaged")
+        if release_root is not None:
+            command.extend(["--release-root", str(release_root)])
     if skip_frontend_build:
         command.append("--skip-frontend-build")
 
@@ -53,12 +65,23 @@ def build_bundle(*, skip_frontend_build: bool, output_root: Path) -> Path:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compatibility wrapper for update/build_update_package.sh"
+        description="Build a source or packaged-artifact Linux update package"
     )
     parser.add_argument(
         "--skip-frontend-build",
         action="store_true",
         help="Compatibility no-op in source update mode",
+    )
+    parser.add_argument(
+        "--packaged",
+        "--artifact",
+        action="store_true",
+        help="Build from a packaged Linux release (PyInstaller + AppImage)",
+    )
+    parser.add_argument(
+        "--release-root",
+        default=None,
+        help="Packaged release directory (defaults to dist/fish-quality-linux-x86_64)",
     )
     parser.add_argument(
         "--output-root",
@@ -75,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
         final_package = build_bundle(
             skip_frontend_build=bool(args.skip_frontend_build),
             output_root=Path(args.output_root).expanduser(),
+            packaged=bool(args.packaged),
+            release_root=Path(args.release_root).expanduser() if args.release_root else None,
         )
     except Exception as exc:
         print(f"[error] {exc}", file=sys.stderr, flush=True)

@@ -9,10 +9,10 @@ type RangeKey = '7d' | '30d' | 'all'
 
 interface SummaryData {
   total_video_tasks: number
-  upload_video_count: number
   camera_video_count: number
   done_task_count: number
   failed_task_count: number
+  interrupted_task_count: number
   no_fish_task_count: number
   success_rate: number
   failure_rate: number
@@ -20,7 +20,9 @@ interface SummaryData {
   avg_fish_per_video: number
   total_video_duration: number
   avg_processing_duration: number
-  avg_fps: number
+  processing_duration_sample_count: number
+  max_processing_duration: number
+  avg_fps: number | null
   camera_start_count: number
 }
 
@@ -46,11 +48,19 @@ interface FailureItem {
 interface ChartsData {
   daily_video_task_trend: ChartBucket[]
   daily_fish_trend: ChartBucket[]
-  source_type_distribution: NameCount[]
+  camera_task_distribution: NameCount[]
   task_status_distribution: NameCount[]
   daily_failed_task_trend: ChartBucket[]
+  daily_abnormal_task_trend: ChartBucket[]
   failure_reason_rank: FailureItem[]
   avg_processing_duration_trend: ChartBucket[]
+}
+
+interface MetricCard {
+  title: string
+  value: number | string
+  unit: string
+  hint?: string
 }
 
 const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
@@ -64,9 +74,10 @@ const summary = ref<SummaryData | null>(null)
 const charts = ref<ChartsData>({
   daily_video_task_trend: [],
   daily_fish_trend: [],
-  source_type_distribution: [],
+  camera_task_distribution: [],
   task_status_distribution: [],
   daily_failed_task_trend: [],
+  daily_abnormal_task_trend: [],
   failure_reason_rank: [],
   avg_processing_duration_trend: []
 })
@@ -77,48 +88,57 @@ const loading = ref(false)
 const taskTrendChartRef = ref<HTMLElement>()
 const fishTrendChartRef = ref<HTMLElement>()
 const taskStatusChartRef = ref<HTMLElement>()
+const abnormalTrendChartRef = ref<HTMLElement>()
 const durationTrendChartRef = ref<HTMLElement>()
 
 let taskTrendChart: echarts.ECharts | null = null
 let fishTrendChart: echarts.ECharts | null = null
 let taskStatusChart: echarts.ECharts | null = null
+let abnormalTrendChart: echarts.ECharts | null = null
 let durationTrendChart: echarts.ECharts | null = null
 const allCharts: echarts.ECharts[] = []
 
-const metricCards = computed(() => {
+const metricCards = computed<MetricCard[]>(() => {
   const s = summary.value
   if (!s) {
     return [
       { title: '视频任务总数', value: '--', unit: '个' },
-      { title: '上传视频数量', value: '--', unit: '个' },
       { title: '摄像头视频数量', value: '--', unit: '个' },
       { title: '完成任务数量', value: '--', unit: '个' },
       { title: '失败任务数量', value: '--', unit: '个' },
+      { title: '中断任务数量', value: '--', unit: '个' },
       { title: '无鱼任务数量', value: '--', unit: '个' },
       { title: '任务成功率', value: '--', unit: '%' },
       { title: '任务失败率', value: '--', unit: '%' },
       { title: '总检测鱼数量', value: '--', unit: '条' },
       { title: '平均每个视频检测鱼数量', value: '--', unit: '条' },
       { title: '总视频时长', value: '--', unit: '秒' },
-      { title: '平均处理耗时', value: '--', unit: '秒' },
+      { title: '有效任务平均处理耗时', value: '--', unit: '秒' },
+      { title: '最长处理耗时', value: '--', unit: '秒' },
       { title: '平均 FPS', value: '--', unit: '' },
       { title: '摄像头开启次数', value: '--', unit: '次' }
     ]
   }
   return [
     { title: '视频任务总数', value: s.total_video_tasks, unit: '个' },
-    { title: '上传视频数量', value: s.upload_video_count, unit: '个' },
     { title: '摄像头视频数量', value: s.camera_video_count, unit: '个' },
     { title: '完成任务数量', value: s.done_task_count, unit: '个' },
     { title: '失败任务数量', value: s.failed_task_count, unit: '个' },
+    { title: '中断任务数量', value: s.interrupted_task_count, unit: '个' },
     { title: '无鱼任务数量', value: s.no_fish_task_count, unit: '个' },
     { title: '任务成功率', value: Number((s.success_rate * 100).toFixed(2)), unit: '%' },
     { title: '任务失败率', value: Number((s.failure_rate * 100).toFixed(2)), unit: '%' },
     { title: '总检测鱼数量', value: s.total_fish, unit: '条' },
     { title: '平均每个视频检测鱼数量', value: s.avg_fish_per_video, unit: '条' },
     { title: '总视频时长', value: formatDurationPrecise(s.total_video_duration), unit: '' },
-    { title: '平均处理耗时', value: formatDurationPrecise(s.avg_processing_duration), unit: '' },
-    { title: '平均 FPS', value: s.avg_fps, unit: '' },
+    {
+      title: '有效任务平均处理耗时',
+      value: formatDurationPrecise(s.avg_processing_duration),
+      unit: '',
+      hint: `按 ${s.processing_duration_sample_count || 0} 个有效耗时样本计算`
+    },
+    { title: '最长处理耗时', value: formatDurationPrecise(s.max_processing_duration), unit: '' },
+    { title: '平均 FPS', value: s.avg_fps == null ? '暂无数据' : s.avg_fps, unit: '' },
     { title: '摄像头开启次数', value: s.camera_start_count, unit: '次' }
   ]
 })
@@ -299,6 +319,16 @@ function renderCharts() {
   if (taskStatusChart) {
     taskStatusChart.setOption(buildPieOption(safeArray(c.task_status_distribution)), true)
   }
+  if (abnormalTrendChart) {
+    abnormalTrendChart.setOption(
+      buildTrendOption(
+        safeArray(c.daily_abnormal_task_trend),
+        '异常任务数',
+        ['#f53f3f', 'rgba(245,63,63,0.30)']
+      ),
+      true
+    )
+  }
   if (durationTrendChart) {
     durationTrendChart.setOption(buildDurationOption(safeArray(c.avg_processing_duration_trend)), true)
   }
@@ -317,6 +347,10 @@ function initCharts() {
     taskStatusChart = echarts.init(taskStatusChartRef.value)
     allCharts.push(taskStatusChart)
   }
+  if (abnormalTrendChartRef.value) {
+    abnormalTrendChart = echarts.init(abnormalTrendChartRef.value)
+    allCharts.push(abnormalTrendChart)
+  }
   if (durationTrendChartRef.value) {
     durationTrendChart = echarts.init(durationTrendChartRef.value)
     allCharts.push(durationTrendChart)
@@ -329,6 +363,7 @@ function disposeCharts() {
   taskTrendChart = null
   fishTrendChart = null
   taskStatusChart = null
+  abnormalTrendChart = null
   durationTrendChart = null
 }
 
@@ -431,6 +466,7 @@ onBeforeUnmount(() => {
             {{ fmtInt(m.value) }}
             <span v-if="m.unit" class="metric-unit">{{ m.unit }}</span>
           </div>
+          <div v-if="m.hint" class="metric-hint">{{ m.hint }}</div>
         </div>
       </div>
 
@@ -447,10 +483,16 @@ onBeforeUnmount(() => {
             <div ref="fishTrendChartRef" class="chart-container chart-container-tall" />
           </a-card>
         </a-col>
-        <a-col :xs="24" :sm="12" :md="12" :lg="12">
+        <a-col :xs="24" :xl="12">
           <a-card :bordered="false" class="chart-card">
             <template #title><span class="chart-title">任务状态分布</span></template>
             <div ref="taskStatusChartRef" class="chart-container" />
+          </a-card>
+        </a-col>
+        <a-col :xs="24" :xl="12">
+          <a-card :bordered="false" class="chart-card">
+            <template #title><span class="chart-title">每日异常任务数量趋势</span></template>
+            <div ref="abnormalTrendChartRef" class="chart-container" />
           </a-card>
         </a-col>
         <a-col :span="24">
@@ -514,7 +556,8 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 12px 0;
+  padding: 16px;
+  padding-bottom: 24px;
 }
 .range-card {
   background: #fff;
@@ -551,6 +594,7 @@ onBeforeUnmount(() => {
       font-weight: 700;
       color: #1f2937;
       font-family: SarasaMonoSC, monospace;
+      white-space: nowrap;
       .metric-unit {
         font-size: 12px;
         margin-left: 4px;
@@ -558,9 +602,16 @@ onBeforeUnmount(() => {
         font-weight: 400;
       }
     }
+    .metric-hint {
+      margin-top: 4px;
+      color: #86909c;
+      font-size: 11px;
+      line-height: 1.4;
+    }
   }
 }
 .charts-section {
+  margin-top: 16px;
   :deep(.chart-card) {
     background: #fff;
     border-radius: 12px;
@@ -588,7 +639,7 @@ onBeforeUnmount(() => {
   }
 }
 .failure-detail-card {
-  height: 420px;
+  min-height: 180px;
   padding: 16px;
   box-sizing: border-box;
   background: #fff;
@@ -598,7 +649,7 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 .failure-table-wrap {
-  height: 340px;
+  max-height: 340px;
   overflow: auto;
   border: 1px solid #e5e6eb;
   border-radius: 8px;
@@ -614,6 +665,34 @@ onBeforeUnmount(() => {
   padding: 8px 10px;
   text-align: left;
   white-space: nowrap;
+}
+.excel-like-table tbody td {
+  color: #1d2129;
+  background: #fff;
+}
+.excel-like-table th:nth-child(1),
+.excel-like-table td:nth-child(1) {
+  width: 56px;
+  text-align: center;
+}
+.excel-like-table th:nth-child(2),
+.excel-like-table td:nth-child(2) {
+  width: 140px;
+}
+.excel-like-table th:nth-child(3),
+.excel-like-table td:nth-child(3) {
+  width: 140px;
+}
+.excel-like-table th:nth-child(4),
+.excel-like-table td:nth-child(4) {
+  min-width: 420px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+.excel-like-table th:nth-child(5),
+.excel-like-table td:nth-child(5) {
+  width: 180px;
 }
 .excel-like-table thead th {
   position: sticky;

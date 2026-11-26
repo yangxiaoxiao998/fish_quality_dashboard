@@ -99,7 +99,6 @@ def main() -> int:
     os.environ.setdefault("FISH_PROJECT_ROOT", str(project_root))
     os.environ.setdefault("FISH_ALGO_ROOT", str(algo_dir))
     os.environ.setdefault("FISH_DATA_ROOT", str(project_root / "data"))
-    os.environ.setdefault("FISH_ALGO_MODE", "real")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
 

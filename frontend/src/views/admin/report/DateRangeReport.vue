@@ -46,34 +46,34 @@
           description="暂无可用于绘图的跨日期数据"
         />
         <div v-else class="charts-grid">
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">每日视频任务数趋势</span></template>
-            <div ref="trendRef" class="chart-canvas chart-canvas-tall"></div>
-          </a-card>
-           <a-card :bordered="false" class="chart-card">
-             <template #title><span class="chart-title">全长分布 (cm)</span></template>
-             <div ref="lengthDistRef" class="chart-canvas"></div>
-           </a-card>
-           <a-card :bordered="false" class="chart-card">
-               <template #title><span class="chart-title">体高分布 (cm)</span></template>
-             <div ref="noTailDistRef" class="chart-canvas"></div>
-           </a-card>
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">体高分布 (cm)</span></template>
-            <div ref="heightDistRef" class="chart-canvas"></div>
-          </a-card>
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">体重分布 (g)</span></template>
-            <div ref="weightDistRef" class="chart-canvas"></div>
-          </a-card>
-          <a-card :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">肥满度分布</span></template>
-            <div ref="conditionDistRef" class="chart-canvas"></div>
-          </a-card>
-          <a-card v-if="hasDamageData" :bordered="false" class="chart-card">
-            <template #title><span class="chart-title">破损率分布 (×100%)</span></template>
-            <div ref="damageDistRef" class="chart-canvas"></div>
-          </a-card>
+           <div class="chart-card">
+             <div class="chart-title">每日视频任务数趋势</div>
+             <div ref="trendRef" class="chart-canvas chart-canvas-tall"></div>
+           </div>
+           <div class="chart-card">
+             <div class="chart-title">体长分布 (cm)</div>
+              <div ref="lengthDistRef" class="chart-canvas"></div>
+           </div>
+           <div class="chart-card">
+             <div class="chart-title">无尾体长分布 (cm)</div>
+              <div ref="noTailDistRef" class="chart-canvas"></div>
+           </div>
+           <div class="chart-card">
+             <div class="chart-title">体高分布 (cm)</div>
+             <div ref="heightDistRef" class="chart-canvas"></div>
+           </div>
+           <div class="chart-card">
+             <div class="chart-title">体重分布 (g)</div>
+             <div ref="weightDistRef" class="chart-canvas"></div>
+           </div>
+           <div class="chart-card">
+             <div class="chart-title">肥满度分布</div>
+             <div ref="conditionDistRef" class="chart-canvas"></div>
+           </div>
+           <div v-if="hasDamageData" class="chart-card">
+             <div class="chart-title">破损率分布 (×100%)</div>
+             <div ref="damageDistRef" class="chart-canvas"></div>
+           </div>
         </div>
       </ReportSection>
 
@@ -107,7 +107,7 @@
                 <template #cell="{ record }">{{ formatDuration(record.video_duration_seconds) }}</template>
               </a-table-column>
               <a-table-column title="处理耗时" :width="120">
-                <template #cell="{ record }">{{ formatDuration(record.processing_duration_seconds) }}</template>
+                <template #cell="{ record }">{{ formatDuration(getProcessingDuration(record)) }}</template>
               </a-table-column>
             </template>
           </a-table>
@@ -240,6 +240,7 @@ function displayValue(value: unknown): string | number {
 }
 
 function formatDuration(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined) return '--'
   const n = Number(seconds)
   if (!Number.isFinite(n) || n < 0) return '--'
   const total = Math.round(n)
@@ -247,6 +248,18 @@ function formatDuration(seconds: number | null | undefined): string {
   const m = Math.floor((total % 3600) / 60)
   const s = total % 60
   return h ? `${h}小时${m}分${s}秒` : m ? `${m}分${s}秒` : `${s}秒`
+}
+
+function getProcessingDuration(record: any): number | null | undefined {
+  return record?.processing_duration_seconds ?? record?.duration_seconds
+}
+
+function getTaskDate(task: any): string {
+  const raw = task?.started_at || task?.created_at || task?.finished_at || ''
+  const parsed = dayjs(raw)
+  if (parsed.isValid()) return parsed.format('YYYY-MM-DD')
+  const match = String(task?.video_id || '').match(/^(\d{4})(\d{2})(\d{2})(?:_|$)/)
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : rangeStart.value
 }
 
 async function loadTasks() {
@@ -271,11 +284,12 @@ const overviewRows = computed(() => [
   { key: 'videoDuration', title: '总视频时长', value: formatDurationPrecise(summary.value.total_video_duration), unit: '' },
   { key: 'fishes', title: '检测总鱼数', value: summary.value.total_fish, unit: '条' },
   { key: 'valid', title: '完整鱼总数', value: summary.value.valid_fish, unit: '条' },
-  { key: 'invalid', title: '不完整鱼总数', value: summary.value.abnormal_fish, unit: '条' },
+  { key: 'invalid', title: '不完整鱼总数', value: summary.value.incomplete_fish, unit: '条' },
   { key: 'damaged', title: '破损鱼总数', value: summary.value.surface_damage_count, unit: '条' },
 ])
 
 function formatDurationPrecise(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined) return '--'
   const n = Number(seconds)
   if (!Number.isFinite(n) || n < 0) return '--'
   if (n < 60) return `${n.toFixed(2)}秒`
@@ -297,7 +311,7 @@ const metricsRows = computed(() => [
 const fishSummaryRows = computed(() => [
   { key: 'fishTotal', title: '鱼总数', value: summary.value.total_fish, unit: '条' },
   { key: 'fishValid', title: '完整鱼数', value: summary.value.valid_fish, unit: '条' },
-  { key: 'fishInvalid', title: '不完整鱼数', value: summary.value.abnormal_fish, unit: '条' },
+  { key: 'fishInvalid', title: '不完整鱼数', value: summary.value.incomplete_fish, unit: '条' },
   // { key: 'fishDamaged', title: '破损鱼数', value: summary.value.surface_damage_count, unit: '条' },
 ])
 
@@ -354,8 +368,12 @@ function goReport(videoId: string) {
     return
   }
   router.push({
-    path: `/admin/data-report/video/${encodeURIComponent(videoId)}`,
-    query: { video_id: videoId },
+    path: '/admin/data-report',
+    query: {
+      type: 'daily-videos',
+      video_id: videoId,
+      date: getTaskDate(task),
+    },
   })
 }
 
@@ -366,7 +384,7 @@ function goDashboard(videoId: string) {
     return
   }
   router.push({
-    path: '/',
+    path: '/dashboard',
     query: { mode: 'result', video_id: videoId },
   })
 }
@@ -458,26 +476,52 @@ onMounted(async () => {
 }
 .charts-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  min-width: 0;
 }
 .chart-card {
+  width: 100%;
+  min-width: 0;
   box-sizing: border-box;
   background: #fff;
   border: 1px solid #e5e6eb;
   border-radius: 8px;
+  padding: 8px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.charts-grid > .chart-card:first-child {
+  grid-column: 1 / -1;
 }
 .chart-title {
+  width: 100%;
+  margin-bottom: 4px;
+  text-align: center;
   font-size: 14px;
   font-weight: 600;
   color: #1d2129;
 }
 .chart-canvas {
-  width: 100%;
-  height: 220px;
+  width: min(100%, 520px);
+  height: 240px;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0 auto;
+  overflow: hidden;
 }
 .chart-canvas-tall {
   height: 280px;
+}
+
+@media (width <= 760px) {
+  .charts-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .charts-grid > .chart-card:first-child {
+    grid-column: auto;
+  }
 }
 .table-scroll {
   width: 100%;

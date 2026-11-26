@@ -13,6 +13,9 @@
 8. 输出 ``measurements/long_height_weight_results.csv``、每条鱼的
    ``measurements.json`` 和可视化图片。
 
+``arched-back.py`` 在后续阶段会调用本模块的坐标转换函数，
+将弓背测量区间的两个端点也画入最终体长可视化图。
+
 不完整鱼（``incomplete_match``）只进 CSV，不计算体长/体高/体重/肥满度。
 
 无尾体长不使用鱼尾检测模型：程序先根据整鱼 mask 找到尾部
@@ -479,8 +482,9 @@ def _make_measurement_visualization(
     body_start,
     tail_cut,
     tail_cut_line=None,
+    body_height_line=None,
 ):
-    """生成无文字的全长和无尾体长可视化图。"""
+    """生成全长、无尾体长和体高的无文字可视化图。"""
 
     cv2 = _cv2()
     source_height, source_width = image.shape[:2]
@@ -490,13 +494,18 @@ def _make_measurement_visualization(
     total_color = (255, 0, 255)
     body_color = (255, 255, 0)
     head_color = (0, 0, 255)
-    endpoint_color = (0, 128, 255)
+    # 鱼尾末端改用蓝色，避免与后续加入的橙色弓背关键点混淆。
+    tail_endpoint_color = (255, 128, 0)
     tail_cut_color = (0, 255, 255)
+    body_height_color = (80, 220, 80)
     outline_color = (0, 0, 0)
 
     short_side = max(1, min(source_height, source_width))
-    total_thickness = max(3, min(7, int(round(short_side / 16.0))))
-    body_thickness = max(2, total_thickness - 2)
+    # 测量线只需要标明路径，不应大面积遮挡鱼体纹理。
+    # 旧值使用 short_side / 16，对常见的小鱼 crop 会生成
+    # 5--7 px 的彩色线，再叠加 3 px 黑色描边后显得过粗。
+    total_thickness = max(2, min(4, int(round(short_side / 26.0))))
+    body_thickness = max(1, total_thickness - 1)
     dash_length = max(8, min(24, int(round(source_width / 14.0))))
     gap_length = max(5, dash_length // 2)
     # 鱼首、尾端和尾部截断点使用较小的标记，避免遮挡鱼体轮廓。
@@ -537,7 +546,7 @@ def _make_measurement_visualization(
         full_start[0] + padding,
         full_end[0] + padding,
         outline_color,
-        total_thickness + 3,
+        total_thickness + 2,
     )
     _draw_quadratic_segment(
         visual,
@@ -553,7 +562,7 @@ def _make_measurement_visualization(
         body_start[0] + padding,
         tail_cut[0] + padding,
         outline_color,
-        body_thickness + 3,
+        body_thickness + 2,
         dash_length,
         gap_length,
     )
@@ -575,7 +584,7 @@ def _make_measurement_visualization(
             shifted_point(tail_cut_line[0]),
             shifted_point(tail_cut_line[1]),
             outline_color,
-            body_thickness + 4,
+            body_thickness + 2,
             cv2.LINE_AA,
         )
         cv2.line(
@@ -583,9 +592,49 @@ def _make_measurement_visualization(
             shifted_point(tail_cut_line[0]),
             shifted_point(tail_cut_line[1]),
             tail_cut_color,
-            body_thickness + 1,
+            body_thickness,
             cv2.LINE_AA,
         )
+
+    # 体高使用最小旋转外接矩形短边的两个端点。先画细连线，
+    # 再画端点，既能看清测量方向，也不会大面积遮挡鱼体。
+    if body_height_line is not None:
+        height_start = shifted_point(body_height_line[0])
+        height_end = shifted_point(body_height_line[1])
+        cv2.line(
+            visual,
+            height_start,
+            height_end,
+            outline_color,
+            body_thickness + 2,
+            cv2.LINE_AA,
+        )
+        cv2.line(
+            visual,
+            height_start,
+            height_end,
+            body_height_color,
+            body_thickness,
+            cv2.LINE_AA,
+        )
+        height_marker_radius = max(2, marker_radius - 1)
+        for height_point in (height_start, height_end):
+            cv2.circle(
+                visual,
+                height_point,
+                height_marker_radius + 2,
+                outline_color,
+                -1,
+                cv2.LINE_AA,
+            )
+            cv2.circle(
+                visual,
+                height_point,
+                height_marker_radius,
+                body_height_color,
+                -1,
+                cv2.LINE_AA,
+            )
 
     # 先画尾部截断点和无尾体长起点，最后画全长端点圆环。即使两个位置
     # 非常接近，黄色截断点和红色鱼首圆环也都能看见。
@@ -623,7 +672,9 @@ def _make_measurement_visualization(
     )
     for point in (full_start, full_end):
         center = shifted_point(point)
-        point_color = head_color if point is head_point else endpoint_color
+        point_color = (
+            head_color if point is head_point else tail_endpoint_color
+        )
         cv2.circle(
             visual,
             center,
@@ -641,6 +692,129 @@ def _make_measurement_visualization(
             cv2.LINE_AA,
         )
     return visual
+
+
+def add_arched_back_keypoints_to_visualization(
+    *,
+    crop_path: Path | str,
+    mask_path: Path | str,
+    visualization_path: Path | str,
+    keypoints,
+) -> list[tuple[int, int]]:
+    """将原始 crop 坐标系中的两个弓背区间端点写入体长可视化。
+
+    ``arched-back.py`` 直接在已对齐 crop 上计算关键点，而
+    ``*_with_line.jpg`` 使用本文件内的二次水平旋转结果，并在
+    四周增加了边框。因此这里重用完全相同的旋转矩阵和边框
+    计算，再用与弓背 overlay 一致的橙色圆环标出两个端点。
+
+    返回两个点在最终体长图中的整数像素坐标。
+    """
+
+    cv2 = _cv2()
+    np = _np()
+    crop_path = Path(crop_path)
+    mask_path = Path(mask_path)
+    visualization_path = Path(visualization_path)
+
+    crop_image = cv2.imread(str(crop_path), cv2.IMREAD_COLOR)
+    if crop_image is None:
+        raise ValueError(f"cannot read crop image: {crop_path}")
+    mask_image = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask_image is None:
+        raise ValueError(f"cannot read mask image: {mask_path}")
+    if crop_image.shape[:2] != mask_image.shape[:2]:
+        raise ValueError(
+            f"image/mask size mismatch: {crop_image.shape[:2]} vs "
+            f"{mask_image.shape[:2]}"
+        )
+
+    points = np.asarray(keypoints, dtype=float)
+    if points.shape != (2, 2) or not np.all(np.isfinite(points)):
+        raise ValueError(
+            "arched-back keypoints must contain exactly two finite (x, y) points"
+        )
+
+    rotated_image, _rotated_mask, _contour, rotation_matrix = (
+        rotate_image_and_mask_to_horizontal(
+            crop_image,
+            mask_image,
+            return_matrix=True,
+        )
+    )
+    visual = cv2.imread(str(visualization_path), cv2.IMREAD_COLOR)
+    if visual is None:
+        raise ValueError(
+            f"cannot read fish-condition visualization: {visualization_path}"
+        )
+
+    rotated_height, rotated_width = rotated_image.shape[:2]
+    short_side = max(1, min(rotated_height, rotated_width))
+    measurement_marker_radius = max(3, min(6, short_side // 14))
+    padding = measurement_marker_radius + 4
+    expected_shape = (
+        rotated_height + 2 * padding,
+        rotated_width + 2 * padding,
+    )
+    if visual.shape[:2] != expected_shape:
+        raise ValueError(
+            "fish-condition visualization size does not match its crop/mask "
+            f"transform: actual={visual.shape[:2]}, expected={expected_shape}"
+        )
+
+    homogeneous_points = np.column_stack(
+        (points, np.ones(points.shape[0], dtype=float))
+    )
+    mapped_points = homogeneous_points @ np.asarray(rotation_matrix, dtype=float).T
+    mapped_points += np.asarray([padding, padding], dtype=float)
+    mapped_points = np.rint(mapped_points).astype(np.int32)
+
+    interval_marker_radius = max(3, min(5, short_side // 40))
+    for x_value, y_value in mapped_points:
+        center = (int(x_value), int(y_value))
+        if not (
+            0 <= center[0] < visual.shape[1]
+            and 0 <= center[1] < visual.shape[0]
+        ):
+            raise ValueError(
+                f"mapped arched-back keypoint is outside visualization: {center}"
+            )
+        # 先画黑色外环，保证橙色关键点在鱼背和体长线上都清晰。
+        cv2.circle(
+            visual,
+            center,
+            interval_marker_radius + 2,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.circle(
+            visual,
+            center,
+            interval_marker_radius,
+            (0, 128, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    ensure_dir(visualization_path.parent)
+    temp_path = visualization_path.with_name(
+        f"{visualization_path.stem}.tmp{visualization_path.suffix}"
+    )
+    try:
+        if not cv2.imwrite(str(temp_path), visual):
+            raise OSError(
+                f"cannot write fish-condition visualization: {temp_path}"
+            )
+        os.replace(temp_path, visualization_path)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+    return [tuple(int(value) for value in point) for point in mapped_points]
 
 
 def _write_measurement_json(
@@ -2012,6 +2186,7 @@ def process_single_image(
         body_start=(X3, Y3),
         tail_cut=(X4, Y4),
         tail_cut_line=tail_cut_line,
+        body_height_line=((X6, Y6), (X7, Y7)),
     )
     visualization_path = save_path / f"{filename}_with_line.jpg"
     if not cv2.imwrite(str(visualization_path), measurement_visualization):

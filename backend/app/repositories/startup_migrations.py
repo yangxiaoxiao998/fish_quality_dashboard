@@ -56,6 +56,16 @@ def run_track_id_migration() -> None:
         logger.error(f"[migration] Failed to migrate track_id: {e}")
 
 
+def run_video_source_type_removal_migration() -> None:
+    """Remove the obsolete multi-source column from legacy databases."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE video_task DROP COLUMN IF EXISTS source_type"))
+        logger.info("[migration] obsolete video_task.source_type removed")
+    except Exception as exc:
+        logger.warning("[migration] source_type removal failed: %r", exc)
+
+
 def run_frame_detection_tables_migration() -> None:
     from sqlalchemy import inspect, text
     from app.repositories.db import engine, Base
@@ -250,6 +260,25 @@ VIDEO_TASK_ALGO_INDEXES: list[str] = [
 ]
 
 
+def _columns_exist(table: str, columns: list[str]) -> bool:
+    """检查表中是否已存在指定的所有列。"""
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(f"""
+                    SELECT COUNT(*)
+                    FROM information_schema.columns
+                    WHERE table_name = :table
+                    AND column_name IN :columns
+                """),
+                {"table": table, "columns": tuple(columns)}
+            )
+            count = result.scalar() or 0
+            return count == len(columns)
+    except Exception:
+        return False
+
+
 def run_algorithm_result_tables_migration() -> None:
     """
     算法最新字段 + 索引的幂等迁移。
@@ -257,7 +286,14 @@ def run_algorithm_result_tables_migration() -> None:
     - 使用 ALTER TABLE ADD COLUMN IF NOT EXISTS（PostgreSQL 9.6+）。
     - CREATE INDEX IF NOT EXISTS。
     - 字段已存在则跳过，不影响存量数据。
+    - 预检查：所有列已存在时直接跳过，避免不必要的表锁。
     """
+    if _columns_exist("video_task", list(VIDEO_TASK_ALGO_FIELDS.keys())) and \
+       _columns_exist("fish", list(FISH_ALGO_FIELDS.keys())):
+        logger.info("[migration] algorithm result tables already up-to-date, skipping")
+        print("[DB] algorithm result tables migration: already up-to-date, skipping")
+        return
+
     try:
         with engine.begin() as conn:
             for col, ddl in VIDEO_TASK_ALGO_FIELDS.items():
@@ -284,9 +320,54 @@ def run_algorithm_result_tables_migration() -> None:
 
         print("[DB] algorithm result tables migration: OK")
     except Exception as e:
-        # 不让启动失败；只记录日志
         logger.error(f"[migration] algorithm result tables migration failed: {e}")
         print(f"[DB][WARN] algorithm result tables migration failed: {e}")
+
+
+def run_fish_measurement_backfill_migration() -> None:
+    """Backfill new measurement columns without overwriting new values.
+
+    The old columns remain during the compatibility window.  This migration is
+    deliberately one-way and idempotent: a value is copied only when the new
+    column is NULL, so a newer algorithm result always wins.
+    """
+    pairs = (
+        ("body_length", "body_length_cm"),
+        ("body_length_without_tail", "body_length_no_tail_cm"),
+        ("body_height", "body_height_cm"),
+        ("body_weight", "pred_weight_g"),
+    )
+    try:
+        with engine.begin() as conn:
+            columns = {
+                str(row[0])
+                for row in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'fish'"
+                    )
+                ).fetchall()
+            }
+            updates: dict[str, int] = {}
+            for old_field, new_field in pairs:
+                if old_field not in columns or new_field not in columns:
+                    continue
+                result = conn.execute(
+                    text(
+                        f"UPDATE fish SET {new_field} = {old_field} "
+                        f"WHERE {new_field} IS NULL AND {old_field} IS NOT NULL"
+                    )
+                )
+                updates[f"{old_field}->{new_field}"] = int(result.rowcount or 0)
+        changed = sum(updates.values())
+        logger.info(
+            "[migration] fish measurement backfill completed: %s (rows=%d)",
+            updates,
+            changed,
+        )
+        print(f"[DB] fish measurement backfill: rows={changed}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[migration] fish measurement backfill failed: %r", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +375,7 @@ def run_algorithm_result_tables_migration() -> None:
 # ---------------------------------------------------------------------------
 
 VIDEO_TASK_TIMED_RECORDING_FIELDS: dict[str, str] = {
+    "recording_started_at": "TIMESTAMP WITH TIME ZONE",
     "record_duration_seconds": "INTEGER",
     "scheduled_stop_at": "TIMESTAMP WITH TIME ZONE",
     "actual_stop_at": "TIMESTAMP WITH TIME ZONE",
@@ -319,7 +401,13 @@ def run_video_task_timed_recording_migration() -> None:
     - 使用 ALTER TABLE ADD COLUMN IF NOT EXISTS（PostgreSQL 9.6+）。
     - 字段已存在则跳过，不影响存量数据。
     - 启动失败不会因为该迁移异常而中断后端启动。
+    - 预检查：所有列已存在时直接跳过，避免不必要的表锁。
     """
+    if _columns_exist("video_task", list(VIDEO_TASK_TIMED_RECORDING_FIELDS.keys())):
+        logger.info("[migration] video_task timed recording columns already up-to-date, skipping")
+        print("[DB] video_task timed recording migration: already up-to-date, skipping")
+        return
+
     try:
         with engine.begin() as conn:
             for col, ddl in VIDEO_TASK_TIMED_RECORDING_FIELDS.items():
@@ -337,7 +425,6 @@ def run_video_task_timed_recording_migration() -> None:
 
         print("[DB] video_task timed recording migration: OK")
     except Exception as e:
-        # 不让启动失败；只记录日志
         logger.error(
             f"[migration] video_task timed recording migration failed: {e}"
         )
@@ -346,6 +433,10 @@ def run_video_task_timed_recording_migration() -> None:
 
 def run_video_task_report_migration() -> None:
     """为视频报表元数据增加养鱼仓字段，兼容已有 video_task 数据。"""
+    if _columns_exist("video_task", list(VIDEO_TASK_REPORT_FIELDS.keys())):
+        logger.info("[migration] video_task report columns already up-to-date, skipping")
+        print("[DB] video_task report migration: already up-to-date, skipping")
+        return
     try:
         with engine.begin() as conn:
             for col, ddl in VIDEO_TASK_REPORT_FIELDS.items():
@@ -395,7 +486,13 @@ def run_detection_report_video_report_migration() -> None:
     - 支持视频报表 report_type='video_fish_quality' + video_id=<具体 id>。
     - 同一 video_id 重复生成时由应用层覆盖逻辑保证唯一 video_fish_quality 记录。
     - 启动失败不会因为该迁移异常而中断后端启动。
+    - 预检查：列已存在时直接跳过，避免不必要的表锁。
     """
+    if _columns_exist("detection_report", list(DETECTION_REPORT_VIDEO_REPORT_FIELDS.keys())):
+        logger.info("[migration] detection_report video_id column already up-to-date, skipping")
+        print("[DB] detection_report video report migration: already up-to-date, skipping")
+        return
+
     try:
         with engine.begin() as conn:
             for col, ddl in DETECTION_REPORT_VIDEO_REPORT_FIELDS.items():
@@ -416,7 +513,6 @@ def run_detection_report_video_report_migration() -> None:
 
         print("[DB] detection_report video report migration: OK")
     except Exception as e:
-        # 不让启动失败；只记录日志
         logger.error(
             f"[migration] detection_report video report migration failed: {e}"
         )

@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from app.services.fixed_report_images import prepare_fixed_body_demo_image
+from app.services.fish_distribution_service import FISH_DISTRIBUTION_BINS
 
 logger = logging.getLogger("video_report_pdf.charts")
 
@@ -142,6 +143,20 @@ def _percent_distribution_data(values: list[float], bins: int) -> tuple[list[str
     labels = [f"{float(edges[index]):.1f}" for index in range(len(edges) - 1)]
     counts_list = [int(count) for count in counts.tolist()]
     return labels, counts_list, counts_to_percentages(counts_list)
+
+
+def _fixed_distribution_data(values: list[float], metric: str) -> tuple[list[str], list[int], list[float]]:
+    """Use stable business intervals so reports remain comparable over time."""
+    cleaned = [value for value in values if math.isfinite(value)]
+    definitions = FISH_DISTRIBUTION_BINS[metric]
+    counts = []
+    for index, (low, high, _label) in enumerate(definitions):
+        if index == len(definitions) - 1:
+            counts.append(sum(low <= value <= high for value in cleaned))
+        else:
+            counts.append(sum(low <= value < high for value in cleaned))
+    labels = [label for _low, _high, label in definitions]
+    return labels, counts, counts_to_percentages(counts)
 
 
 def _style_axes(ax: Any, *, xlabel: str | None = None, x_tick_fontsize: int = CHART_X_TICK_FONTSIZE) -> None:
@@ -273,27 +288,32 @@ def generate_charts(fish: list[dict], out_dir: Path) -> dict[str, Path]:
     out_files: dict[str, Path] = {}
     metadata: dict[str, dict[str, Any]] = {}
     pairs = [
-        ("chart_body_length_distribution", "图1：全长分布图", _collect(fish, "body_length_cm"), "全长 (cm)"),
-        ("chart_body_length_without_tail_distribution", "图2：体高分布图", _collect(fish, "body_height_cm"), "体高 (cm)"),
-        ("chart_body_weight_distribution", "图3：体重分布图", _collect(fish, "pred_weight_g"), "体重 (g)"),
-        ("chart_condition_factor_distribution", "图4：肥满度分布图", _collect(fish, "condition_factor"), "肥满度"),
+        ("chart_body_length_distribution", "图1：全长分布图", "body_length_cm", "全长 (cm)"),
+        ("chart_body_length_without_tail_distribution", "图2：去尾体长分布图", "body_length_no_tail_cm", "去尾体长 (cm)"),
+        ("chart_body_weight_distribution", "图3：体重分布图", "pred_weight_g", "体重 (g)"),
+        ("chart_condition_factor_distribution", "图4：肥满度分布图", "condition_factor", "肥满度"),
     ]
-    for key, title, values, xlabel in pairs:
+    for key, title, metric, xlabel in pairs:
         out = out_dir / f"{key}.png"
-        n = len(values)
-        bins = max(4, min(10, int(round(n ** 0.5 / 1.5)))) if n else 0
-        labels, counts, percentages = _percent_distribution_data(values, bins)
-        if key == "chart_body_weight_distribution":
-            labels = [f"{float(label):.0f}" for label in labels]
+        values = _collect(fish, metric)
+        chart_metric = metric if metric in FISH_DISTRIBUTION_BINS else "body_length_cm"
+        labels, counts, percentages = _fixed_distribution_data(values, chart_metric)
         create_percent_distribution_chart(labels, percentages, output_path=out, title=title, xlabel=xlabel,
-                                          sample_n=n, x_tick_fontsize=BODY_WEIGHT_X_TICK_FONTSIZE)
+                                          sample_n=len(values), x_tick_fontsize=BODY_WEIGHT_X_TICK_FONTSIZE)
         metadata[key] = {"labels": labels, "counts": counts, "percentages": percentages,
-                         "sum_percentages": round(sum(percentages), 2), "y_axis": "占比（%）", "sample_n": n}
+                         "sum_percentages": round(sum(percentages), 2), "y_axis": "占比（%）", "sample_n": len(values)}
         out_files[key] = out
-    damage_labels, damage_counts = _damage_buckets(fish)
+    damage_values = []
+    for item in fish:
+        if not isinstance(item, dict):
+            continue
+        value = _to_float(item.get("surface_damage_ratio"))
+        if value is not None:
+            damage_values.append(value * 100 if value <= 1.5 else value)
+    damage_labels, damage_counts, damage_percentages = _fixed_distribution_data(
+        damage_values, "surface_damage_percent")
     damage_out = out_dir / "chart_surface_damage_distribution.png"
     create_percent_bar_chart(damage_labels, damage_counts, output_path=damage_out, title="图5：体表损伤程度统计图")
-    damage_percentages = counts_to_percentages(damage_counts)
     metadata["chart_surface_damage_distribution"] = {
         "labels": damage_labels, "counts": damage_counts, "percentages": damage_percentages,
         "sum_percentages": round(sum(damage_percentages), 2), "y_axis": "占比（%）",

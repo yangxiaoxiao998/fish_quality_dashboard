@@ -1,6 +1,9 @@
 import { ref } from 'vue'
 
-export const TECHNICAL_DEBUG_PASSWORD = '123456'
+// Development fallback is kept for the local kiosk workflow. Production
+// builds should inject VITE_TECHNICAL_DEBUG_PASSWORD at build time.
+export const TECHNICAL_DEBUG_PASSWORD =
+  import.meta.env.VITE_TECHNICAL_DEBUG_PASSWORD || '123456'
 const ADMIN_ROLE_KEY = 'fish-quality-admin-role'
 export const administratorRole = ref<boolean>(false)
 

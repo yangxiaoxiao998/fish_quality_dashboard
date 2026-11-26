@@ -41,7 +41,6 @@ for p in (str(BACKEND_DIR), str(ALGO_DIR)):
 os.environ.setdefault("FISH_PROJECT_ROOT", str(PROJECT_ROOT))
 os.environ.setdefault("FISH_ALGO_ROOT", str(ALGO_DIR))
 os.environ.setdefault("FISH_DATA_ROOT", str(PROJECT_ROOT / "data"))
-os.environ.setdefault("FISH_ALGO_MODE", "real")
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

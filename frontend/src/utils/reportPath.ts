@@ -29,6 +29,12 @@ export function normalizeReportUrl(p?: string | null): string {
     return url
   }
 
+  // Result videos may be served by the backend API so packaged installs can
+  // resolve artifacts that still live under the private jobs directory.
+  if (url.startsWith('/api/')) {
+    return url
+  }
+
   // data/... → /static/...
   if (url.startsWith('data/')) {
     return '/static/' + url.slice('data/'.length)

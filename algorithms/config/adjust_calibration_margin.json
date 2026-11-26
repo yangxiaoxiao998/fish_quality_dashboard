@@ -1,6 +1,8 @@
 {
   "side_margin_ratio": 0.13,
   "vertical_margin_ratio": 0.05,
-  "tracking_start_ratio": 0.4,
-  "crop_save_ratio": 0.7
+  "tracking_start_ratio": 0.3,
+  "crop_save_ratio": 0.5,
+  "conveyor_direction": "top_to_bottom",
+  "complete_threshold": 0.9
 }

@@ -383,3 +383,54 @@ def get_pi_resolution_diag() -> dict:
         "now": now,
         "cache_alive": bool(entry and entry.expires_at > now),
     }
+
+
+def get_pi_arp_diag(ip: Optional[str]) -> dict:
+    """Read the Linux ARP/neighbor state for the resolved Pi address.
+
+    This is diagnostic only. It does not flush the neighbor cache because a
+    cache mutation belongs to the deployment/network operator, not the API.
+    """
+    result = {
+        "ip": ip,
+        "available": False,
+        "mac": None,
+        "state": None,
+        "raw": None,
+        "error": None,
+    }
+    if not ip:
+        result["error"] = "resolved_ip_missing"
+        return result
+    try:
+        proc = subprocess.run(
+            ["ip", "neigh", "show", ip],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        raw = (proc.stdout or "").strip()
+        result["raw"] = raw or None
+        if proc.returncode != 0:
+            result["error"] = (proc.stderr or "ip neigh failed").strip()[:240]
+            return result
+        tokens = raw.split()
+        if "lladdr" in tokens:
+            index = tokens.index("lladdr")
+            if index + 1 < len(tokens):
+                result["mac"] = tokens[index + 1]
+        states = {
+            "REACHABLE", "STALE", "DELAY", "PROBE",
+            "FAILED", "NOARP", "PERMANENT", "INCOMPLETE",
+        }
+        result["state"] = next((token for token in tokens if token in states), None)
+        result["available"] = bool(result["mac"] or result["state"] or raw)
+        return result
+    except FileNotFoundError:
+        result["error"] = "ip_command_missing"
+    except subprocess.TimeoutExpired:
+        result["error"] = "ip_neigh_timeout"
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = repr(exc)
+    return result

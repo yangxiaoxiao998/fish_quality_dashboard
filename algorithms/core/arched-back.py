@@ -16,6 +16,10 @@
 每条鱼的全部中间数值和可视化保存到
 ``measurements/arched_back/``，并由 pipeline 发布到
 ``data/results/<video_id>/fish_images/arched_back/``。
+
+弓背区间的两个端点还会在对应的
+``measurements/fish_condition_images/<stem>/<stem>_with_line.jpg``
+中以橙色圆环标出；如果测量图不存在或叠加失败，不会影响弓背指标计算。
 """
 
 from __future__ import annotations
@@ -279,6 +283,76 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _load_fish_condition_keypoint_overlay_helper():
+    """加载鱼体测量模块的弓背关键点叠加函数。
+
+    ``arched-back.py`` 既可由 pipeline 通过 ``runpy`` 调用，也可直接
+    作为脚本执行。两种入口的 ``sys.path`` 略有不同，因此按从完整包名
+    到脚本目录模块名的顺序尝试，避免改变原有启动方式。
+    """
+
+    module_names = (
+        "algorithms.core.fish_condition",
+        "core.fish_condition",
+        "fish_condition",
+        # 902 版本沿用同一可视化 API；标准模块不可用时保留兼容回退。
+        "algorithms.core.fish_condition902",
+        "core.fish_condition902",
+        "fish_condition902",
+    )
+    import_errors = []
+    for module_name in module_names:
+        try:
+            module = __import__(
+                module_name,
+                fromlist=["add_arched_back_keypoints_to_visualization"],
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            import_errors.append(f"{module_name}: {exc}")
+            continue
+        helper = getattr(module, "add_arched_back_keypoints_to_visualization", None)
+        if callable(helper):
+            return helper
+
+    details = "; ".join(import_errors)
+    raise ImportError(
+        "cannot load add_arched_back_keypoints_to_visualization"
+        + (f" ({details})" if details else "")
+    )
+
+
+def _overlay_fish_condition_keypoints(
+    *,
+    crop_path: Path,
+    mask_path: Path,
+    visualization_path: Path,
+    metrics: dict,
+) -> list[tuple[int, int]] | None:
+    """把弓背区间端点叠加到 fish-condition 测量图。
+
+    这是弓背阶段的附加可视化步骤。测量图可能因用户关闭调试图、
+    单条鱼几何失败或使用了自定义输出目录而不存在，此时返回 ``None``
+    让调用方保留原有弓背计算结果。
+    """
+
+    crop_path = Path(crop_path)
+    mask_path = Path(mask_path)
+    visualization_path = Path(visualization_path)
+    if not visualization_path.is_file():
+        return None
+
+    helper = _load_fish_condition_keypoint_overlay_helper()
+    return helper(
+        crop_path=crop_path,
+        mask_path=mask_path,
+        visualization_path=visualization_path,
+        keypoints=(
+            metrics["interval_start_point"],
+            metrics["interval_end_point"],
+        ),
+    )
 
 
 def save_intermediate_results(
@@ -611,6 +685,47 @@ def run(args) -> int:
                 frame_index=frame_index,
                 metrics=metrics,
             )
+
+            # ``arched-back`` 在 complete_match crop 坐标系中计算区间端点，
+            # 而 fish_condition 的最终图还经过一次水平旋转并增加了边框。
+            # 在这里（fish_condition 阶段之后）调用其坐标映射辅助函数，
+            # 将同一对端点叠加到 ``*_with_line.jpg``。这是附加可视化：
+            # 测量图可能被显式丢弃、单条鱼测量失败，或用户只单独运行
+            # arched-back，此时不能让弓背指标本身失败。
+            try:
+                fish_condition_images_dir = getattr(
+                    args, "fish_condition_images_dir", None
+                )
+                if fish_condition_images_dir:
+                    fish_condition_images_dir = _resolve_project_relative(
+                        fish_condition_images_dir
+                    )
+                else:
+                    fish_condition_images_dir = (
+                        csv_path.parent / "fish_condition_images"
+                    )
+                fish_condition_visualization = (
+                    fish_condition_images_dir
+                    / stem
+                    / f"{stem}_with_line.jpg"
+                )
+                mapped_keypoints = _overlay_fish_condition_keypoints(
+                    crop_path=crop_path,
+                    mask_path=mask_path,
+                    visualization_path=fish_condition_visualization,
+                    metrics=metrics,
+                )
+            except Exception as overlay_exc:
+                print(
+                    f"[WARN] {stem}: fish-condition 弓背关键点叠加失败，"
+                    f"不影响弓背指标：{type(overlay_exc).__name__}: {overlay_exc}"
+                )
+            else:
+                if mapped_keypoints is not None:
+                    print(
+                        f"[arched-back] {stem}: 已叠加 fish-condition 弓背关键点"
+                    )
+
             results[key] = metrics
             summary_rows.append(
                 _success_summary_row(

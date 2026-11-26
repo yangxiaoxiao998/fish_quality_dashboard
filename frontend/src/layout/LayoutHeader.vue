@@ -104,7 +104,9 @@ function goToAdmin() {
   }
   .header-right {
     position: absolute;
-    top: 50%;
+
+    // 与管理员 60px header 的按钮中心线保持一致。
+    top: 30px;
     right: 30px;
     transform: translateY(-50%);
     display: flex;

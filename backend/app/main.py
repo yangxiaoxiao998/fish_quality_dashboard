@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -9,6 +10,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 
 from app.routers.health_router import router as health_router
 from app.routers.stream_router import router as stream_router
@@ -25,6 +27,7 @@ from app.routers.operation_log_router import router as operation_log_router
 from app.routers.ops_algorithm_task_router import router as ops_algorithm_task_router
 from app.repositories.db import SessionLocal
 from app.services.operation_log_service import log_operation
+from app.settings import settings
 
 
 def _operation_module(path: str) -> str:
@@ -42,14 +45,10 @@ def _operation_module(path: str) -> str:
         return "鱼体数据"
     if path.startswith("/api/settings") or path.startswith("/api/system"):
         return "系统设置"
-    if path.startswith("/api/upload"):
-        return "视频管理"
     return "系统操作"
 
 
 def _operation_action(method: str, path: str) -> tuple[str, str]:
-    if method == "POST" and path.startswith("/api/algorithm/videos"):
-        return "start_video_detection", "启动视频检测"
     if method == "POST" and path.startswith("/api/algorithm/calibration/capture"):
         return "capture_calibration", "抓拍标定"
     if method == "POST" and path.startswith("/api/algorithm/calibration"):
@@ -78,12 +77,10 @@ def _should_log_operation(method: str, path: str) -> bool:
         return path.startswith("/api/")
     if method == "POST":
         prefixes = (
-            "/api/algorithm/videos",
             "/api/algorithm/calibration",
             "/api/reports",
             "/api/camera",
             "/api/calibration",
-            "/api/upload",
         )
         return path.startswith(prefixes)
     return False
@@ -96,7 +93,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     启动顺序：
         1. ensure_directories
         2. log_db_connection + init_db_schema
-        3. 全部 startup_migrations（10 个）
+        3. 全部 startup_migrations（按源码注册顺序）
         4. path_migrations
         5. 摄像头 startup_recovery（容错，失败仅记录）
         6. 启动 camera_record_schedule scheduler（所有前置成功后才启动）
@@ -129,12 +126,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 3) 全部 startup migrations（保持现有调用顺序）
     from app.repositories.startup_migrations import (
         run_track_id_migration,
+        run_video_source_type_removal_migration,
         run_body_length_without_tail_migration,
         run_report_tables_migration,
         run_frame_detection_tables_migration,
         run_fish_extra_metric_migration,
         run_detection_report_conclusion_migration,
         run_algorithm_result_tables_migration,
+        run_fish_measurement_backfill_migration,
         run_video_task_timed_recording_migration,
         run_video_task_report_migration,
         run_camera_schedule_integrity_migration,
@@ -143,12 +142,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     run_track_id_migration()
+    run_video_source_type_removal_migration()
     run_body_length_without_tail_migration()
     run_report_tables_migration()
     run_frame_detection_tables_migration()
     run_fish_extra_metric_migration()
     run_detection_report_conclusion_migration()
     run_algorithm_result_tables_migration()
+    run_fish_measurement_backfill_migration()
     run_video_task_timed_recording_migration()
     run_video_task_report_migration()
     run_camera_schedule_integrity_migration()
@@ -240,15 +241,46 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    app.mount("/static", StaticFiles(directory=str(DATA_DIR)), name="static")
+    # Expose only user-facing media trees. Logs, runtime config, backups and
+    # temporary algorithm files stay private to the backend filesystem.
+    for static_name in ("uploads", "results", "reports", "calibration"):
+        app.mount(
+            f"/static/{static_name}",
+            StaticFiles(directory=str(DATA_DIR / static_name), check_dir=False),
+            name=f"static-{static_name}",
+        )
+
+    raw_origins = settings.cors_allowed_origins
+    cors_origins = [item.strip() for item in raw_origins.split(",") if item.strip()]
+    if not cors_origins:
+        cors_origins = ["http://127.0.0.1:5173"]
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    api_key = settings.fish_api_key.strip()
+
+    @app.middleware("http")
+    async def optional_api_key_middleware(request: Request, call_next):
+        # Keep local development frictionless. Production can set FISH_API_KEY
+        # and the frontend sends the same value as X-API-Key.
+        if (
+            api_key
+            and request.url.path.startswith("/api/")
+            and request.url.path not in {"/api/health", "/api/ready"}
+        ):
+            provided = request.headers.get("x-api-key", "")
+            if not secrets.compare_digest(provided, api_key):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "invalid or missing API key"},
+                )
+        return await call_next(request)
 
     @app.middleware("http")
     async def operation_logging_middleware(request: Request, call_next):

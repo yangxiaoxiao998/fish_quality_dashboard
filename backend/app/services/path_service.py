@@ -8,7 +8,7 @@ path_service.py - 统一路径管理服务
     - 前端访问图片/视频统一使用 /static/<rel_path> 形式的 URL。
     - 本地文件系统读取使用 DATA_DIR / rel_path 或调用 to_abs_data_path()。
 
-DATA_DIR = /home/.../fish_quality_dashboard/data
+DATA_DIR = <project>/data
 """
 from __future__ import annotations
 
@@ -19,12 +19,12 @@ from app.paths import DATA_DIR, PROJECT_ROOT
 
 def to_data_relative(path: str | Path | None) -> str | None:
     """
-    将任意路径转换为相对于 DATA_DIR 的相对路径（posix 格式）。
+    将任意路径转换为带 ``data/`` 前缀的相对路径（POSIX 格式）。
 
     输入支持：
         1. None                             -> None
-        2. 已经是相对路径                   -> 原样规范化为 posix 格式
-        3. DATA_DIR 下的绝对路径            -> 去掉 DATA_DIR 前缀
+        2. 已经是相对路径                   -> 规范化到 ``data/<rel>``
+        3. DATA_DIR 下的绝对路径            -> 转为 ``data/<rel>``
         4. 不属于 DATA_DIR 的绝对路径       -> None
 
     返回：
@@ -36,17 +36,30 @@ def to_data_relative(path: str | Path | None) -> str | None:
     if isinstance(path, str) and path == "":
         return None
 
-    p = Path(path)
+    raw = str(path).replace("\\", "/")
+    if raw.startswith("/static/"):
+        raw = raw[len("/static/"):]
+    elif raw.startswith(("/data/", "/uploads/", "/results/", "/jobs/", "/reports/", "/calibration/")):
+        raw = raw[1:]
+    p = Path(raw)
 
     if p.is_absolute():
         try:
             rel = p.resolve().relative_to(DATA_DIR.resolve())
-            return rel.as_posix()
+            return f"data/{rel.as_posix()}"
         except ValueError:
             return None
 
     s = p.as_posix().lstrip("/")
-    return s if s else None
+    if s.startswith("static/"):
+        s = s[len("static/"):]
+    if not s:
+        return None
+    if s.startswith("data/"):
+        s = s[len("data/"):]
+    if not s or ".." in Path(s).parts:
+        return None
+    return f"data/{s}"
 
 
 def to_abs_data_path(path: str | Path | None) -> Path | None:

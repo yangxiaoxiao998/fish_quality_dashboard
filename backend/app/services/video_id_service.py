@@ -42,7 +42,7 @@ def _date_prefix(date: datetime) -> str:
     return date.strftime("%Y%m%d")
 
 
-def generate_video_id(db: Session, source_type: str = "upload") -> str:
+def generate_video_id(db: Session) -> str:
     today = _date_prefix(now_beijing())
 
     max_seq = 0

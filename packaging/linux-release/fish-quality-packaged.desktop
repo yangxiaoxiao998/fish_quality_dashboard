@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=鱼品质智能检测系统
+Name[zh_CN]=鱼品质智能检测系统
+GenericName=鱼品质智能检测系统
+Comment=登录后自动启动鱼品质智能检测系统 Linux 交付版
+Exec=@RELEASE_ROOT@/start.sh
+Path=@RELEASE_ROOT@
+Icon=fish-quality-desktop
+Terminal=false
+StartupWMClass=fish-quality-desktop
+X-GNOME-Autostart-enabled=true
+StartupNotify=false

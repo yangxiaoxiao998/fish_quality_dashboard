@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=鱼品质智能检测系统
+Comment=登录后自动启动鱼品质智能检测系统桌面端
+Exec=/bin/bash @PROJECT_ROOT@/scripts/launch_desktop_autostart.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true
+StartupNotify=false

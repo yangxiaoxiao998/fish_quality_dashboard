@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import subprocess
+from math import isfinite
 from datetime import date, datetime, time
 from typing import Any
 
@@ -11,6 +11,10 @@ from sqlalchemy.orm import Session
 from app.repositories.models import Fish, VideoTask
 from app.services.path_service import to_static_url
 from app.services.path_service import to_abs_data_path
+from app.services.video_task_metrics_service import (
+    processing_duration_seconds as task_processing_duration_seconds,
+    video_duration_seconds as task_video_duration_seconds,
+)
 from app.services.fish_id_service import (
     derive_fish_display_id,
     derive_fish_short_id,
@@ -24,7 +28,6 @@ from app.services.report_format_utils import (
 from app.services.fish_distribution_service import build_fixed_distribution
 from app.utils.time_utils import BEIJING_TZ
 from app.utils.timezone import format_china_datetime
-from app.paths import DATA_DIR, RESULTS_DIR
 
 
 # ----------------- 通用工具 -----------------
@@ -106,6 +109,20 @@ def _avg(values: list[Any]) -> float | None:
         except (TypeError, ValueError):
             continue
     return round(sum(nums) / len(nums), 2) if nums else None
+
+
+def _condition_factor_percent(value: Any) -> float | None:
+    """Return a usable condition-factor percentage, excluding corrupt rows."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    # The algorithm stores condition factor as percent (weight / length^3 * 100).
+    # Values outside 0..100 are not physically meaningful for this report and
+    # historically came from near-zero body-length records.
+    if not isfinite(number) or number <= 0 or number > 100:
+        return None
+    return number
 
 
 def _fish_length_cm(f: Fish) -> float | None:
@@ -226,103 +243,49 @@ def get_fish_quality_summary(
     else:
         fishes = []
 
-    # 步骤 3：pipeline_result.json 兜底
-    cache = _get_or_load_pipeline_results(video_ids) if video_ids else {}
-
     # 计算汇总
     total_video = len(video_ids)
+    # Resolve every task independently.  A single stored duration must not
+    # prevent historical NULL rows from being probed and included in the sum.
     total_video_duration = round(
-        sum(
-            float(v.video_duration_seconds or 0)
-            for v in video_tasks
-            if v.video_duration_seconds is not None
-        ),
+        sum(task_video_duration_seconds(v) or 0.0 for v in video_tasks),
         2,
     )
-    if total_video_duration <= 0:
-        total_video_duration = _query_video_total_duration(db, video_tasks)
     total_fish = len(fishes)
     valid_fish = len([f for f in fishes if (f.status or "").lower() in {"done", "complete"}])
     abnormal_fish = sum(1 for f in fishes if _is_abnormal(f))
     surface_damage_fish_total = sum(1 for f in fishes if has_surface_damage(f.surface_damage_ratio))
 
-    # 优先使用 pipeline_result.json，避免数据库旧字段与最终算法结果重复或不一致。
-    all_records: list[dict] = []
-    if cache:
-        for info in cache.values():
-            all_records.extend(info.get("fish_records", []))
-    else:
-        for f in fishes:
-            all_records.append(
-                {
-                    "body_length_cm": _fish_length_cm(f),
-                    "body_length_no_tail_cm": _fish_length_no_tail_cm(f),
-                    "body_height_cm": _fish_height_cm(f),
-                    "body_weight_g": _fish_weight_g(f),
-                    "condition_factor": getattr(f, "condition_factor", None),
-                    "surface_damage_ratio": getattr(f, "surface_damage_ratio", None),
-                }
-            )
+    all_records = [
+        {
+            "body_length_cm": _fish_length_cm(f),
+            "body_length_no_tail_cm": _fish_length_no_tail_cm(f),
+            "body_height_cm": _fish_height_cm(f),
+            "body_weight_g": _fish_weight_g(f),
+            "condition_factor": _condition_factor_percent(
+                getattr(f, "condition_factor", None)
+            ),
+            "surface_damage_ratio": getattr(f, "surface_damage_ratio", None),
+        }
+        for f in fishes
+    ]
 
-    # 如果 DB 完全没有 fish 但 JSON 有，total_fish/complete/incomplete/failed 来自 JSON
+    # Imported database rows are the report truth, including a valid result
+    # with zero fish.  pipeline_result.json is intentionally excluded here;
+    # it remains available through the raw-result/discovery endpoints and the
+    # reconciliation tool.
     db_fish_count = len(fishes)
-    json_fish_count = sum(len(v.get("fish_records", [])) for v in cache.values())
-    if json_fish_count > 0:
-        total_fish = json_fish_count
-        valid_fish = sum(
-            1
-            for v in cache.values()
-            for r in v.get("fish_records", [])
-            if (r.get("status") or "").lower() in ("done", "complete")
-        )
-        incomplete_fish = sum(
-            1
-            for v in cache.values()
-            for r in v.get("fish_records", [])
-            if (r.get("status") or "").lower() == "incomplete"
-        )
-        failed_fish = sum(
-            1
-            for v in cache.values()
-            for r in v.get("fish_records", [])
-            if (r.get("status") or "").lower() == "failed"
-        )
-        surface_damage_fish_total = sum(
-            1
-            for v in cache.values()
-            for r in v.get("fish_records", [])
-            if normalize_ratio_percent(r.get("surface_damage_ratio")) not in (None, 0)
-        )
-        abnormal_fish = sum(
-            1 for v in cache.values() for r in v.get("fish_records", [])
-            if _record_is_abnormal(r)
-        )
 
     metric_complete_rate = (valid_fish / total_fish) if total_fish else 0.0
-    if json_fish_count > 0:
-        abnormal_fish = sum(
-            1 for v in cache.values() for r in v.get("fish_records", [])
-            if _record_is_abnormal(r)
-        )
-    else:
-        abnormal_fish = sum(1 for f in fishes if _is_abnormal(f))
+    abnormal_fish = sum(1 for f in fishes if _is_abnormal(f))
     abnormal_fish_rate = (abnormal_fish / total_fish) if total_fish else 0.0
     surface_damage_rate = (
         surface_damage_fish_total / total_fish if total_fish else 0.0
     )
 
     # 修复 incomplete_fish / failed_fish 字段（之前没计算）
-    if db_fish_count > 0 and json_fish_count == 0:
-        incomplete_fish = sum(1 for f in fishes if (f.status or "") == "incomplete")
-        failed_fish = sum(1 for f in fishes if (f.status or "") == "failed")
-    # 兜底：db_fish_count=0 且 json_fish_count=0 时上面两个分支都不会跑，
-    # incomplete_fish / failed_fish 未定义；return 时引用会 UnboundLocalError。
-    if "incomplete_fish" not in locals():
-        incomplete_fish = 0
-    if "failed_fish" not in locals():
-        failed_fish = 0
-    if json_fish_count == 0:
-        abnormal_fish = sum(1 for f in fishes if _is_abnormal(f))
+    incomplete_fish = sum(1 for f in fishes if (f.status or "") == "incomplete")
+    failed_fish = sum(1 for f in fishes if (f.status or "") == "failed")
 
     return {
         "total_video": total_video,
@@ -345,8 +308,6 @@ def get_fish_quality_summary(
         "avg_condition_factor": _avg([r.get("condition_factor") for r in all_records]) or 0.0,
         "video_ids": video_ids,
         "db_fish_count": db_fish_count,
-        "json_fish_count": json_fish_count,
-        "used_json_fallback": db_fish_count == 0 and json_fish_count > 0,
     }
 
 
@@ -375,18 +336,83 @@ def _build_fish_count_trend(
         bucket_format = "%Y-%m-%d"
         bucket_kind = "day"
 
+    video_ids = {f.video_id for f in fishes if f.video_id}
+    created_at_by_video: dict[str, datetime] = {}
+    if video_ids:
+        created_at_by_video = {
+            row.video_id: row.created_at
+            for row in db.execute(
+                select(VideoTask).where(VideoTask.video_id.in_(video_ids))
+            ).scalars().all()
+            if row.created_at is not None
+        }
+
     bucket_map: dict[str, int] = {}
     for f in fishes:
-        if f.created_at is None:
+        created_at = created_at_by_video.get(f.video_id)
+        if created_at is None:
             continue
         # 统一转到北京时间再格式化
-        beijing_time = f.created_at.astimezone(BEIJING_TZ)
+        beijing_time = created_at.astimezone(BEIJING_TZ)
         key = beijing_time.strftime(bucket_format)
         bucket_map[key] = bucket_map.get(key, 0) + 1
 
     return [
         {"bucket": k, "bucket_kind": bucket_kind, "count": v}
         for k, v in sorted(bucket_map.items())
+    ]
+
+
+def _build_video_task_trend(
+    db: Session,
+    *,
+    report_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    video_id: str | None = None,
+) -> list[dict]:
+    """Count video tasks by capture time, independently of detected fish."""
+    filters = []
+    bucket_format = "%Y-%m-%d %H:00"
+    bucket_kind = "hour"
+    if report_date:
+        parsed = _parse_date(report_date)
+        if parsed:
+            start, end = _day_range(parsed)
+            filters.extend((VideoTask.created_at >= start, VideoTask.created_at <= end))
+    if start_date:
+        parsed = _parse_date(start_date)
+        if parsed:
+            start, _ = _day_range(parsed)
+            filters.append(VideoTask.created_at >= start)
+    if end_date:
+        parsed = _parse_date(end_date)
+        if parsed:
+            _, end = _day_range(parsed)
+            filters.append(VideoTask.created_at <= end)
+    if start_date or end_date:
+        bucket_format = "%Y-%m-%d"
+        bucket_kind = "day"
+    if video_id:
+        filters.append(VideoTask.video_id == video_id)
+
+    stmt = select(VideoTask)
+    if filters:
+        stmt = stmt.where(*filters)
+    bucket_map: dict[str, int] = {}
+    for task in db.execute(stmt).scalars().all():
+        if task.created_at is None:
+            continue
+        created_at = task.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=BEIJING_TZ)
+        else:
+            created_at = created_at.astimezone(BEIJING_TZ)
+        key = created_at.strftime(bucket_format)
+        bucket_map[key] = bucket_map.get(key, 0) + 1
+    return [
+        {"bucket": key, "bucket_kind": bucket_kind, "count": count}
+        for key, count in sorted(bucket_map.items())
     ]
 
 
@@ -407,32 +433,22 @@ def get_fish_quality_charts(
     if video_id:
         filters.append(Fish.video_id == video_id)
 
-    fish_stmt = select(Fish)
+    fish_stmt = select(Fish).join(VideoTask, Fish.video_id == VideoTask.video_id)
     if filters:
         fish_stmt = fish_stmt.where(*filters)
     fishes = list(db.execute(fish_stmt).scalars().all())
 
-    # JSON 兜底：从 pipeline_result.json 拉鱼字段，merge 到 all_records
-    video_ids_now = sorted({f.video_id for f in fishes if f.video_id})
-    json_cache = _get_or_load_pipeline_results(video_ids_now) if video_ids_now else {}
-    extra_records: list[dict] = []
-    for v_info in json_cache.values():
-        for r in v_info.get("fish_records", []):
-            extra_records.append(r)
-    if extra_records:
-        all_records_for_charts = extra_records
-    else:
-        all_records_for_charts = [
-            {
-                "body_length_cm": _fish_length_cm(f),
-                "body_length_no_tail_cm": _fish_length_no_tail_cm(f),
-                "body_height_cm": f.body_height_cm,
-                "body_weight_g": f.pred_weight_g,
-                "condition_factor": f.condition_factor,
-                "surface_damage_ratio": f.surface_damage_ratio,
-            }
-            for f in fishes
-        ]
+    all_records_for_charts = [
+        {
+            "body_length_cm": _fish_length_cm(f),
+            "body_length_no_tail_cm": _fish_length_no_tail_cm(f),
+            "body_height_cm": f.body_height_cm,
+            "body_weight_g": f.pred_weight_g,
+            "condition_factor": _condition_factor_percent(f.condition_factor),
+            "surface_damage_ratio": f.surface_damage_ratio,
+        }
+        for f in fishes
+    ]
 
     length_values = [float(r.get("body_length_cm")) for r in all_records_for_charts if r.get("body_length_cm") is not None]
     no_tail_values = [float(r.get("body_length_no_tail_cm")) for r in all_records_for_charts if r.get("body_length_no_tail_cm") is not None]
@@ -445,11 +461,6 @@ def get_fish_quality_charts(
         pct = normalize_ratio_percent(f.surface_damage_ratio)
         if pct is not None:
             damage_pcts.append(pct)
-    for r in extra_records:
-        pct = normalize_ratio_percent(r.get("surface_damage_ratio"))
-        if pct is not None:
-            damage_pcts.append(pct)
-
     video_rank: dict[str, int] = {}
     for f in fishes:
         video_rank[f.video_id] = video_rank.get(f.video_id, 0) + 1
@@ -462,11 +473,22 @@ def get_fish_quality_charts(
         end_date=end_date,
         video_id=video_id,
     )
+    video_task_trend = _build_video_task_trend(
+        db,
+        report_date=report_date,
+        start_date=start_date,
+        end_date=end_date,
+        video_id=video_id,
+    )
 
     return {
         "fish_count_trend": fish_count_trend,
+        "video_task_trend": video_task_trend,
         "body_length_distribution": build_fixed_distribution(length_values, "body_length_cm"),
-        "body_length_without_tail_distribution": build_fixed_distribution(height_values, "body_height_cm"),
+        "body_length_without_tail_distribution": build_fixed_distribution(
+            no_tail_values,
+            "body_length_no_tail_cm",
+        ),
         "body_height_distribution": build_fixed_distribution(height_values, "body_height_cm"),
         "body_weight_distribution": build_fixed_distribution(weight_values, "body_weight_g"),
         "condition_factor_distribution": build_fixed_distribution(condition_values, "condition_factor"),
@@ -513,19 +535,12 @@ def get_fish_quality_fishes(
         ).scalars().all()
     )
 
-    json_by_fish_id: dict[str, dict] = {}
-    if video_id:
-        payload = _read_pipeline_result_json(video_id) or {}
-        for record in payload.get("fish") or payload.get("fishes") or []:
-            if isinstance(record, dict):
-                key = record.get("fish_uid") or record.get("fish_id")
-                if key:
-                    json_by_fish_id[str(key)] = record
-
     items = []
     for f in fishes:
-        record = json_by_fish_id.get(str(f.fish_id), {})
-        crop_path = record.get("crop_image_path") or f.crop_image_path
+        # The database is authoritative after result import. Do not silently
+        # replace a database row with stale JSON values.
+        record: dict = {}
+        crop_path = f.crop_image_path
         items.append({
             "fish_id": f.fish_id,
             "fish_display_id": derive_fish_display_id(f.fish_id),
@@ -533,24 +548,24 @@ def get_fish_quality_fishes(
             "video_id": f.video_id,
             "video_display_id": derive_video_display_id(f.video_id),
             "created_at": f.created_at.isoformat() if f.created_at else None,
-            "body_length": record.get("body_length_cm") if record else f.body_length_cm,
-            "body_length_without_tail": record.get("body_length_no_tail_cm") if record else f.body_length_no_tail_cm,
-            "body_height": record.get("body_height_cm") if record else f.body_height_cm,
-            "body_weight": record.get("pred_weight_g") if record else f.pred_weight_g,
-            "condition_factor": record.get("condition_factor") if record else f.condition_factor,
+            "body_length": f.body_length_cm,
+            "body_length_without_tail": f.body_length_no_tail_cm,
+            "body_height": f.body_height_cm,
+            "body_weight": f.pred_weight_g,
+            "condition_factor": _condition_factor_percent(f.condition_factor),
             "surface_damage": f.surface_damage,
-            "surface_damage_ratio": record.get("surface_damage_ratio") if record else f.surface_damage_ratio,
-            "hex_color": record.get("hex_color") or getattr(f, "hex_color", None),
-            "status": record.get("status") or f.status,
-            "track_id": record.get("track_id") if record else f.track_id,
-            "fish_uid": record.get("fish_uid") or f.fish_uid,
-            "frame_index": record.get("frame_index") if record else f.frame_index,
+            "surface_damage_ratio": f.surface_damage_ratio,
+            "hex_color": getattr(f, "hex_color", None),
+            "status": f.status,
+            "track_id": f.track_id,
+            "fish_uid": f.fish_uid,
+            "frame_index": f.frame_index,
             "crop_image_path": crop_path,
             "crop_image_url": to_static_url(crop_path),
-            "body_length_cm": record.get("body_length_cm") if record else f.body_length_cm,
-            "body_length_no_tail_cm": record.get("body_length_no_tail_cm") if record else f.body_length_no_tail_cm,
-            "body_height_cm": record.get("body_height_cm") if record else f.body_height_cm,
-            "pred_weight_g": record.get("pred_weight_g") if record else f.pred_weight_g,
+            "body_length_cm": f.body_length_cm,
+            "body_length_no_tail_cm": f.body_length_no_tail_cm,
+            "body_height_cm": f.body_height_cm,
+            "pred_weight_g": f.pred_weight_g,
             "original_image_url": to_static_url(f.original_image_path),
             "corrected_image_url": to_static_url(f.corrected_image_path),
         })
@@ -577,215 +592,39 @@ def get_videos_by_date(db: Session, *, report_date: str) -> list[dict]:
         .order_by(VideoTask.created_at.desc())
     )
     rows = list(db.execute(stmt).scalars().all())
+    video_ids = [row.video_id for row in rows if row.video_id]
+    fish_by_video: dict[str, list[Fish]] = {video_id: [] for video_id in video_ids}
+    if video_ids:
+        for fish in db.execute(
+            select(Fish).where(Fish.video_id.in_(video_ids))
+        ).scalars().all():
+            fish_by_video.setdefault(fish.video_id, []).append(fish)
 
     items: list[dict] = []
     for v in rows:
-        pipeline = _read_pipeline_result_json(v.video_id) or {}
-        video_duration = v.video_duration_seconds
-        if video_duration is None or float(video_duration) <= 0:
-            try:
-                video_duration = float(pipeline.get("video_duration_seconds"))
-            except (TypeError, ValueError):
-                video_duration = None
-        if video_duration is None or float(video_duration) <= 0:
-            source = pipeline.get("original_input_video") or pipeline.get("input_video")
-            path = to_abs_data_path(source) if source else None
-            if path and path.exists():
-                try:
-                    probe = subprocess.run(
-                        [
-                            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-                        ], capture_output=True, text=True, timeout=20, check=False,
-                    )
-                    video_duration = float(probe.stdout.strip())
-                except (OSError, ValueError, subprocess.TimeoutExpired):
-                    video_duration = None
-        processing_duration = v.processing_duration_seconds
-        if processing_duration is None:
-            try:
-                processing_duration = float(
-                    pipeline.get("processing_duration_seconds")
-                    or pipeline.get("processing_seconds")
-                )
-            except (TypeError, ValueError):
-                processing_duration = None
+        db_fish = fish_by_video.get(v.video_id) or []
+        video_duration = task_video_duration_seconds(v)
+        processing_duration = task_processing_duration_seconds(v)
         items.append(
             {
                 "video_id": v.video_id,
                 "video_display_id": derive_video_display_id(v.video_id),
-                "source_type": v.source_type,
                 "status": v.status,
                 "total_fish": v.total_fish,
                 "video_duration_seconds": video_duration,
                 "processing_duration_seconds": processing_duration,
                 "avg_body_length": _avg([
-                    r.get("body_length_cm")
-                    for r in (pipeline.get("fish") or [])
-                    if isinstance(r, dict)
-                    and str(r.get("status") or "").lower() in {"done", "complete"}
+                    fish.body_length_cm for fish in db_fish
+                    if str(fish.status or "").lower() in {"done", "complete"}
                 ]),
                 "avg_body_height": _avg([
-                    r.get("body_height_cm") for r in (pipeline.get("fish") or [])
-                    if isinstance(r, dict)
-                    and str(r.get("status") or "").lower() in {"done", "complete"}
+                    fish.body_height_cm for fish in db_fish
+                    if str(fish.status or "").lower() in {"done", "complete"}
                 ]),
                 "created_at": v.created_at.isoformat() if v.created_at else None,
             }
         )
     return items
-
-
-# ----------------- pipeline_result.json 兜底读取 -----------------
-
-def _read_pipeline_result_json(video_id: str) -> dict | None:
-    """读取 data/results/<video_id>/reports/pipeline_result.json。"""
-    path = RESULTS_DIR / video_id / "reports" / "pipeline_result.json"
-    if not path.exists():
-        return None
-    try:
-        with open(path, encoding="utf-8") as fp:
-            data = json.loads(fp.read())
-        if not isinstance(data, dict):
-            return None
-        return data
-    except Exception:
-        return None
-
-
-def _get_or_load_pipeline_results(video_ids: list[str]) -> dict[str, dict]:
-    """对每个 video_id 优先读 DB VideoTask 总数字段；
-    若 0 / 缺，则读 pipeline_result.json 兜底。
-
-    返回 mapping: video_id -> {
-        "summary": {total_fish, complete_fish, incomplete_fish, failed_fish, damaged_fish,
-                   avg_surface_damage_ratio, max_surface_damage_ratio},
-        "fish_records": list[dict]    # 鱼字段统一映射
-    }
-    """
-    out: dict[str, dict] = {}
-    if not video_ids:
-        return out
-    try:
-        from app.repositories.db import SessionLocal
-        from app.repositories.models import VideoTask
-        db = SessionLocal()
-        try:
-            vts = (
-                db.query(VideoTask)
-                .filter(VideoTask.video_id.in_(video_ids))
-                .all()
-            )
-            vt_map = {vt.video_id: vt for vt in vts}
-        finally:
-            db.close()
-    except Exception:
-        vt_map = {}
-
-    for vid in video_ids:
-        vt = vt_map.get(vid)
-        # 来自 DB VideoTask 的统计（如果>0）
-        summary = {
-            "total_fish": int(getattr(vt, "total_fish", 0) or 0) if vt else 0,
-            "complete_fish": int(getattr(vt, "complete_fish", 0) or 0) if vt else 0,
-            "incomplete_fish": int(getattr(vt, "incomplete_fish", 0) or 0) if vt else 0,
-            "failed_fish": int(getattr(vt, "failed_fish", 0) or 0) if vt else 0,
-            "damaged_fish": int(getattr(vt, "damaged_fish", 0) or 0) if vt else 0,
-            "avg_surface_damage_ratio": (
-                float(getattr(vt, "avg_surface_damage_ratio", 0) or 0.0) if vt else 0.0
-            ),
-            "max_surface_damage_ratio": (
-                float(getattr(vt, "max_surface_damage_ratio", 0) or 0.0) if vt else 0.0
-            ),
-        }
-
-        # 读取 pipeline_result.json
-        pr = _read_pipeline_result_json(vid)
-        fish_records: list[dict] = []
-        used_json = False
-        if pr:
-            used_json = True
-            pr_summary = pr.get("summary") or {}
-            if isinstance(pr_summary, dict):
-                for k in (
-                    "total_fish",
-                    "complete_fish",
-                    "incomplete_fish",
-                    "failed_fish",
-                    "damaged_fish",
-                    "avg_surface_damage_ratio",
-                    "max_surface_damage_ratio",
-                ):
-                    if k in pr_summary and pr_summary[k] is not None:
-                        summary[k] = pr_summary[k]
-            raw_fish = pr.get("fish") or pr.get("fishes") or []
-            if isinstance(raw_fish, list):
-                for r in raw_fish:
-                    if not isinstance(r, dict):
-                        continue
-                    # 算法结果统一使用当前字段口径。
-                    rec = {
-                        "body_length_cm": r.get("body_length_cm"),
-                        "body_length_no_tail_cm": r.get("body_length_no_tail_cm"),
-                        "body_height_cm": r.get("body_height_cm"),
-                        "pred_weight_g": r.get("pred_weight_g"),
-                        "body_weight_g": r.get("pred_weight_g"),
-                        "condition_factor": r.get("condition_factor"),
-                        "surface_damage_ratio": r.get("surface_damage_ratio"),
-                        "status": r.get("status"),
-                        "video_id": r.get("video_id") or vid,
-                        "fish_id": r.get("fish_id") or r.get("fish_uid"),
-                        "track_id": r.get("track_id"),
-                    }
-                    fish_records.append(rec)
-
-        # 如果 DB 全 0 而 JSON 有，采纳 JSON 的 summary
-        if (summary["total_fish"] == 0
-            and summary["complete_fish"] == 0
-            and summary["incomplete_fish"] == 0
-            and summary["failed_fish"] == 0
-            and fish_records
-        ):
-            try:
-                summary["total_fish"] = len(fish_records)
-            except Exception:
-                pass
-            try:
-                summary["complete_fish"] = sum(
-                    1 for r in fish_records
-                    if (r.get("status") or "").lower() in ("done", "complete")
-                )
-            except Exception:
-                pass
-            try:
-                summary["incomplete_fish"] = sum(
-                    1 for r in fish_records
-                    if (r.get("status") or "").lower() == "incomplete"
-                )
-            except Exception:
-                pass
-            try:
-                summary["failed_fish"] = sum(
-                    1 for r in fish_records
-                    if (r.get("status") or "").lower() == "failed"
-                )
-            except Exception:
-                pass
-            try:
-                damaged = sum(
-                    1 for r in fish_records
-                    if (r.get("surface_damage_ratio") or 0) > 0
-                )
-                summary["damaged_fish"] = damaged
-            except Exception:
-                pass
-
-        out[vid] = {
-            "summary": summary,
-            "fish_records": fish_records,
-            "used_json": used_json,
-        }
-    return out
 
 
 # ----------------- 兼容早期 dashboard 调用 -----------------
@@ -807,7 +646,7 @@ ALL_REPORT_PLACEHOLDERS: list[str] = [
     "report_type_name", "report_status_name",
     "aquaculture_bin",
     # 视频任务概况
-    "video_total", "upload_video_total", "rtsp_video_total",
+    "video_total", "camera_video_total",
     "done_video_total", "failed_video_total", "no_fish_video_total",
     "total_video_duration", "avg_processing_seconds", "avg_fps",
     "task_success_rate",
@@ -917,47 +756,18 @@ def _compute_video_total_duration_seconds(videos: list) -> float:
 
 
 def _query_video_total_duration(db: Session, videos: list) -> float:
-    """计算当天视频文件时长总和，优先使用视频文件元数据。"""
-    if not videos:
-        return 0.0
-    total = 0.0
-    for video in videos:
-        source = to_abs_data_path(getattr(video, "source_path", None))
-        if source is None or not source.exists():
-            continue
-        try:
-            result = subprocess.run(
-                [
-                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1", str(source),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-            value = float(result.stdout.strip())
-            if value > 0:
-                total += value
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            continue
-    return round(total, 2)
+    """Compatibility wrapper for callers that need the per-task duration sum."""
+    del db
+    return round(sum(task_video_duration_seconds(video) or 0.0 for video in videos), 2)
 
 
 def _query_avg_processing_seconds(videos: list) -> float:
     """平均处理时长，过滤旧数据中的结束时间早于开始时间记录。"""
-    pairs: list[float] = []
-    for v in videos:
-        end = v.finished_at or v.updated_at
-        if end is None:
-            continue
-        for start in (v.started_at, v.created_at):
-            if start is None:
-                continue
-            delta = (end - start).total_seconds()
-            if delta > 0:
-                pairs.append(delta)
-                break
+    pairs = [
+        duration
+        for v in videos
+        if (duration := task_processing_duration_seconds(v)) is not None
+    ]
     return round(sum(pairs) / len(pairs), 2) if pairs else 0.0
 
 
@@ -1034,8 +844,7 @@ def build_daily_report_context(
     summary.setdefault("surface_damage_rate", 0.0)
     summary.setdefault("metric_complete_rate", 0.0)
     summary.setdefault("abnormal_fish_rate", 0.0)
-    summary.setdefault("upload_video_total", 0)
-    summary.setdefault("rtsp_video_total", 0)
+    summary.setdefault("camera_video_total", 0)
     summary.setdefault("done_video_total", 0)
     summary.setdefault("failed_video_total", 0)
     summary.setdefault("no_fish_video_total", 0)
@@ -1059,78 +868,41 @@ def build_daily_report_context(
         ).scalars().all()
     )
 
-    upload_videos = [v for v in video_rows if (v.source_type or "upload") == "upload"]
-    rtsp_videos = [v for v in video_rows if (v.source_type or "upload") == "rtsp"]
     done_videos = [v for v in video_rows if v.status == "done"]
     failed_videos = [v for v in video_rows if v.status == "failed"]
     no_fish_videos = [v for v in video_rows if (v.total_fish or 0) == 0]
 
-    summary["upload_video_total"] = len(upload_videos)
-    summary["rtsp_video_total"] = len(rtsp_videos)
+    summary["camera_video_total"] = len(video_rows)
     summary["done_video_total"] = len(done_videos)
     summary["failed_video_total"] = len(failed_videos)
     summary["no_fish_video_total"] = len(no_fish_videos)
     summary["total_video_duration"] = round(
-        sum(
-            float(v.video_duration_seconds or 0)
-            for v in video_rows
-            if v.video_duration_seconds is not None
-        ),
+        sum(task_video_duration_seconds(v) or 0.0 for v in video_rows),
         2,
     )
-    if summary["total_video_duration"] <= 0:
-        summary["total_video_duration"] = _query_video_total_duration(db, video_rows)
+    processing_durations = [
+        duration
+        for v in done_videos + failed_videos
+        if (duration := task_processing_duration_seconds(v)) is not None
+    ]
     summary["avg_processing_seconds"] = round(
-        sum(
-            float(v.processing_duration_seconds)
-            for v in done_videos + failed_videos
-            if v.processing_duration_seconds is not None
-        )
-        / max(
-            1,
-            sum(
-                1
-                for v in done_videos + failed_videos
-                if v.processing_duration_seconds is not None
-            ),
-        ),
-        2,
-    ) if any(v.processing_duration_seconds is not None for v in done_videos + failed_videos) else _query_avg_processing_seconds(done_videos + failed_videos)
+        sum(processing_durations) / len(processing_durations), 2
+    ) if processing_durations else 0.0
     summary["avg_fps"] = _query_avg_fps(video_rows)
     summary["video_total"] = len(video_rows)
     summary["task_success_rate"] = (
         len(done_videos) / len(video_rows) if video_rows else 0.0
     )
 
-    # 当天鱼
+    # 当天鱼，按视频拍摄时间筛选，而不是算法导入时间。
+    report_video_ids = [v.video_id for v in video_rows if v.video_id]
     fish_rows = list(
         db.execute(
             select(Fish)
-            .where(Fish.created_at >= start_dt)
-            .where(Fish.created_at <= end_dt)
+            .where(Fish.video_id.in_(report_video_ids))
             .order_by(Fish.created_at.desc())
         ).scalars().all()
     )
-    report_video_ids = [v.video_id for v in video_rows if v.video_id]
-    report_cache = _get_or_load_pipeline_results(report_video_ids)
-    records_by_id = {
-        str(record.get("fish_id")): record
-        for data in report_cache.values()
-        for record in data.get("fish_records", [])
-        if record.get("fish_id")
-    }
-    records_by_track = {
-        (str(record.get("video_id")), str(record.get("track_id"))): record
-        for data in report_cache.values()
-        for record in data.get("fish_records", [])
-        if record.get("track_id") is not None
-    }
-    for fish in fish_rows:
-        record = records_by_id.get(str(fish.fish_id)) or records_by_track.get(
-            (str(fish.video_id), str(fish.track_id))
-        )
-        if record and record.get("surface_damage_ratio") is not None:
-            fish.surface_damage_ratio = record["surface_damage_ratio"]
     total_fish = len(fish_rows)
     valid_fish = [f for f in fish_rows if str(f.status or "").lower() in {"done", "complete"}]
     partial_fish = [f for f in fish_rows if str(f.status or "").lower() == "incomplete"]
@@ -1153,33 +925,8 @@ def build_daily_report_context(
         len(surface_damage_fish) / total_fish if total_fish else 0.0
     )
 
-    # 核心指标
-    report_records = [
-        record
-        for video_data in report_cache.values()
-        for record in video_data.get("fish_records", [])
-    ]
-    if report_records:
-        record_statuses = [str(r.get("status") or "").lower() for r in report_records]
-        total_fish = len(report_records)
-        valid_count = sum(s in {"done", "complete"} for s in record_statuses)
-        partial_count = sum(s == "processing" for s in record_statuses)
-        abnormal_count = sum(_record_is_abnormal(r) for r in report_records)
-        damaged_count = sum(
-            normalize_ratio_percent(r.get("surface_damage_ratio")) not in (None, 0)
-            for r in report_records
-        )
-        summary["total_fish"] = total_fish
-        summary["fish_total"] = total_fish
-        summary["valid_fish_total"] = valid_count
-        summary["partial_fish_total"] = sum(s == "incomplete" for s in record_statuses)
-        summary["abnormal_fish_total"] = abnormal_count
-        summary["surface_damage_fish_total"] = damaged_count
-        summary["metric_complete_rate"] = valid_count / total_fish if total_fish else 0.0
-        summary["abnormal_fish_rate"] = abnormal_count / total_fish if total_fish else 0.0
-        summary["surface_damage_rate"] = damaged_count / total_fish if total_fish else 0.0
-        valid_fish = [f for f in valid_fish if f.status in {"done", "complete"}]
-    metric_records = [r for r in report_records if str(r.get("status") or "").lower() in {"done", "complete"}] or [
+    # 核心指标只读取数据库新字段。
+    metric_records = [
         {
             "body_length_cm": f.body_length_cm,
             "body_length_no_tail_cm": f.body_length_no_tail_cm,
@@ -1234,13 +981,14 @@ def build_daily_report_context(
 
         # 视频任务概况
         "video_total": summary["video_total"],
-        "upload_video_total": summary["upload_video_total"],
-        "rtsp_video_total": summary["rtsp_video_total"],
+        "camera_video_total": summary["camera_video_total"],
         "done_video_total": summary["done_video_total"],
         "failed_video_total": summary["failed_video_total"],
         "no_fish_video_total": summary["no_fish_video_total"],
         "total_video_duration": format_duration_with_unit(summary["total_video_duration"]),
-        "avg_processing_seconds": f"{summary['avg_processing_seconds']:.2f}",
+        "avg_processing_seconds": format_duration_with_unit(
+            summary["avg_processing_seconds"]
+        ),
         "avg_fps": f"{summary['avg_fps']:.2f}",
         "task_success_rate": format_percent(
             summary["task_success_rate"] * 100, digits=2
@@ -1381,7 +1129,7 @@ def _build_video_rows_context(top_videos: list) -> dict:
     for idx, v in enumerate(top_videos[:5], start=1):
         out[f"video_index_{idx}"] = str(idx)
         out[f"video_id_{idx}"] = v.video_id or "--"
-        from app.services.report_format_utils import video_source_cn, video_status_cn
+        from app.services.report_format_utils import video_status_cn
         from app.services.fish_id_service import derive_video_display_id
         out[f"aquaculture_bin_{idx}"] = getattr(v, "aquaculture_bin", None) or "未填写"
         out[f"video_status_{idx}"] = video_status_cn(v.status)

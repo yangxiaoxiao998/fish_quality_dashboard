@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from app.paths import PROJECT_ROOT
+from app.paths import PROJECT_ROOT, resource_path
 
 logger = logging.getLogger("report_fixed_images")
 
@@ -17,6 +17,11 @@ FIXED_BODY_DEMO_TIF_REL = (
 
 
 def get_fixed_body_demo_tif() -> Path:
+    # The template image is bundled read-only by PyInstaller.  Prefer that
+    # resource and retain the source-install path as a fallback.
+    bundled = resource_path(*FIXED_BODY_DEMO_TIF_REL.parts)
+    if bundled.exists():
+        return bundled
     return PROJECT_ROOT / FIXED_BODY_DEMO_TIF_REL
 
 

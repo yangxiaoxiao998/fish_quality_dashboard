@@ -24,7 +24,6 @@ import { Message } from '@arco-design/web-vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   clearTechnicalDebugAccessRequest,
-  grantTechnicalDebugAccess,
   getTechnicalDebugAccessRequest,
   TECHNICAL_DEBUG_PASSWORD,
   setAdministrator,
@@ -65,7 +64,6 @@ function confirmDebugAccess(): void {
   requestedPath.value = null
   clearTechnicalDebugAccessRequest()
   if (target) {
-    grantTechnicalDebugAccess(target)
     void router.push(target)
   }
 }

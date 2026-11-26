@@ -10,5 +10,6 @@ mkdir -p "$TARGET_DIR" "$(dirname -- "$LOG_FILE")"
 
 exec /usr/bin/rsync -avPh \
   --exclude='.cache/' \
+  --exclude='uploads/videos/segments/' \
   --exclude='rsync.log' \
   -- "$SOURCE_DIR/" "$TARGET_DIR/" >>"$LOG_FILE" 2>&1

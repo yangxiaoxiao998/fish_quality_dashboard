@@ -1,6 +1,6 @@
 <template>
   <div class="dashboard-viewport">
-    <div class="dashboard-fixed" :style="fixedScreenStyle">
+    <div class="dashboard-fixed">
   <div class="dashboard-background">
     <Layout>
       <!-- 左侧区域：4个ECharts图表 (20%) -->
@@ -45,7 +45,7 @@
 
             <div class="charts-grid">
               <div class="chart-card">
-                 <div class="card-title">全长分布 (cm)</div>
+                 <div class="card-title">体长分布 (cm)</div>
                 <div ref="lengthChartRef" class="chart-container"></div>
               </div>
               <div class="chart-card">
@@ -83,8 +83,8 @@
                 <span class="value">{{ startTime || '--' }}</span>
               </div>
               <div class="info-item">
-                <span class="label">检测耗时：</span>
-                <span class="value">{{ duration }}</span>
+                <span class="label">视频时长：</span>
+                <span class="value">{{ videoDurationLabel }}</span>
               </div>
             </div>
             <div class="info-right">
@@ -93,11 +93,23 @@
                 <span class="value">{{ endTime || '--' }}</span>
               </div>
               <div class="info-item">
-                <span class="label">视频时长：</span>
-                <span class="value">{{ videoDurationLabel }}</span>
+                <span class="label">检测耗时：</span>
+                <span class="value">{{ duration }}</span>
               </div>
             </div>
           </div>
+          <a-alert
+            v-if="storageHealth && storageHealth.level !== 'ok'"
+            :type="storageHealth.level === 'warning' ? 'warning' : 'error'"
+            :title="storageHealth.message"
+            :show-icon="true"
+            class="storage-health-alert"
+          >
+            <template #content>
+              剩余 {{ formatStorageBytes(storageHealth.free_bytes) }}（{{ storageHealth.free_percent ?? 0 }}%）。
+              {{ storageHealth.removable_available ? '已检测到移动存储，可到“系统设置 → 数据备份”立即迁移。' : '请插入 U 盘或移动硬盘后迁移历史数据。' }}
+            </template>
+          </a-alert>
 
           <!-- 状态卡片 -->
           <div class="status-cards">
@@ -116,7 +128,7 @@
               </div>
             </div> -->
             <div
-              v-if="cameraStreamActive || cameraState === 'starting' || cameraState === 'running'"
+              v-if="cameraStreamActive || cameraState === 'starting' || cameraState === 'running' || cameraState === 'reconnecting'"
               class="status-card"
             >
               <div class="status-icon"><i class="fa-solid fa-video"></i></div>
@@ -204,10 +216,9 @@
                        result mode 抢占。
                   2. result 模式（从视频历史 / 报表跳转大屏进入）
                      → 显示算法标注视频（grounded_sam.mp4）。
-                  3. 普通 upload / history 视频（VideoWall）
-                  4. idle → VideoWall
+                   3. idle → 等待摄像头输入
               -->
-              <template v-if="isCameraLive || cameraState === 'starting' || cameraState === 'running'">
+              <template v-if="isCameraLive || cameraState === 'starting' || cameraState === 'running' || cameraState === 'reconnecting'">
                 <div class="camera-stream-container">
                   <img
                     v-if="sharedCameraFrameUrl"
@@ -258,19 +269,16 @@
                 <div v-else-if="resultVideoErrored" class="video-status-text error">
                   结果视频加载失败：<br />
                   {{ resultGroundedUrl || '(空 URL)' }}<br />
-                  请检查 grounded_sam.mp4 是否为 H.264 / yuv420p 编码。
+                  请检查结果文件是否已部署，或确认浏览器支持 H.264 / yuv420p 编码。
                 </div>
                 <div v-else class="video-status-text">
                   该视频暂无结果视频（grounded_sam.mp4）。
                 </div>
               </template>
 
-              <VideoWall
-                v-else
-                ref="videoWallRef"
-                @fish-selected="handleFishSelected"
-                @upload-success="handleUploadSuccess"
-              />
+              <div v-else class="video-status-text">
+                请启动摄像头输入
+              </div>
             </div>
           </div>
 
@@ -290,27 +298,6 @@
                 <span>光圈设置</span>
               </button>
             </div>
-            <!-- <button class="ctrl-btn upload-btn" :disabled="!canStart" @click="handleUpload">
-              <i class="fa-solid fa-upload"></i>
-              <span>上传</span>
-            </button>
-            <button class="ctrl-btn" :disabled="cameraStreamActive || !currentVideoId" @click="handlePlay">
-              <i class="fa-solid fa-play"></i>
-              <span>播放</span>
-            </button>
-            <button class="ctrl-btn" :disabled="cameraStreamActive || !currentVideoId" @click="handlePause">
-              <i class="fa-solid fa-pause"></i>
-              <span>暂停</span>
-            </button>
-            <button class="ctrl-btn detect-btn" :disabled="!canStart" @click="handleReDetect">
-              <i class="fa-solid fa-magnifying-glass"></i>
-              <span>重新检测</span>
-            </button>
-            <button class="ctrl-btn clear-btn" @click="handleClearCurrentTask">
-              <i class="fa-solid fa-eraser"></i>
-              <span>清除当前任务</span>
-            </button> -->
-
             <a-modal
               v-model:visible="apertureDialogVisible"
               title="光圈设置"
@@ -353,6 +340,21 @@
                 </div>
 
                 <div class="aperture-controls">
+                  <div class="aperture-section integrity-setting-section">
+                    <div class="aperture-section-title">鱼体完整性检测</div>
+                    <a-radio-group
+                      v-model="integrityDetectionEnabled"
+                      direction="horizontal"
+                      @change="handleIntegritySettingChange"
+                    >
+                      <a-radio :value="true">是，检测完整性</a-radio>
+                      <a-radio :value="false">否，不检测完整性</a-radio>
+                    </a-radio-group>
+                    <div class="aperture-section-desc">
+                      该选择会持续保存，重启系统后仍然生效，并用于后续录制任务。
+                    </div>
+                  </div>
+
                   <div
                     class="aperture-mode-tip"
                     :class="`aperture-mode-${aperturePreviewMode}`"
@@ -628,7 +630,6 @@
                 </a-space>
               </div>
             </a-modal>
-            <IntegritySettingDialog v-model:visible="integrityDialogVisible" @confirm="handleIntegrityConfirm" />
             <a-modal
               v-model:visible="calibrationVisible"
               title="摄像头视角标定"
@@ -812,20 +813,31 @@
                 v-model="fishQueryDate"
                 value-format="YYYY-MM-DD"
                 allow-clear
+                :disabled="isResultMode"
                 style="flex:1"
                 @change="onFishQueryDateChange"
               />
             </div>
             <div class="query-row">
               <label class="query-label">视频信息</label>
-              <a-input
+              <a-select
                 v-model="fishQueryVideoId"
-                placeholder="请输入视频 ID，回车搜索"
+                placeholder="请选择视频编号"
                 allow-clear
+                allow-search
+                filter-option
+                :disabled="isResultMode"
                 style="flex:1"
-                @press-enter="onFishQueryVideoChange(fishQueryVideoId)"
-                @clear="onFishQueryVideoChange('')"
-              />
+                @change="onFishQueryVideoChange"
+              >
+                <a-option
+                  v-for="video in fishQueryVideos"
+                  :key="video.video_id"
+                  :value="video.video_id"
+                >
+                  {{ video.label }}
+                </a-option>
+              </a-select>
             </div>
             <div class="query-row">
               <label class="query-label">鱼 ID</label>
@@ -934,7 +946,6 @@
 import { ref, onMounted, onUnmounted, onErrorCaptured, computed, reactive, nextTick, watch } from 'vue'
 import Layout from '@/layout/Layout.vue'
 import { LayoutPanel } from '@/layout'
-import VideoWall from '@/components/stream/VideoWall.vue'
 import {
   useCameraJpegFramePolling,
   type CameraFrameState,
@@ -943,13 +954,11 @@ import {
 // 摄像头设置功能已迁移到 系统设置 → 摄像头设置（admin/system/CameraSettingsPage.vue）。
 // CameraSettings.vue 保留作为旧调用方兼容，本阶段此处不再 import。
 import * as echarts from 'echarts'
-import type { FishDetail } from '@/types/fish'
 import dayjsLib from 'dayjs'
 const dayjs = dayjsLib
 import { Message } from '@arco-design/web-vue'
 import { http } from '@/api/http'
 import { setDistributionChartOption } from '@/utils/distributionChart'
-import { useFixedScreen } from '@/utils/useFixedScreen'
 import { getVideoState } from '@/store/video'
 import { useRoute, useRouter } from 'vue-router'
 import { getAlgorithmVideoResult } from '@/api/algorithm'
@@ -968,7 +977,6 @@ import { logUserAction } from '@/utils/operationLogger'
 import RecordScheduleDialog, {
   type RecordTask,
 } from '@/components/camera/RecordScheduleDialog.vue'
-import IntegritySettingDialog from '@/components/camera/IntegritySettingDialog.vue'
 import {
   getAlgorithmCalibrationStatus,
   runAlgorithmCalibration,
@@ -986,8 +994,6 @@ import {
   getFishErrorMessage,
   getFishDisplayId,
 } from '@/utils/fishFields'
-
-const videoWallRef = ref<InstanceType<typeof VideoWall> | null>(null)
 
 const route = useRoute()
 const router = useRouter()
@@ -1008,7 +1014,7 @@ const resultSelectedTrackId = ref<string>('')
 // resultGroundedUrl / resultVideoErrored 在更下方 normalizeStaticUrl 附近声明。
 // 注意：showCameraSettings 已删除。摄像头设置入口已迁移到 系统设置 → 摄像头设置。
 const cameraStreamActive = ref(false)
-// 统一实时帧轮询 composable（Dashboard 与 DataInput 共享同一接口，
+// 统一实时帧轮询 composable（Dashboard 使用同一接口，
 // 主画面与光圈预览都引用这一个 frameUrl）。
 const {
   frameUrl: sharedCameraFrameUrl,
@@ -1019,6 +1025,24 @@ const {
 } = useCameraJpegFramePolling()
 const cameraConnected = ref(false)
 const cameraState = ref<string>('idle')
+const storageHealth = ref<any | null>(null)
+let lastStorageMessageLevel = ''
+function formatStorageBytes(value: unknown) {
+  const bytes = Number(value || 0)
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 GB'
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`
+}
+function applyStorageHealth(data: any) {
+  if (!data || typeof data !== 'object') return
+  storageHealth.value = data
+  if (data.level && data.level !== 'ok' && data.level !== lastStorageMessageLevel) {
+    lastStorageMessageLevel = data.level
+    if (data.level === 'warning') Message.warning(data.message || '磁盘剩余空间偏低')
+    else Message.error(data.message || '磁盘空间不足，请插入 U 盘迁移数据')
+  } else if (data.level === 'ok') {
+    lastStorageMessageLevel = ''
+  }
+}
 let cameraFrameTimer: number | null = null
 // 摄像头视角标定状态
 const calibrationVisible = ref(false)
@@ -1090,8 +1114,31 @@ const customDurationMinutes = ref<number>(0)
 const recordScheduleDialogVisible = ref(false)
 const recordModeDialogVisible = ref(false)
 const recordPlanningDialogVisible = ref(false)
-const integrityDialogVisible = ref(false)
 const forceAllComplete = ref(false)
+const INTEGRITY_SETTING_KEY = 'fish_quality_integrity_detection_enabled'
+const integrityDetectionEnabled = ref(true)
+
+function loadIntegritySetting(): void {
+  try {
+    const saved = localStorage.getItem(INTEGRITY_SETTING_KEY)
+    if (saved === 'false') integrityDetectionEnabled.value = false
+    else if (saved === 'true') integrityDetectionEnabled.value = true
+  } catch {
+    // 浏览器禁用 localStorage 时保留默认的完整性检测。
+  }
+}
+
+function handleIntegritySettingChange(value: boolean): void {
+  integrityDetectionEnabled.value = Boolean(value)
+  try {
+    localStorage.setItem(
+      INTEGRITY_SETTING_KEY,
+      String(integrityDetectionEnabled.value),
+    )
+  } catch {
+    // 保存失败不阻断当前页面的录制设置。
+  }
+}
 
 // 服务端 /status 是权威值；本地每秒递减仅做 UI 平滑。
 const recordDurationSeconds = ref<number | null>(null)
@@ -1168,7 +1215,7 @@ const calibrationStatusText = computed(() => {
   return '已标定'
 })
 
-// 摄像头/上传的运行时配置（来源：CameraSettings 弹窗）
+// 摄像头运行时配置（来源：CameraSettings 弹窗）
 // 默认不写死推流地址，由后端按主机局域网 IP 自动生成。
 const cameraConfig = reactive({
   stream_url: '',
@@ -1183,14 +1230,13 @@ const cameraConfig = reactive({
 const streamUrl = computed(() => cameraConfig.stream_url)
 
 // ---- 时间字段（持久化） ----
-const startTime = ref<string | null>(null)         // 检测开始时间（video_task.started_at/created_at）
-const endTime = ref<string | null>(null)           // 检测结束时间（video_task.finished_at）
-const duration = ref<string>('00:00:00')           // 检测耗时 = finished - started（或 now - started）
-const videoDurationLabel = ref<string>('--')      // 视频文件真实时长（与检测耗时分开）
+const startTime = ref<string | null>(null)         // 录像开始时间（首帧）
+const endTime = ref<string | null>(null)           // 录像结束时间（停止录制）
+const duration = ref<string>('--')                 // 算法检测耗时
+const videoDurationLabel = ref<string>('--')       // 录像时长；录制中实时增长
 
 // ---- 任务状态 ----
 const currentVideoId = ref<string>('')
-const currentSourceType = ref<string>('')
 const currentVideoStatus = ref<string>('')
 const currentAlgorithm = ref<string>('')
 const totalFish = ref(0)
@@ -1269,7 +1315,11 @@ async function loadResultMode() {
   resultLoading.value = true
   resultError.value = ''
   try {
-    const resp = await getAlgorithmVideoResult(vid)
+    const [resp, taskResp] = await Promise.all([
+      getAlgorithmVideoResult(vid),
+      http.get(`/api/videos/${encodeURIComponent(vid)}`),
+    ])
+    applyVideoTaskToUi(taskResp.data)
     if (resp.data?.data) {
       resultData.value = resp.data.data
     } else {
@@ -1371,7 +1421,7 @@ function setResultTrackId(t: any) {
 
 function getResultFishStatusColor(status: string | undefined | null): string {
   const s = String(status || '').toLowerCase()
-  if (s === 'done') return 'green'
+  if (s === 'done' || s === 'complete') return 'green'
   if (s === 'incomplete') return 'orange'
   if (s === 'failed') return 'red'
   return 'gray'
@@ -1437,7 +1487,9 @@ function normalizeStaticUrl(path?: string | null): string {
 
 const resultGroundedUrl = computed(() => {
   const data: any = resultData.value
-  return normalizeStaticUrl(data?.grounded_video_url || data?.grounded_video || '')
+  return normalizeStaticUrl(
+    data?.result_video_url || data?.grounded_video_url || data?.grounded_video || '',
+  )
 })
 
 const resultVideoErrored = ref<boolean>(false)
@@ -1453,7 +1505,8 @@ const isCameraLive = computed(
   () =>
     cameraStreamActive.value ||
     cameraState.value === 'running' ||
-    cameraState.value === 'starting'
+    cameraState.value === 'starting' ||
+    cameraState.value === 'reconnecting'
 )
 const selectedFishMessage = ref('')
 
@@ -1522,7 +1575,7 @@ const fishQueryFishOptions = computed(() => {
     const shortId = getShortFishId(f)
     const status = String(f.status || '').toLowerCase()
     const statusLabel =
-      status === 'done'
+      status === 'done' || status === 'complete'
         ? '完整'
         : status === 'incomplete'
         ? '不完整'
@@ -1564,7 +1617,7 @@ const selectedDashboardFishStatusText = computed(() => {
   const f: any = selectedDashboardFish.value
   if (!f) return '--'
   const s = String(f.status || '').toLowerCase()
-  if (s === 'done') return '完整'
+  if (s === 'done' || s === 'complete') return '完整'
   if (s === 'incomplete') return '不完整'
   if (s === 'failed') return '失败'
   return s || '--'
@@ -1647,6 +1700,17 @@ function sameDate(a: string | null | undefined, dateStr: string): boolean {
   return String(a).slice(0, 10) === dateStr
 }
 
+function getVideoDateForQuery(v: any): string {
+  if (!v) return ''
+  const explicit =
+    v.recording_date || v.record_date || v.report_date || v.date ||
+    getVideoStartTimeForQuery(v)
+  if (explicit) return String(explicit).slice(0, 10)
+  const videoId = String(v.video_id || v.id || v.task_id || '')
+  const match = videoId.match(/^(\d{4})(\d{2})(\d{2})(?:_|$)/)
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : ''
+}
+
 function normalizeDashboardVideoOptions(items: any[]): any[] {
   if (!Array.isArray(items)) return []
   return items
@@ -1668,7 +1732,14 @@ function normalizeDashboardVideoOptions(items: any[]): any[] {
 }
 
 async function loadDashboardFishQueryVideos() {
-  const date = fishQueryDate.value
+  const lockedVideoId = isResultMode.value ? resultVideoId.value.trim() : ''
+  const lockedDate = lockedVideoId
+    ? getVideoDateForQuery({ video_id: lockedVideoId })
+    : ''
+  if (lockedDate && fishQueryDate.value !== lockedDate) {
+    fishQueryDate.value = lockedDate
+  }
+  const date = lockedDate || fishQueryDate.value
   let items: any[] = []
   // 1) /api/reports/fish-quality/videos
   try {
@@ -1693,19 +1764,26 @@ async function loadDashboardFishQueryVideos() {
       items = []
     }
   }
-  let normalized = normalizeDashboardVideoOptions(items)
-  // 如果当前 fishQueryVideoId 不在列表里但有值，要把它补进列表，避免下拉显示空。
-  if (fishQueryVideoId.value) {
-    const exists = normalized.some(
-      (v) => String(v.video_id) === String(fishQueryVideoId.value),
-    )
-    if (!exists) {
+  const dateFiltered = date
+    ? items.filter((v) => getVideoDateForQuery(v) === date)
+    : items
+  const normalized = normalizeDashboardVideoOptions(dateFiltered)
+  if (lockedVideoId) {
+    if (!normalized.some((v) => String(v.video_id) === lockedVideoId)) {
       normalized.unshift({
-        video_id: String(fishQueryVideoId.value),
-        status: '',
-        label: String(fishQueryVideoId.value),
+        video_id: lockedVideoId,
+        status: 'done',
+        label: `${lockedVideoId}（已完成）`,
       })
     }
+    fishQueryVideoId.value = lockedVideoId
+  } else if (
+    fishQueryVideoId.value &&
+    !normalized.some((v) => String(v.video_id) === String(fishQueryVideoId.value))
+  ) {
+    fishQueryVideoId.value = ''
+    fishQueryFishId.value = ''
+    fishQueryFishes.value = []
   }
   fishQueryVideos.value = normalized
   console.log('[Dashboard FishQuery] videos:', fishQueryVideos.value.length, fishQueryVideos.value.slice(0, 3))
@@ -2008,7 +2086,6 @@ let pollAbort = false
 
 // localStorage 键
 const LS_KEY_VIDEO_ID = 'dashboard_current_video_id'
-const LS_KEY_SOURCE = 'dashboard_current_source_type'
 const LS_KEY_SAVED_AT = 'dashboard_current_saved_at'
 
 // ---- 时间范围选择 ----
@@ -2056,7 +2133,7 @@ async function handleCameraFrameClick(event: MouseEvent) {
   }
 
   const fps = cameraConfig.fps || 25
-  const baseTime = startedAtMs ?? Date.now()
+  const baseTime = recordingStartedAtMs ?? Date.now()
   const elapsedSeconds = Math.max(0, (Date.now() - baseTime) / 1000)
   const frameIndex = Math.floor(elapsedSeconds * fps)
 
@@ -2158,16 +2235,19 @@ const canStart = computed(() => {
   if (cameraStreamActive.value) return false
   return cameraState.value === 'idle' || cameraState.value === 'error'
 })
-const canStop = computed(() => cameraState.value === 'running')
+const canStop = computed(() =>
+  cameraState.value === 'running' || cameraState.value === 'reconnecting'
+)
 const cameraButtonText = computed(() => {
   if (cameraState.value === 'starting') return '正在连接'
+  if (cameraState.value === 'reconnecting') return '等待恢复（点击停止）'
   if (cameraState.value === 'stopping') return '正在关闭'
   if (cameraStreamActive.value || cameraState.value === 'running') return '关闭摄像头'
   return '摄像头输入'
 })
 
 const cameraButtonIcon = computed(() => {
-  if (cameraStreamActive.value || cameraState.value === 'running' || cameraState.value === 'starting') {
+  if (cameraStreamActive.value || cameraState.value === 'running' || cameraState.value === 'starting' || cameraState.value === 'reconnecting') {
     return 'fa-solid fa-stop'
   }
   return 'fa-solid fa-camera'
@@ -2342,12 +2422,11 @@ function clearAllTimers() {
   }
 }
 
-// 检测耗时 = finished_at - started_at（带状态刷新）。
-// 运行中：每秒刷新一次（基于真实时间戳，**与播放暂停无关**）。
+// 录像时长和算法检测耗时使用两套时间戳，每秒只刷新当前活动的一套。
 function startDurationCounter() {
   if (durationTimer) return
   durationTimer = window.setInterval(() => {
-    recomputeDurationFromTimestamps()
+    recomputeTimingLabels()
   }, 1000)
 }
 
@@ -2355,45 +2434,94 @@ function stopDurationCounter() {
   if (durationTimer) { clearInterval(durationTimer); durationTimer = null }
 }
 
-let startedAtMs: number | null = null
-let finishedAtMs: number | null = null
+let recordingStartedAtMs: number | null = null
+let recordingFinishedAtMs: number | null = null
+let processingStartedAtMs: number | null = null
+let processingFinishedAtMs: number | null = null
+let persistedProcessingSeconds: number | null = null
 
-function recomputeDurationFromTimestamps() {
-  if (startedAtMs === null) {
-    duration.value = '00:00:00'
-    return
+const LIVE_RECORDING_STATUSES = new Set(['recording', 'running'])
+const TERMINAL_TASK_STATUSES = new Set([
+  'done', 'failed', 'stopped', 'no_fish_detected', 'interrupted',
+])
+
+function parseTimestamp(value: unknown): number | null {
+  if (!value) return null
+  const parsed = new Date(value as string | number | Date).getTime()
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function recomputeTimingLabels() {
+  const status = String(currentVideoStatus.value || '').toLowerCase()
+  startTime.value = recordingStartedAtMs !== null
+    ? formatChinaDateTime(recordingStartedAtMs)
+    : null
+  endTime.value = recordingFinishedAtMs !== null
+    ? formatChinaDateTime(recordingFinishedAtMs)
+    : null
+
+  if (LIVE_RECORDING_STATUSES.has(status) && recordingStartedAtMs !== null) {
+    videoDurationLabel.value = formatDuration(Date.now() - recordingStartedAtMs)
+  } else if (videoDurationSeconds.value !== null) {
+    videoDurationLabel.value = formatSeconds(videoDurationSeconds.value)
+  } else if (recordingStartedAtMs !== null && recordingFinishedAtMs !== null) {
+    videoDurationLabel.value = formatDuration(
+      recordingFinishedAtMs - recordingStartedAtMs,
+    )
+  } else {
+    videoDurationLabel.value = '--'
   }
-  const end = finishedAtMs ?? Date.now()
-  duration.value = formatDuration(end - startedAtMs)
+
+  if (status === 'processing' && processingStartedAtMs !== null) {
+    duration.value = formatDuration(Date.now() - processingStartedAtMs)
+  } else if (persistedProcessingSeconds !== null) {
+    duration.value = formatSeconds(persistedProcessingSeconds)
+  } else if (
+    TERMINAL_TASK_STATUSES.has(status)
+    && processingStartedAtMs !== null
+    && processingFinishedAtMs !== null
+  ) {
+    duration.value = formatDuration(processingFinishedAtMs - processingStartedAtMs)
+  } else {
+    // 录制和排队阶段还没有进入算法检测，不能显示伪造的耗时。
+    duration.value = '--'
+  }
 }
 
 function applyTimestampsFromTask(task: any) {
-  // 优先用 video_task.started_at，没有就退到 created_at
-  if (task?.started_at) {
-    startedAtMs = new Date(task.started_at).getTime()
-  } else if (task?.created_at) {
-    startedAtMs = new Date(task.created_at).getTime()
+  const status = String(task?.status || '').toLowerCase()
+  currentVideoStatus.value = status
+  recordingStartedAtMs = parseTimestamp(
+    task?.recording_started_at
+      || (LIVE_RECORDING_STATUSES.has(status) ? null : task?.created_at),
+  )
+  recordingFinishedAtMs = parseTimestamp(task?.recording_finished_at)
+  processingStartedAtMs = parseTimestamp(task?.started_at)
+  processingFinishedAtMs = parseTimestamp(task?.finished_at)
+
+  videoDurationSeconds.value = (
+    typeof task?.video_duration_seconds === 'number'
+    && Number.isFinite(task.video_duration_seconds)
+    && task.video_duration_seconds > 0
+  ) ? task.video_duration_seconds : null
+  persistedProcessingSeconds = (
+    typeof task?.processing_duration_seconds === 'number'
+    && Number.isFinite(task.processing_duration_seconds)
+    && task.processing_duration_seconds >= 0
+  ) ? task.processing_duration_seconds : null
+
+  recomputeTimingLabels()
+  if (LIVE_RECORDING_STATUSES.has(status) || status === 'processing') {
+    startDurationCounter()
   } else {
-    startedAtMs = null
-  }
-  finishedAtMs = task?.finished_at ? new Date(task.finished_at).getTime() : null
-  startTime.value = startedAtMs ? formatChinaDateTime(startedAtMs) : null
-  endTime.value = finishedAtMs ? formatChinaDateTime(finishedAtMs) : null
-  if (startedAtMs !== null) {
-    if (finishedAtMs === null) startDurationCounter()
-    else stopDurationCounter()
-    recomputeDurationFromTimestamps()
-  } else {
-    duration.value = '00:00:00'
     stopDurationCounter()
   }
 }
 
 // 持久化当前任务到 localStorage
-function saveCurrentTaskToStorage(videoId: string, sourceType: string) {
+function saveCurrentTaskToStorage(videoId: string) {
   try {
     localStorage.setItem(LS_KEY_VIDEO_ID, videoId)
-    localStorage.setItem(LS_KEY_SOURCE, sourceType)
     localStorage.setItem(LS_KEY_SAVED_AT, Date.now().toString())
   } catch (e) { /* ignore */ }
 }
@@ -2401,17 +2529,15 @@ function saveCurrentTaskToStorage(videoId: string, sourceType: string) {
 function clearCurrentTaskFromStorage() {
   try {
     localStorage.removeItem(LS_KEY_VIDEO_ID)
-    localStorage.removeItem(LS_KEY_SOURCE)
     localStorage.removeItem(LS_KEY_SAVED_AT)
   } catch (e) { /* ignore */ }
 }
 
-function readCurrentTaskFromStorage(): { videoId: string; sourceType: string } | null {
+function readCurrentTaskFromStorage(): { videoId: string } | null {
   try {
     const videoId = localStorage.getItem(LS_KEY_VIDEO_ID)
     if (!videoId) return null
-    const sourceType = localStorage.getItem(LS_KEY_SOURCE) || 'upload'
-    return { videoId, sourceType }
+    return { videoId }
   } catch {
     return null
   }
@@ -2438,19 +2564,6 @@ function applyVideoTaskToUi(task: any) {
   // 时间字段
   applyTimestampsFromTask(task)
 
-  // 视频文件时长
-  if (typeof task.video_duration_seconds === 'number' && task.video_duration_seconds > 0) {
-    videoDurationSeconds.value = task.video_duration_seconds
-    videoDurationLabel.value = formatSeconds(task.video_duration_seconds)
-  } else {
-    videoDurationSeconds.value = null
-    videoDurationLabel.value = '--'
-  }
-
-  // 统一使用后端记录的最终处理耗时，避免页面自行推算产生差异。
-  if (typeof task.processing_duration_seconds === 'number') {
-    duration.value = formatSeconds(task.processing_duration_seconds)
-  }
 }
 
 async function pollVideoTask(videoId: string) {
@@ -2467,9 +2580,6 @@ async function pollVideoTask(videoId: string) {
         if (data.status === 'done') {
           progress.value = 100
         }
-        if (data.finished_at) {
-          endTime.value = formatChinaDateTime(data.finished_at)
-        }
         stopDurationCounter()
         return
       }
@@ -2482,43 +2592,11 @@ async function pollVideoTask(videoId: string) {
   check()
 }
 
-function handleUpload() {
-  logUserAction({ module: '算法检测', action: 'upload_video', message: '点击上传视频' })
-  if (!canStart.value) return
-  videoWallRef.value?.triggerFileInput()
-}
-
-function handleUploadSuccess(data: { video_id: string, videoSrc: string }) {
-  logUserAction({ module: '算法检测', action: 'start_algorithm_detection', targetType: 'video', targetId: data.video_id, message: '上传视频并开始算法检测' })
-  currentVideoId.value = data.video_id
-  currentSourceType.value = 'upload'
-  saveCurrentTaskToStorage(data.video_id, 'upload')
-  // 立即拉一次 task 拿到 started_at 等
-  pollVideoTask(data.video_id)
-}
-
-function handlePlay() {
-  if (currentVideoId.value) videoWallRef.value?.playVideo()
-}
-
-function handlePause() {
-  if (currentVideoId.value) videoWallRef.value?.pauseVideo()
-}
-
-function handleReDetect() {
-  if (canStart.value) handleUpload()
-}
-
-function handleFishSelected(fish: FishDetail) {
-  selectedFish.value = fish
-}
-
 function handleClearCurrentTask() {
   pollAbort = true
   clearAllTimers()
   clearCurrentTaskFromStorage()
   currentVideoId.value = ''
-  currentSourceType.value = ''
   currentVideoStatus.value = ''
   currentAlgorithm.value = ''
   totalFish.value = 0
@@ -2526,13 +2604,16 @@ function handleClearCurrentTask() {
   progress.value = 0
   startTime.value = null
   endTime.value = null
-  duration.value = '00:00:00'
+  duration.value = '--'
   videoDurationLabel.value = '--'
   videoDurationSeconds.value = null
   selectedFish.value = null
   lastError.value = null
-  startedAtMs = null
-  finishedAtMs = null
+  recordingStartedAtMs = null
+  recordingFinishedAtMs = null
+  processingStartedAtMs = null
+  processingFinishedAtMs = null
+  persistedProcessingSeconds = null
 }
 
 function onCorrectedImgError(e: Event) {
@@ -2553,6 +2634,12 @@ async function pollCameraStatus() {
       const statusResp = await http.get('/api/camera_yzt/status')
       const statusData = statusResp.data
       cameraState.value = statusData.state || 'idle'
+      applyStorageHealth(statusData.storage)
+
+      if (statusData.video_id && !currentVideoId.value) {
+        currentVideoId.value = statusData.video_id
+        saveCurrentTaskToStorage(statusData.video_id)
+      }
 
       // 解释：摄像头状态不活跃时，可能是正在连接（starting），也可能是已停止（idle/error）。只有在 idle/error 状态才真正认为摄像头不活跃并关闭画面，starting 状态则继续等待。
       if (!statusData.is_active) {
@@ -2561,6 +2648,15 @@ async function pollCameraStatus() {
         // 正在连接时，后端可能还没有进入 active，不能立刻把画面关掉
         if (cameraState.value === 'starting') {
           cameraStreamActive.value = true
+          cameraPollTimer = window.setTimeout(check, 2000)
+          return
+        }
+
+        if (cameraState.value === 'reconnecting') {
+          cameraStreamActive.value = true
+          applyCameraTimingFromStatus(statusData)
+          startCameraFramePolling()
+          if (timedRecording.value) startRemainingTick()
           cameraPollTimer = window.setTimeout(check, 2000)
           return
         }
@@ -2574,12 +2670,7 @@ async function pollCameraStatus() {
               const r = await http.get(`/api/videos/${currentVideoId.value}`)
               const v = r.data
               applyVideoTaskToUi(v)
-              if (v.finished_at) {
-                endTime.value = formatChinaDateTime(v.finished_at)
-              }
             } catch {}
-          } else {
-            endTime.value = formatChinaDateTime(Date.now())
           }
 
           stopDurationCounter()
@@ -2601,11 +2692,6 @@ async function pollCameraStatus() {
         stopRemainingTick()
       }
 
-      if (statusData.video_id && !currentVideoId.value) {
-        currentVideoId.value = statusData.video_id
-        currentSourceType.value = 'rtsp'
-        saveCurrentTaskToStorage(statusData.video_id, 'rtsp')
-      }
       if (statusData.fish_detected !== undefined && statusData.fish_detected !== null) {
         // 摄像头运行时短暂用 fish_detected
         if (totalFish.value === 0) totalFish.value = statusData.fish_detected
@@ -2634,13 +2720,18 @@ async function startCameraCapture(durationMinutes?: number) {
   cameraConnected.value = false
   cameraState.value = 'starting'
 
-  // 摄像头启动后立刻开始计算耗时
-  startedAtMs = Date.now()
-  finishedAtMs = null
-  startTime.value = formatChinaDateTime(startedAtMs)
+  // 等后端收到第一帧后再显示录像开始时间。
+  recordingStartedAtMs = null
+  recordingFinishedAtMs = null
+  processingStartedAtMs = null
+  processingFinishedAtMs = null
+  persistedProcessingSeconds = null
+  videoDurationSeconds.value = null
+  startTime.value = null
   endTime.value = null
-  duration.value = '00:00:00'
-  startDurationCounter()
+  duration.value = '--'
+  videoDurationLabel.value = '--'
+  stopDurationCounter()
 
   const payload: Record<string, any> = {
     stream_url: cameraConfig.stream_url,
@@ -2665,8 +2756,6 @@ async function startCameraCapture(durationMinutes?: number) {
       cameraConnected.value = false
       cameraStreamActive.value = false
       stopCameraFramePolling()
-      endTime.value = formatChinaDateTime(Date.now())
-      finishedAtMs = Date.now()
       stopDurationCounter()
       stopRemainingTick()
       // 失败时把后端 status 返回的 timing 字段也同步下来，便于 UI 显示错误后状态
@@ -2688,8 +2777,7 @@ async function startCameraCapture(durationMinutes?: number) {
 
     if (data.video_id) {
       currentVideoId.value = data.video_id
-      currentSourceType.value = 'rtsp'
-      saveCurrentTaskToStorage(data.video_id, 'rtsp')
+      saveCurrentTaskToStorage(data.video_id)
     }
 
     // 提示：复用现推流 / 强制重启 / 普通启动
@@ -2716,8 +2804,6 @@ async function startCameraCapture(durationMinutes?: number) {
     cameraConnected.value = false
     cameraStreamActive.value = false
     stopCameraFramePolling()
-    endTime.value = formatChinaDateTime(Date.now())
-    finishedAtMs = Date.now()
     stopDurationCounter()
     stopRemainingTick()
     const msg = e?.message || String(e)
@@ -2738,12 +2824,14 @@ async function stopCameraCapture() {
   cameraState.value = 'stopping'
   stopCameraFramePolling()
   stopRemainingTick()
+  let stopData: any = null
   try {
     const resp = await http.post('/api/camera_yzt/stop', {
       reason: 'dashboard_camera_button',
       source: 'Dashboard.vue',
     })
     const data = resp.data
+    stopData = data
     if (typeof data.fish_detected === 'number') {
       totalFish.value = data.fish_detected
     }
@@ -2751,8 +2839,7 @@ async function stopCameraCapture() {
     // 本阶段新增：处理后端入队结果，触发任务状态轮询
     if (data.video_id) {
       currentVideoId.value = data.video_id
-      currentSourceType.value = 'rtsp'
-      saveCurrentTaskToStorage(data.video_id, 'rtsp')
+      saveCurrentTaskToStorage(data.video_id)
     }
 
     if (data.queued && data.video_id) {
@@ -2771,9 +2858,16 @@ async function stopCameraCapture() {
     cameraStreamActive.value = false
     cameraConnected.value = false
     cameraState.value = 'idle'
-    endTime.value = formatChinaDateTime(Date.now())
-    finishedAtMs = Date.now()
-    stopDurationCounter()
+    // stop 接口返回的是录像时间；算法时间由后续任务轮询单独更新。
+    if (stopData?.recording_started_at || stopData?.recording_finished_at) {
+      applyTimestampsFromTask({
+        status: stopData.queued ? 'queued' : 'stopped',
+        recording_started_at: stopData.recording_started_at,
+        recording_finished_at: stopData.recording_finished_at,
+      })
+    } else {
+      stopDurationCounter()
+    }
     // 兜底：手动停止的 stop_reason / stop_source 即使后端没返回，前端也展示。
     stopReason.value = stopReason.value || 'dashboard_camera_button'
     stopSource.value = stopSource.value || 'Dashboard.vue'
@@ -2808,16 +2902,12 @@ function handleCameraInput() {
     if (isResultMode.value) {
       switchToCameraLiveMode()
     }
-    integrityDialogVisible.value = true
+    forceAllComplete.value = !integrityDetectionEnabled.value
+    recordModeDialogVisible.value = true
     return
   }
 
   console.warn(`[Camera] 当前状态 ${cameraState.value} 不可操作`)
-}
-
-function handleIntegrityConfirm(value: { forceAllComplete: boolean }): void {
-  forceAllComplete.value = value.forceAllComplete
-  recordModeDialogVisible.value = true
 }
 
 function chooseImmediateRecording() {
@@ -2846,6 +2936,7 @@ function startCameraFramePolling() {
     cameraStreamActive.value
     || cameraState.value === 'starting'
     || cameraState.value === 'running'
+    || cameraState.value === 'reconnecting'
     || cameraState.value === 'stopping'
   ) {
     startSharedFramePolling()
@@ -2860,6 +2951,7 @@ function stopCameraFramePolling() {
     cameraStreamActive.value
     || cameraState.value === 'starting'
     || cameraState.value === 'running'
+    || cameraState.value === 'reconnecting'
     || cameraState.value === 'stopping'
   )
   stopSharedFramePolling({ clearFrame: needClear })
@@ -2906,7 +2998,7 @@ async function handleOpenApertureSettings() {
     const state = String(statusData.state || 'idle')
     if (
       isActive &&
-      (state === 'starting' || state === 'running' || state === 'stopping')
+       (state === 'starting' || state === 'running' || state === 'reconnecting' || state === 'stopping')
     ) {
       // 已经有画面：复用，不调 preview/start
       aperturePreviewActive.value = true
@@ -3127,7 +3219,6 @@ async function runCalibrationWithImage(sourceImage: string) {
 }
 
 // ---------- 统计图 ----------
-const { fixedScreenStyle } = useFixedScreen(1920, 1080)
 const lengthChartRef = ref<HTMLElement>()
 const weightChartRef = ref<HTMLElement>()
 const conditionChartRef = ref<HTMLElement>()
@@ -3409,7 +3500,6 @@ async function restoreFromLocalStorage() {
   const saved = readCurrentTaskFromStorage()
   if (!saved) return
   currentVideoId.value = saved.videoId
-  currentSourceType.value = saved.sourceType
   try {
     const resp = await http.get(`/api/videos/${saved.videoId}`)
     applyVideoTaskToUi(resp.data)
@@ -3430,6 +3520,7 @@ async function restoreCameraState() {
   try {
     const resp = await http.get('/api/camera_yzt/status')
     const data = resp.data
+    applyStorageHealth(data.storage)
     const state = data.state || 'idle'
     const streamReady = data.stream_ready === true || (data.frames_captured || 0) > 0
     const isLive =
@@ -3445,17 +3536,14 @@ async function restoreCameraState() {
       cameraConnected.value = state === 'running' && streamReady
       cameraState.value = state
       currentVideoId.value = data.video_id
-      currentSourceType.value = 'rtsp'
-      saveCurrentTaskToStorage(data.video_id, 'rtsp')
+      saveCurrentTaskToStorage(data.video_id)
       if (streamReady) {
         startCameraFramePolling()
       }
-      startedAtMs = data.started_at ? new Date(data.started_at).getTime() : Date.now()
-      finishedAtMs = null
-      startTime.value = data.started_at ? formatChinaDateTime(data.started_at) : formatChinaDateTime(Date.now())
-      endTime.value = null
-      duration.value = '00:00:00'
-      startDurationCounter()
+      applyTimestampsFromTask({
+        status: 'recording',
+        recording_started_at: data.recording_started_at,
+      })
       // 恢复倒计时本地 1 秒递减 timer（后端 /status 仍是权威值）
       if (timedRecording.value) {
         startRemainingTick()
@@ -3472,8 +3560,7 @@ async function restoreCameraState() {
       cameraConnected.value = false
       cameraState.value = 'error'
       currentVideoId.value = data.video_id
-      currentSourceType.value = 'rtsp'
-      saveCurrentTaskToStorage(data.video_id, 'rtsp')
+      saveCurrentTaskToStorage(data.video_id)
       Message.error(
         data.startup_error ||
           data.last_error ||
@@ -3511,8 +3598,7 @@ async function restoreFromVideoStore() {
   }
 
   currentVideoId.value = v.videoId
-  currentSourceType.value = v.source === 'history' ? 'history' : (v.source || 'history')
-  saveCurrentTaskToStorage(v.videoId, currentSourceType.value)
+  saveCurrentTaskToStorage(v.videoId)
 
   // 拉任务元数据（status / fish_count / started_at 等）
   try {
@@ -3549,7 +3635,11 @@ watch(
     ) {
       return
     }
-    if (fishQueryVideoId.value === v) return
+    if (isResultMode.value) {
+      const targetDate = getVideoDateForQuery({ video_id: v })
+      if (targetDate) fishQueryDate.value = targetDate
+    }
+    if (fishQueryVideoId.value === v && fishQueryFishes.value.length > 0) return
     fishQueryVideoId.value = v
     try {
       await loadDashboardFishQueryVideos()
@@ -3569,6 +3659,7 @@ onErrorCaptured((err: unknown, instance, info) => {
 })
 
 onMounted(async () => {
+  loadIntegritySetting()
   // result 模式（?mode=result&video_id=...）只展示算法结果，
   // 不做实时摄像头恢复 / 启动 / 拉流。
   if (isResultMode.value) {
@@ -3593,6 +3684,8 @@ onMounted(async () => {
       try {
         const vid = String(route.query.video_id || '')
         if (vid) {
+          const targetDate = getVideoDateForQuery({ video_id: vid })
+          if (targetDate) fishQueryDate.value = targetDate
           fishQueryVideoId.value = vid
         }
         // 先把视频列表（含当前 video_id）加载好，再去拉鱼
@@ -3655,18 +3748,19 @@ onUnmounted(() => {
 <style lang="scss" scoped>
 /* 使用视口原生尺寸，所有内部列和图表按可用空间流式布局。 */
 .dashboard-viewport {
-  width: 100vw;
-  height: 100vh;
+  width: 100%;
+  height: 100%;
+  min-height: 100dvh;
   overflow: hidden;
   position: relative;
   background: #000;
 }
 .dashboard-fixed {
-  position: absolute;
-  width: 1920px;
-  height: 1080px;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
   overflow: hidden;
-  transform-origin: top left;
 }
 .dashboard-background {
   width: 100%;

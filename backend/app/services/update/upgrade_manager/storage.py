@@ -12,14 +12,20 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from app.runtime_paths import (
+    CONFIG_ROOT as RUNTIME_CONFIG_ROOT,
+    DATA_ROOT as RUNTIME_DATA_ROOT,
+    INSTALL_ROOT as RUNTIME_INSTALL_ROOT,
+    resource_path,
+)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[5]
-UPDATE_DIR = PROJECT_ROOT / "backend" / "app" / "services" / "update"
+PROJECT_ROOT = RUNTIME_INSTALL_ROOT
+UPDATE_DIR = resource_path("backend", "app", "services", "update")
 HOME_DIR = Path.home()
-CONFIG_ROOT = Path(os.environ.get("FISH_CONFIG_ROOT") or PROJECT_ROOT / ".config").expanduser()
-DATA_ROOT = Path(os.environ.get("FISH_DATA_ROOT") or PROJECT_ROOT / "data").expanduser()
+CONFIG_ROOT = RUNTIME_CONFIG_ROOT
+DATA_ROOT = RUNTIME_DATA_ROOT
 STATE_ROOT = Path(os.environ.get("FISH_STATE_ROOT") or DATA_ROOT / "state").expanduser()
-INSTALL_ROOT = Path(os.environ.get("FISH_INSTALL_ROOT") or PROJECT_ROOT).expanduser()
+INSTALL_ROOT = RUNTIME_INSTALL_ROOT
 
 UPDATER_SCRIPT = UPDATE_DIR / "updater.py"
 UPDATE_PACKAGE_DIR = DATA_ROOT / "uploads" / "update_packages"
@@ -27,7 +33,18 @@ SOFTWARE_UPDATE_LOG_DIR = STATE_ROOT / "software_update"
 TASK_STATUS_DIR = SOFTWARE_UPDATE_LOG_DIR / "tasks"
 TASK_LOG_DIR = SOFTWARE_UPDATE_LOG_DIR / "runs"
 BACKUP_ROOT = PROJECT_ROOT / "backups"
-VERSION_FILE = PROJECT_ROOT / "version.json"
+VERSION_FILE = next(
+    (
+        candidate
+        for candidate in (
+            INSTALL_ROOT / "version.json",
+            INSTALL_ROOT / "backend" / "version.json",
+            resource_path("version.json"),
+        )
+        if candidate.exists()
+    ),
+    resource_path("version.json"),
+)
 CONFIG_META_FILE = CONFIG_ROOT / "config-meta.json"
 
 DEFAULT_VERSION = "1.0.0"
@@ -79,12 +96,21 @@ def _is_update_package_name(name: str) -> bool:
 
 
 def read_current_version() -> str:
-    if VERSION_FILE.exists():
+    candidates = [
+        INSTALL_ROOT / "version.json",
+        INSTALL_ROOT / "backend" / "version.json",
+        VERSION_FILE,
+    ]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
         try:
-            payload = _read_json(VERSION_FILE)
-            return str(payload.get("version") or payload.get("current_version") or DEFAULT_VERSION)
+            payload = _read_json(candidate)
+            value = str(payload.get("version") or payload.get("current_version") or "").strip()
+            if value:
+                return value
         except Exception:
-            return DEFAULT_VERSION
+            continue
     return DEFAULT_VERSION
 
 
@@ -110,6 +136,15 @@ def read_current_config_version() -> int:
 
 def current_link_targets() -> dict[str, str | None]:
     algo_python = os.environ.get("ALGORITHM_PYTHON", "").strip() or None
+    release_root = INSTALL_ROOT
+    if INSTALL_ROOT.name == "backend" and (INSTALL_ROOT / "fish-quality-backend").is_file():
+        release_root = INSTALL_ROOT.parent
+        return {
+            "backend": str(release_root / "backend"),
+            "frontend": str(release_root / "frontend"),
+            "algorithms": str(release_root / "backend" / "algorithms"),
+            "algo-env": algo_python,
+        }
     return {
         "backend": str(PROJECT_ROOT / "backend"),
         "frontend": str(PROJECT_ROOT / "frontend"),

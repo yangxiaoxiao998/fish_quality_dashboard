@@ -1,14 +1,10 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import Dashboard from '@/views/Dashboard.vue'
 import ScreenHome from '@/views/ScreenHome.vue'
-import DataInput from '@/views/DataInput.vue'
 import VideoDetectionReport from '@/views/VideoDetectionReport.vue'
 import AdminLayout from '@/layout/AdminLayout.vue'
-// DataSearch 入口已被合并到 /admin/data-report（鱼体检测明细章节），保留文件供 legacy import。
-import VideoHistory from '@/views/admin/VideoHistory.vue'
-import { clearVideoState } from '@/store/video'
 import {
-  consumeTechnicalDebugAccess,
+  isAdministrator,
   requestTechnicalDebugAccess,
 } from '@/utils/technicalDebugAuth'
 
@@ -31,13 +27,6 @@ const router = createRouter({
       // 兼容入口：旧链接 / 书签重定向到 /dashboard
       path: '/legacy-dashboard',
       redirect: '/dashboard'
-    },
-    {
-      // 数据录入占位页（后续正式录入页将替换此组件）
-      path: '/data-input',
-      name: 'DataInputLite',
-      component: DataInput,
-      meta: { title: '数据录入' }
     },
     {
       // 视频检测报告大屏（单中间列铺满，独立于 AdminLayout）
@@ -154,7 +143,7 @@ const router = createRouter({
 router.beforeEach((to, from, next) => {
   if (
     (to.path === '/admin/system-ops' || to.path === '/admin/system-settings') &&
-    !consumeTechnicalDebugAccess(to.fullPath)
+    !isAdministrator()
   ) {
     requestTechnicalDebugAccess(to.fullPath)
     next(false)

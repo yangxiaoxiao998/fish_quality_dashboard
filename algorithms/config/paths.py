@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os
+import sys
 import uuid
 from pathlib import Path
 
@@ -18,14 +20,21 @@ def _resolve_project_root() -> Path:
     ``<project_root>/algorithms/config/paths.py``，因此向上回溯两级即可。
     """
 
-    here = Path(__file__).resolve()
-    project_root = here.parents[2]
-    return project_root
+    configured = os.getenv("FISH_INSTALL_ROOT") or os.getenv("FISH_PROJECT_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
 
 
 PROJECT_ROOT: Path = _resolve_project_root()
-ALGORITHMS_ROOT: Path = PROJECT_ROOT / "algorithms"
-DATA_ROOT: Path = PROJECT_ROOT / "data"
+ALGORITHMS_ROOT: Path = Path(
+    os.getenv("FISH_ALGO_ROOT", str(PROJECT_ROOT / "algorithms"))
+).expanduser().resolve()
+DATA_ROOT: Path = Path(
+    os.getenv("FISH_DATA_ROOT", str(PROJECT_ROOT / "data"))
+).expanduser().resolve()
 
 
 # ---------------------------------------------------------------------------

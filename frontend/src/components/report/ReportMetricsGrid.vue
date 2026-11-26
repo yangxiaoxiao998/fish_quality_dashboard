@@ -35,6 +35,11 @@ const rows = computed(() => props.rows)
 
 function formatNumber(v: any, digits: number = 2): string {
   if (v === null || v === undefined || v === '') return '--'
+  if (typeof v === 'string') {
+    const text = v.trim()
+    const parsed = Number(text)
+    return Number.isFinite(parsed) ? parsed.toFixed(digits) : text
+  }
   const n = Number(v)
   if (!Number.isFinite(n)) return '--'
   return n.toFixed(digits)

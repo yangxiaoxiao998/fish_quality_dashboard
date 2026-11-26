@@ -402,8 +402,7 @@ onBeforeUnmount(() => {
 </script>
 
 <style lang="scss" scoped>
-/* DataInput 已用 dashboard-viewport.data-input-page 占位。
-   本页面用 video-report-display-page 占位，避免 :deep 选择器同时命中两个页面。 */
+/* 本页面用 video-report-display-page 命名空间隔离 :deep 选择器。 */
 .dashboard-viewport.video-report-display-page {
   /* 占位 */
 }
@@ -448,7 +447,7 @@ onBeforeUnmount(() => {
 
 /* ============================================================
  * 跨组件覆盖：单列铺满 Layout 主体（不能修改 Layout.vue）
- * 与 .data-input-page 命名空间隔离
+ * 与其它 dashboard 页面命名空间隔离
  * ============================================================ */
 .video-report-display-page :deep(.layout-main.no-left) {
   grid-template-columns: minmax(0, 1fr);

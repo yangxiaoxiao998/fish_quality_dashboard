@@ -134,7 +134,7 @@ watch(
 }
 .toc-title {
   margin: 0 0 10px;
-  font-size: 14px;
+  font-size: 16px;
   font-weight: 600;
   color: #1d2129;
 }
@@ -150,7 +150,7 @@ watch(
 .toc-item {
   display: block;
   padding: 5px 0;
-  font-size: 13px;
+  font-size: 16px;
   line-height: 1.6;
   color: #4e5969;
   text-decoration: none;

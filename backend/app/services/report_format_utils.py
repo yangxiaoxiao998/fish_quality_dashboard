@@ -113,7 +113,7 @@ def format_date_cn(value: date | str | None) -> str:
     return f"{value.year}年{value.month:02d}月{value.day:02d}日"
 
 
-# ------------------------- 视频状态 / 来源 中文映射 -------------------------
+# ------------------------- 视频状态中文映射 -------------------------
 
 _VIDEO_STATUS_CN = {
     "queued": "已入队",
@@ -123,19 +123,8 @@ _VIDEO_STATUS_CN = {
     "stopped": "已停止",
 }
 
-
-_VIDEO_SOURCE_CN = {
-    "upload": "上传",
-    "rtsp": "RTSP",
-}
-
-
 def video_status_cn(value: Any) -> str:
     return _VIDEO_STATUS_CN.get(str(value or ""), safe_text(value))
-
-
-def video_source_cn(value: Any) -> str:
-    return _VIDEO_SOURCE_CN.get(str(value or ""), safe_text(value))
 
 
 # ------------------------- 异常鱼原因生成 -------------------------

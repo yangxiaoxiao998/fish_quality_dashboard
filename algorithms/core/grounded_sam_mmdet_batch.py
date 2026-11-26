@@ -115,8 +115,15 @@ UNCLIPPED_XYXY_DATA_KEY = "unclipped_xyxy"
 # Ratios are intentionally not CLI options. They are loaded together with the
 # adjusted-canvas margin from config/adjust_calibration_margin.json so all runs
 # use the same physical positions on the conveyor body.
-POSITION_GATE_VERSION = "conveyor_position_gate_v1_20260813"
+POSITION_GATE_VERSION = "conveyor_position_gate_v2_20260825"
 BEST_SAMPLE_CROP_SCALE = 1.20
+CONVEYOR_DIRECTION_TOP_TO_BOTTOM = "top_to_bottom"
+CONVEYOR_DIRECTION_LEFT_TO_RIGHT = "left_to_right"
+DEFAULT_CONVEYOR_DIRECTION = CONVEYOR_DIRECTION_TOP_TO_BOTTOM
+VALID_CONVEYOR_DIRECTIONS = {
+    CONVEYOR_DIRECTION_TOP_TO_BOTTOM,
+    CONVEYOR_DIRECTION_LEFT_TO_RIGHT,
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -404,8 +411,8 @@ def synchronize_cuda() -> None:
 
 def load_conveyor_position_config(
     config_path: Path = ADJUST_CALIBRATION_MARGIN_CONFIG_PATH,
-) -> dict[str, float]:
-    """Load canvas margin and conveyor-position gates from the shared JSON."""
+) -> dict[str, Any]:
+    """Load conveyor direction, canvas margins, and position gates."""
     try:
         with config_path.open("r", encoding="utf-8") as file:
             payload = json.load(file)
@@ -420,6 +427,7 @@ def load_conveyor_position_config(
         )
 
     required_keys = (
+        "side_margin_ratio",
         "vertical_margin_ratio",
         "tracking_start_ratio",
         "crop_save_ratio",
@@ -430,7 +438,7 @@ def load_conveyor_position_config(
             f"Conveyor position config is missing {missing_keys}: {config_path}"
         )
 
-    values: dict[str, float] = {}
+    values: dict[str, Any] = {}
     for key in required_keys:
         raw_value = payload[key]
         if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
@@ -446,12 +454,12 @@ def load_conveyor_position_config(
             )
         values[key] = value
 
-    vertical_margin_ratio = values["vertical_margin_ratio"]
-    if not 0.0 <= vertical_margin_ratio <= 2.0:
-        raise RuntimeError(
-            "Conveyor position config vertical_margin_ratio must be in [0, 2], "
-            f"got {vertical_margin_ratio}: {config_path}"
-        )
+    for key in ("side_margin_ratio", "vertical_margin_ratio"):
+        if not 0.0 <= values[key] <= 2.0:
+            raise RuntimeError(
+                f"Conveyor position config {key} must be in [0, 2], "
+                f"got {values[key]}: {config_path}"
+            )
 
     for key in ("tracking_start_ratio", "crop_save_ratio"):
         if not 0.0 <= values[key] <= 1.0:
@@ -465,6 +473,21 @@ def load_conveyor_position_config(
             "Conveyor position config tracking_start_ratio must be smaller than "
             f"crop_save_ratio: {config_path}"
         )
+
+    conveyor_direction = payload.get(
+        "conveyor_direction",
+        DEFAULT_CONVEYOR_DIRECTION,
+    )
+    if (
+        not isinstance(conveyor_direction, str)
+        or conveyor_direction not in VALID_CONVEYOR_DIRECTIONS
+    ):
+        allowed = ", ".join(sorted(VALID_CONVEYOR_DIRECTIONS))
+        raise RuntimeError(
+            "Conveyor position config conveyor_direction must be one of "
+            f"[{allowed}], got {conveyor_direction!r}: {config_path}"
+        )
+    values["conveyor_direction"] = conveyor_direction
     return values
 
 
@@ -1217,24 +1240,39 @@ def conveyor_body_progress(
     image_height: int,
     image_width: int,
     *,
-    vertical_margin_ratio: float,
+    conveyor_direction: str = DEFAULT_CONVEYOR_DIRECTION,
+    side_margin_ratio: float = 0.0,
+    vertical_margin_ratio: float = 0.0,
 ) -> float | None:
     """Return where the middle of a fish lies along the conveyor body.
 
-    Adjusted frames contain a top and bottom safety margin, each measured as
-    ``vertical_margin_ratio * belt_height``. Progress 0 is therefore the top of
-    the conveyor itself and progress 1 is its bottom, rather than the edges of
-    the full adjusted canvas.
+    For a top-to-bottom conveyor, progress is measured from the top of the belt
+    after excluding the adjusted canvas' vertical margins. For a left-to-right
+    conveyor, it is measured from the left after excluding the side margins.
+    In either case, progress 0 and 1 are the two ends of the conveyor body,
+    rather than the edges of the full adjusted canvas.
     """
     mask_bool = ensure_2d_mask(mask, image_height, image_width)
-    ys = np.flatnonzero(np.any(mask_bool, axis=1))
-    if ys.size == 0:
+    if conveyor_direction == CONVEYOR_DIRECTION_TOP_TO_BOTTOM:
+        occupied_positions = np.flatnonzero(np.any(mask_bool, axis=1))
+        canvas_length = float(image_height)
+        margin_ratio = float(vertical_margin_ratio)
+    elif conveyor_direction == CONVEYOR_DIRECTION_LEFT_TO_RIGHT:
+        occupied_positions = np.flatnonzero(np.any(mask_bool, axis=0))
+        canvas_length = float(image_width)
+        margin_ratio = float(side_margin_ratio)
+    else:
+        raise ValueError(f"Unsupported conveyor direction: {conveyor_direction!r}")
+
+    if occupied_positions.size == 0:
         return None
 
-    fish_middle_y = 0.5 * (float(ys[0]) + float(ys[-1]))
-    belt_height = float(image_height) / (1.0 + 2.0 * vertical_margin_ratio)
-    belt_top = vertical_margin_ratio * belt_height
-    return (fish_middle_y - belt_top) / belt_height
+    fish_middle = 0.5 * (
+        float(occupied_positions[0]) + float(occupied_positions[-1])
+    )
+    belt_length = canvas_length / (1.0 + 2.0 * margin_ratio)
+    belt_start = margin_ratio * belt_length
+    return (fish_middle - belt_start) / belt_length
 
 
 def filter_detections_by_conveyor_progress(
@@ -1243,7 +1281,9 @@ def filter_detections_by_conveyor_progress(
     image_width: int,
     *,
     minimum_progress_ratio: float,
-    vertical_margin_ratio: float,
+    conveyor_direction: str = DEFAULT_CONVEYOR_DIRECTION,
+    side_margin_ratio: float = 0.0,
+    vertical_margin_ratio: float = 0.0,
 ) -> sv.Detections:
     """Keep fish whose body midpoint has passed the configured belt position."""
     if len(detections) == 0:
@@ -1260,6 +1300,8 @@ def filter_detections_by_conveyor_progress(
             mask,
             image_height,
             image_width,
+            conveyor_direction=conveyor_direction,
+            side_margin_ratio=side_margin_ratio,
             vertical_margin_ratio=vertical_margin_ratio,
         )
         # "Passed" is deliberately strict: a midpoint exactly on the line has
@@ -1709,11 +1751,15 @@ class BestFishSampleSelector:
         crop_scale: float = BEST_SAMPLE_CROP_SCALE,
         save_progress_ratio: float,
         vertical_margin_ratio: float,
+        conveyor_direction: str = DEFAULT_CONVEYOR_DIRECTION,
+        side_margin_ratio: float = 0.0,
     ) -> None:
         self.output_root = output_root
         self.crop_scale = float(crop_scale)
         self.save_progress_ratio = float(save_progress_ratio)
         self.vertical_margin_ratio = float(vertical_margin_ratio)
+        self.conveyor_direction = conveyor_direction
+        self.side_margin_ratio = float(side_margin_ratio)
 
         self.best_scores: dict[int, float] = {}
         self.best_frame_indexes: dict[int, int] = {}
@@ -1858,6 +1904,8 @@ class BestFishSampleSelector:
                 mask_bool,
                 image_height,
                 image_width,
+                conveyor_direction=self.conveyor_direction,
+                side_margin_ratio=self.side_margin_ratio,
                 vertical_margin_ratio=self.vertical_margin_ratio,
             )
             if progress is None or progress <= self.save_progress_ratio:
@@ -2782,6 +2830,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         crop_scale=BEST_SAMPLE_CROP_SCALE,
         save_progress_ratio=position_config["crop_save_ratio"],
         vertical_margin_ratio=position_config["vertical_margin_ratio"],
+        conveyor_direction=position_config["conveyor_direction"],
+        side_margin_ratio=position_config["side_margin_ratio"],
     )
 
     visualization_pipeline = AsyncVisualizationWriter(
@@ -2811,6 +2861,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     print(
         "[INFO] Conveyor position config:  "
         f"{ADJUST_CALIBRATION_MARGIN_CONFIG_PATH}"
+    )
+    print(
+        "[INFO] Conveyor direction:        "
+        f"{position_config['conveyor_direction']}"
     )
     print(
         "[INFO] Tracking/segmentation gate: fish midpoint > "
@@ -2932,6 +2986,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                         image_width=record["image_width"],
                         minimum_progress_ratio=(
                             position_config["tracking_start_ratio"]
+                        ),
+                        conveyor_direction=(
+                            position_config["conveyor_direction"]
+                        ),
+                        side_margin_ratio=(
+                            position_config["side_margin_ratio"]
                         ),
                         vertical_margin_ratio=(
                             position_config["vertical_margin_ratio"]

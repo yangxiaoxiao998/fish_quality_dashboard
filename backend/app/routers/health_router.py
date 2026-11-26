@@ -13,8 +13,16 @@ from app.repositories.db import (
     _mask_url,
 )
 from app.settings import settings
-from app.repositories.models import Fish, VideoTask, Stats5Min
+from app.repositories.models import (
+    DetectionReport,
+    Fish,
+    FrameFishDetection,
+    Stats5Min,
+    VideoFrame,
+    VideoTask,
+)
 from app.infra.redis_client import get_redis
+from app.services.path_service import to_abs_data_path
 
 router = APIRouter()
 
@@ -146,6 +154,117 @@ def health_database(db: Session = Depends(get_db)) -> dict:
             }
     except Exception as e:
         info["latest_stats_error"] = str(e)
+
+    # Data integrity diagnostics are deliberately read-only. They make the
+    # health endpoint useful after imports, retries, deletes, and upgrades.
+    diagnostics: dict = {
+        "missing_required_columns": {},
+        "orphan_fish_count": None,
+        "orphan_frame_count": None,
+        "orphan_detection_count": None,
+        "orphan_report_count": None,
+        "fish_count_mismatch_task_count": None,
+        "missing_pipeline_result_file_count": None,
+    }
+    try:
+        from sqlalchemy import inspect
+
+        inspector = inspect(engine)
+        required_columns = {
+            "video_task": {
+                "video_id", "source_path", "status",
+                "pipeline_result_path", "result_dir", "complete_fish",
+                "incomplete_fish", "failed_fish",
+            },
+            "fish": {
+                "fish_id", "video_id", "status", "fish_uid",
+                "body_length_cm", "body_length_no_tail_cm", "body_height_cm",
+                "pred_weight_g", "surface_damage_ratio",
+            },
+        }
+        for table, expected in required_columns.items():
+            actual = {column["name"] for column in inspector.get_columns(table)}
+            missing = sorted(expected - actual)
+            if missing:
+                diagnostics["missing_required_columns"][table] = missing
+    except Exception as exc:
+        diagnostics["schema_diagnostics_error"] = str(exc)
+
+    try:
+        diagnostics["orphan_fish_count"] = int(
+            db.execute(
+                select(func.count())
+                .select_from(Fish)
+                .outerjoin(VideoTask, Fish.video_id == VideoTask.video_id)
+                .where(VideoTask.video_id.is_(None))
+            ).scalar()
+            or 0
+        )
+        diagnostics["orphan_frame_count"] = int(
+            db.execute(
+                select(func.count())
+                .select_from(VideoFrame)
+                .outerjoin(VideoTask, VideoFrame.video_id == VideoTask.video_id)
+                .where(VideoTask.video_id.is_(None))
+            ).scalar()
+            or 0
+        )
+        diagnostics["orphan_detection_count"] = int(
+            db.execute(
+                select(func.count())
+                .select_from(FrameFishDetection)
+                .outerjoin(VideoTask, FrameFishDetection.video_id == VideoTask.video_id)
+                .where(VideoTask.video_id.is_(None))
+            ).scalar()
+            or 0
+        )
+        diagnostics["orphan_report_count"] = int(
+            db.execute(
+                select(func.count())
+                .select_from(DetectionReport)
+                .outerjoin(VideoTask, DetectionReport.video_id == VideoTask.video_id)
+                .where(
+                    DetectionReport.video_id.is_not(None),
+                    VideoTask.video_id.is_(None),
+                )
+            ).scalar()
+            or 0
+        )
+        diagnostics["fish_count_mismatch_task_count"] = int(
+            db.execute(
+                select(func.count())
+                .select_from(
+                    select(
+                        VideoTask.video_id,
+                        VideoTask.total_fish,
+                        func.count(Fish.fish_id).label("actual_fish"),
+                    )
+                    .outerjoin(Fish, Fish.video_id == VideoTask.video_id)
+                    .group_by(VideoTask.video_id, VideoTask.total_fish)
+                    .subquery()
+                )
+                .where(text("total_fish <> actual_fish"))
+            ).scalar()
+            or 0
+        )
+    except Exception as exc:
+        diagnostics["relational_diagnostics_error"] = str(exc)
+
+    try:
+        tasks_with_results = db.execute(
+            select(VideoTask.pipeline_result_path)
+            .where(VideoTask.pipeline_result_path.is_not(None))
+        ).scalars().all()
+        missing_results = 0
+        for stored_path in tasks_with_results:
+            path = to_abs_data_path(stored_path)
+            if path is None or not path.is_file():
+                missing_results += 1
+        diagnostics["missing_pipeline_result_file_count"] = missing_results
+    except Exception as exc:
+        diagnostics["file_diagnostics_error"] = str(exc)
+
+    info["data_diagnostics"] = diagnostics
 
     return info
 

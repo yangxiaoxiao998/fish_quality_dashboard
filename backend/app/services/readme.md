@@ -1,39 +1,21 @@
-上传视频
+摄像头视频
   ↓
-  <!-- 获取视频流 -->
-stream_ingest.py
+stream_router 创建 video_task
   ↓
-  <!-- 处理视频帧 -->
-algo_facade.process_video_frames()
+Redis/RQ fish 队列
   ↓
-  <!-- 抽帧 -->
-frame_extract_service.extract_video_frames()
+algorithm_video_pipeline 调用整视频 CLI
   ↓
-抽帧保存 jpg
+抽帧、矫正、检测/分割/跟踪、测量
   ↓
-  <!-- 矫正 -->
-apply_frame_perspective_if_enabled()
-  ↓
-后续检测 / 分割 / 裁剪读取矫正后的帧
+结果导入 PostgreSQL 并生成报表
 
 
 摄像头输入：
-树莓派推流
+树莓派向 MediaMTX 推送 RTMP
   ↓
-B端 camera_yzt_service 读取实时帧
+camera_yzt_service 从本机 MediaMTX 读取并录制 MP4
   ↓
-apply_perspective_to_frame_if_enabled(frame)
+停止录制后沿用同一个 video_id 入队整视频算法
   ↓
-保存 frame_fish_detection，包括 bbox 和 center_x/center_y
-  ↓
-前端点击画面
-  ↓
-/api/dashboard/frame/select-fish
-  ↓
-根据点击坐标找最近鱼
-  ↓
-前端显示矫正后的 Camera Stream
-  ↓
-保存矫正后的逐帧图像
-  ↓
-检测算法使用矫正后的帧
+结果导入 PostgreSQL、生成视频报告和日报

@@ -1,8 +1,7 @@
 """
 worker_main.py - RQ worker 的主入口。
 
-第一阶段：算法统一走 algorithm_cli_service.run_video_pipeline_cli，
-不再支持 FISH_ALGO_MODE mock / real 切换。
+算法统一走 algorithm_cli_service.run_video_pipeline_cli。
 
 启动方式：
 

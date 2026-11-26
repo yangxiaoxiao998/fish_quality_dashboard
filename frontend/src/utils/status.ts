@@ -39,6 +39,7 @@ export const CAMERA_STATE_COLOR: Record<string, string> = {
   running: 'green',
   stopping: 'orange',
   error: 'red',
+  reconnecting: 'orange',
 }
 
 export function videoStatusText(status?: string | null): string {

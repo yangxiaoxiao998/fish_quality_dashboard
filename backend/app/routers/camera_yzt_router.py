@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -12,7 +14,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.services.camera_yzt.camera_yzt_service import camera_service_yzt
-from app.services.path_service import to_abs_data_path, to_static_url
+from app.services.path_service import to_abs_data_path, to_data_relative, to_static_url
 from app.repositories.db import SessionLocal
 from app.repositories import session_repo, fish_repo
 from app.paths import DATA_DIR
@@ -60,6 +62,7 @@ class StartStreamResponse(BaseModel):
     auto_stop_triggered: Optional[bool] = None
     # preview/start 专用：True = preview-only（不建 video_task、不写视频、不入队算法）
     preview_mode: Optional[bool] = None
+    storage: Optional[dict] = None
 
 
 class StreamStatusResponse(BaseModel):
@@ -87,6 +90,7 @@ class StreamStatusResponse(BaseModel):
     last_fish_detected: int = 0
     fps: Optional[float]
     elapsed_seconds: Optional[float]
+    recording_started_at: Optional[str] = None
     last_error: Optional[str]
     last_error_history: Optional[str] = None
     backend: Optional[dict] = None
@@ -105,6 +109,16 @@ class StreamStatusResponse(BaseModel):
     write_video_enabled: Optional[bool] = None
     create_video_task: Optional[bool] = None
     calibration_only: Optional[bool] = None
+    reconnect_grace_seconds: Optional[float] = None
+    reconnect_elapsed_seconds: Optional[int] = None
+    reconnect_remaining_seconds: Optional[int] = None
+    reconnecting: Optional[bool] = None
+    pi_resolution: Optional[dict] = None
+    pi_address_changed: Optional[bool] = None
+    pi_arp: Optional[dict] = None
+    pi_mac_changed: Optional[bool] = None
+    storage: Optional[dict] = None
+    recording_segments: Optional[dict] = None
 
 
 class StopStreamResponse(BaseModel):
@@ -127,6 +141,8 @@ class StopStreamResponse(BaseModel):
     note: Optional[str] = None
     pi_stop_called: Optional[bool] = None
     pi_status_after: Optional[dict] = None
+    recording_started_at: Optional[str] = None
+    recording_finished_at: Optional[str] = None
 
 
 class CameraHistoryItem(BaseModel):
@@ -142,8 +158,8 @@ class CameraHistoryItem(BaseModel):
 
 class CameraSettingsRequest(BaseModel):
     stream_url: str = ""
-    width: int = 1920
-    height: int = 1080
+    width: int = 1980
+    height: int = 1020
     fps: int = 25
     force_all_complete: bool = False
 
@@ -315,8 +331,8 @@ class PreviewStartRequest(BaseModel):
       - 不支持定时录制（duration_minutes 字段不允许传）
     """
     stream_url: Optional[str] = None
-    width: Optional[int] = 1920
-    height: Optional[int] = 1080
+    width: Optional[int] = 1980
+    height: Optional[int] = 1020
     fps: Optional[int] = 25
     autofocus_mode: Optional[str] = None
     lens_position: Optional[float] = None
@@ -468,15 +484,13 @@ async def confirm_focus(request: FocusSettingsRequest):
                 camera_service_yzt.start_stream,
                 {
                     **payload,
-                    "width": request.width or 1920,
-                    "height": request.height or 1080,
+                    "width": request.width or 1980,
+                    "height": request.height or 1020,
                 },
                 calibration_only=True,
                 write_video=False,
                 create_video_task=False,
             )
-            import asyncio
-            import time
             deadline = time.time() + 30.0
             while time.time() < deadline:
                 status = await run_in_threadpool(camera_service_yzt.get_status)
@@ -486,7 +500,6 @@ async def confirm_focus(request: FocusSettingsRequest):
             else:
                 raise RuntimeError("重启摄像头后未获取到实时画面")
         else:
-            import asyncio
             deadline = time.time() + 5.0
             while time.time() < deadline and not camera_service_yzt.get_latest_frame():
                 await asyncio.sleep(0.2)
@@ -595,12 +608,7 @@ async def get_camera_history(limit: int = 50):
         from app.repositories.models import VideoTask
         from sqlalchemy import select, desc
 
-        stmt = (
-            select(VideoTask)
-            .where(VideoTask.source_type == "rtsp")
-            .order_by(desc(VideoTask.created_at))
-            .limit(limit)
-        )
+        stmt = select(VideoTask).order_by(desc(VideoTask.created_at)).limit(limit)
         results = db.execute(stmt).scalars().all()
 
         items = []
@@ -616,7 +624,7 @@ async def get_camera_history(limit: int = 50):
                     processed_fish=r.processed_fish or 0,
                     created_at=created_at_bj.strftime("%Y-%m-%d %H:%M") if created_at_bj else "",
                     finished_at=finished_at_bj.strftime("%Y-%m-%d %H:%M") if finished_at_bj else None,
-                    source_path=r.source_path,
+                     source_path=to_data_relative(r.source_path),
                 )
             )
         return {"items": items, "count": len(items)}
@@ -634,8 +642,9 @@ async def get_camera_video(video_id: str):
 
         fishes = fish_repo.list_fish_by_video(db, video_id=video_id, limit=1000)
 
-        playback_url = to_static_url(task.source_path)
-        abs_video_path = to_abs_data_path(task.source_path)
+        safe_source_path = to_data_relative(task.source_path)
+        playback_url = to_static_url(safe_source_path)
+        abs_video_path = to_abs_data_path(safe_source_path)
         video_exists = abs_video_path.exists() if abs_video_path else False
 
         created_at_bj = to_beijing(task.created_at)
@@ -649,7 +658,7 @@ async def get_camera_video(video_id: str):
             "processed_fish": task.processed_fish or 0,
             "created_at": created_at_bj.isoformat() if created_at_bj else None,
             "finished_at": finished_at_bj.isoformat() if finished_at_bj else None,
-            "source_path": task.source_path,
+            "source_path": safe_source_path,
             "playback_url": playback_url,
             "video_exists": video_exists,
             "playable": task.status == "done" and video_exists,
@@ -657,9 +666,12 @@ async def get_camera_video(video_id: str):
             "fishes": [
                 {
                     "fish_id": f.fish_id,
-                    "body_length": f.body_length,
-                    "body_height": f.body_height,
-                    "body_weight": f.body_weight,
+                    "body_length": f.body_length_cm,
+                    "body_length_cm": f.body_length_cm,
+                    "body_height": f.body_height_cm,
+                    "body_height_cm": f.body_height_cm,
+                    "body_weight": f.pred_weight_g,
+                    "pred_weight_g": f.pred_weight_g,
                     "condition_factor": f.condition_factor,
                     "surface_damage": f.surface_damage,
                     "status": f.status,

@@ -1,7 +1,7 @@
 // frontend/src/store/video.ts
 //
 // 视频状态 store：
-//   - reactive 状态（同时被 VideoWall.vue 和 Dashboard.vue 读）
+//   - reactive 状态（由 Dashboard 和历史报告页面读取）
 //   - 写 localStorage，刷新或切路由不丢
 //   - 支持：上传 / 历史跳转 / 摄像头 等不同 source 标记
 //
@@ -101,7 +101,7 @@ export function setVideoState(
 
 /**
  * 历史视频跳转专用：写入 store 并标记 playOnce = true。
- * 配合 VideoWall 的 @ended 处理器，自然结束时不再自动续播。
+ * 配合视频播放页面的 ended 处理器，自然结束时不再自动续播。
  */
 export function setHistoryVideoState(videoId: string, videoSrc: string) {
   setVideoState(videoId, videoSrc, true, {

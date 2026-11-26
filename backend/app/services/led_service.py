@@ -87,7 +87,7 @@ def _request(
     method: str,
     path: str,
     json_data: Optional[Dict[str, Any]] = None,
-    timeout: float = 5.0,
+    timeout: float = 20.0,
 ) -> Dict[str, Any]:
     """统一代理请求：捕获异常 + 截断错误文本 + 规范化返回。
 

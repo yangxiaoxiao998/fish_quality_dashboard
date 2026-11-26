@@ -108,7 +108,13 @@ def _write_task_log_header(task_id: str, title: str, payload: dict[str, Any]) ->
 
 
 def _spawn_task_process(task_id: str) -> int:
-    command = [sys.executable, "-m", "app.services.update.upgrade_manager.runner", task_id]
+    # PyInstaller's executable exposes subcommands rather than Python's
+    # ``-m`` switch.  Keep source/Conda development behavior while launching
+    # the dedicated frozen upgrade-runner entrypoint in a packaged release.
+    if bool(getattr(sys, "frozen", False)):
+        command = [sys.executable, "upgrade-runner", task_id]
+    else:
+        command = [sys.executable, "-m", "app.services.update.upgrade_manager.runner", task_id]
     process = subprocess.Popen(
         command,
         cwd=str(storage.PROJECT_ROOT),

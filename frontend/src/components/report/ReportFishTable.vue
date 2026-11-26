@@ -7,7 +7,7 @@
     row-key="fish_id"
     stripe
     hoverable
-    :scroll="{ x: 1100 }"
+    :scroll="{ x: 1600 }"
   >
     <template #bodyCell="{ column, record }">
       <template v-if="column.dataIndex === 'crop_image'">
@@ -46,6 +46,28 @@
       <template v-else-if="column.dataIndex === 'error_message'">
         <span class="dim">{{ record.error_message || '--' }}</span>
       </template>
+      <template v-else-if="column.dataIndex === 'fish_condition_image'">
+        <div class="fish-thumb-cell">
+          <img
+            v-if="fishConditionImageUrl(record)"
+            :src="fishConditionImageUrl(record)"
+            alt="fish-condition"
+            @error="onImgError"
+          />
+          <span v-else class="dim">--</span>
+        </div>
+      </template>
+      <template v-else-if="column.dataIndex === 'arched_back_image'">
+        <div class="fish-thumb-cell">
+          <img
+            v-if="archedBackImageUrl(record)"
+            :src="archedBackImageUrl(record)"
+            alt="arched-back"
+            @error="onImgError"
+          />
+          <span v-else class="dim">--</span>
+        </div>
+      </template>
       <template v-else-if="column.dataIndex === 'track_id'">
         <a-tag color="arcoblue">{{ record.track_id ?? '--' }}</a-tag>
       </template>
@@ -60,6 +82,7 @@
 
 <script setup lang="ts">
 import { getFishImageUrl } from '@/utils/fishFields'
+import { normalizeImageUrl } from '@/utils/reportPath'
 
 const props = defineProps<{
   rows: any[]
@@ -132,6 +155,16 @@ function fishCropUrl(fish: any): string {
   return url || ''
 }
 
+function fishConditionImageUrl(fish: any): string {
+  const raw = (fish && (fish as any).raw) || fish
+  return normalizeImageUrl(raw?.fish_condition_image_path || raw?.fish_condition_image_url || '')
+}
+
+function archedBackImageUrl(fish: any): string {
+  const raw = (fish && (fish as any).raw) || fish
+  return normalizeImageUrl(raw?.arched_back_image_path || raw?.arched_back_image_url || '')
+}
+
 const columns = [
   { title: '序号', dataIndex: 'track_id', width: 90, fixed: 'left' as const },
   { title: '鱼图', dataIndex: 'crop_image', width: 110 },
@@ -145,6 +178,9 @@ const columns = [
   { title: '肥满度', dataIndex: 'condition_factor', width: 90, digits: 3 },
   { title: '破损率', dataIndex: 'surface_damage_ratio', width: 90 },
   { title: '腹部颜色', dataIndex: 'hex_color', width: 110 },
+  { title: '弓背比值', dataIndex: 'arched_back_ratio', width: 100, digits: 3 },
+  { title: '体尺标注图', dataIndex: 'fish_condition_image', width: 110 },
+  { title: '弓背标注图', dataIndex: 'arched_back_image', width: 110 },
   { title: 'error_message', dataIndex: 'error_message', width: 200 },
 ]
 </script>

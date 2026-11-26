@@ -27,7 +27,8 @@ function buildPercentBarOption(
   xAxisName: string,
   xUnitLabel: string,
 ): any {
-  const counts = data.map((d) => Number(d.count) || 0)
+  const visibleData = data.filter((d) => Number(d.count) > 0)
+  const counts = visibleData.map((d) => Number(d.count) || 0)
   const percents = countToPercent(counts).map((r) => Math.round(r * 10000) / 100) // 0~100
   return {
     tooltip: {
@@ -37,7 +38,7 @@ function buildPercentBarOption(
         const p = arr[0]
         if (!p || p.dataIndex == null) return ''
         const idx = p.dataIndex
-        const datum = data[idx]
+        const datum = visibleData[idx]
         if (!datum) return ''
         const pct = Number(p.value ?? 0)
         const lines = [
@@ -48,7 +49,13 @@ function buildPercentBarOption(
         return lines.join('<br/>')
       },
     },
-    grid: { left: 50, right: 16, top: 24, bottom: 56 },
+    grid: {
+      left: 56,
+      right: 12,
+      top: 24,
+      bottom: visibleData.length > 8 ? 76 : 58,
+      containLabel: true,
+    },
     title: title
       ? { text: title, left: 'center', top: 4, textStyle: { fontSize: 13, color: '#1d2129' } }
       : undefined,
@@ -57,8 +64,14 @@ function buildPercentBarOption(
       name: xAxisName,
       nameLocation: 'middle',
       nameGap: 42,
-      data: data.map((d) => d.label),
-      axisLabel: { interval: 0, rotate: data.length > 6 ? 25 : 0 },
+      data: visibleData.map((d) => d.label),
+      axisLabel: {
+        interval: visibleData.length > 8 ? 1 : 0,
+        rotate: visibleData.length > 8 ? 35 : 0,
+        hideOverlap: true,
+        margin: 10,
+        fontSize: 10,
+      },
       nameTextStyle: { color: '#4e5969', fontSize: 11 },
     },
     yAxis: {
@@ -161,10 +174,13 @@ export function useReportCharts(
 ) {
   const rendered = ref<boolean>(false)
   let chartInstances: echarts.ECharts[] = []
+  let resizeObserver: ResizeObserver | null = null
 
   function destroy() {
     chartInstances.forEach((c) => c.dispose())
     chartInstances = []
+    resizeObserver?.disconnect()
+    resizeObserver = null
     rendered.value = false
   }
 
@@ -174,8 +190,8 @@ export function useReportCharts(
     const s = summary.value
     const c = charts.value
 
-    if (refs.trend?.value && c.fish_count_trend?.length) {
-      const trend = c.fish_count_trend.map((d) => ({ bucket: d.bucket, count: d.count }))
+    if (refs.trend?.value && c.video_task_trend?.length) {
+      const trend = c.video_task_trend.map((d) => ({ bucket: d.bucket, count: d.count }))
       const inst = echarts.init(refs.trend.value)
       inst.setOption(buildTrendOption(trend))
       chartInstances.push(inst)
@@ -183,12 +199,12 @@ export function useReportCharts(
 
     if (refs.lengthDist?.value && c.body_length_distribution?.length) {
       const inst = echarts.init(refs.lengthDist.value)
-       inst.setOption(buildPercentBarOption(c.body_length_distribution, '', '全长区间（cm）', ' cm'))
+       inst.setOption(buildPercentBarOption(c.body_length_distribution, '', '体长区间（cm）', ' cm'))
       chartInstances.push(inst)
     }
     if (refs.noTailDist?.value && c.body_length_without_tail_distribution?.length) {
       const inst = echarts.init(refs.noTailDist.value)
-       inst.setOption(buildPercentBarOption(c.body_length_without_tail_distribution, '', '体高区间（cm）', ' cm'))
+        inst.setOption(buildPercentBarOption(c.body_length_without_tail_distribution, '', '无尾体长区间（cm）', ' cm'))
       chartInstances.push(inst)
     }
     if (refs.heightDist?.value && c.body_height_distribution?.length) {
@@ -233,10 +249,17 @@ export function useReportCharts(
             return `${p.name}<br/>数量：${v} 条<br/>占比：${pct.toFixed(2)}%`
           },
         },
-        legend: { bottom: 0 },
+        legend: {
+          orient: 'vertical',
+          right: 4,
+          top: 'middle',
+          itemGap: 12,
+          textStyle: { color: '#4e5969', fontSize: 12 },
+        },
         series: [
           {
             type: 'pie',
+            center: ['34%', '50%'],
             radius: ['38%', '70%'],
             data: statusData,
             label: {
@@ -246,10 +269,18 @@ export function useReportCharts(
                 return `${p.name} ${pct.toFixed(1)}%`
               },
             },
+            labelLine: { length: 8, length2: 6 },
           },
         ],
       })
       chartInstances.push(inst)
+    }
+
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => handleResize())
+      Object.values(refs).forEach((chartRef) => {
+        if (chartRef?.value) resizeObserver?.observe(chartRef.value)
+      })
     }
 
     rendered.value = chartInstances.length > 0

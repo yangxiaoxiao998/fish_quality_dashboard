@@ -14,12 +14,13 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Optional
 
-from app.paths import DATA_DIR, PROJECT_ROOT
+from app.paths import DATA_DIR, PROJECT_ROOT, resource_path
+from app.runtime_paths import IS_FROZEN
 
 
-UPDATE_DIR = Path(__file__).resolve().parent
+UPDATE_DIR = resource_path("backend", "app", "services", "update")
 UPDATER_SCRIPT = UPDATE_DIR / "updater.py"
-VERSION_FILE = PROJECT_ROOT / "version.json"
+VERSION_FILE = resource_path("version.json")
 UPDATE_PACKAGE_DIR = DATA_DIR / "uploads" / "update_packages"
 DEFAULT_VERSION = {"current_version": "1.0.0", "version": "1.0.0"}
 DEFAULT_UPGRADE_MANAGER_BASE_URL = "http://127.0.0.1:8012"
@@ -36,10 +37,23 @@ def _is_update_package_name(name: str) -> bool:
     return any(lower_name.endswith(suffix) for suffix in PACKAGE_SUFFIXES)
 
 
+def _active_version_file() -> Path:
+    for candidate in (
+        PROJECT_ROOT / "version.json",
+        PROJECT_ROOT / "backend" / "version.json",
+        VERSION_FILE,
+    ):
+        if candidate.exists():
+            return candidate
+    return VERSION_FILE
+
+
 def _read_version() -> Dict[str, Any]:
-    if not VERSION_FILE.exists():
+    active_version_file = _active_version_file()
+    if not active_version_file.exists():
         try:
-            VERSION_FILE.write_text(
+            active_version_file.parent.mkdir(parents=True, exist_ok=True)
+            active_version_file.write_text(
                 json.dumps(
                     {
                         "version": "1.0.0",
@@ -48,8 +62,8 @@ def _read_version() -> Dict[str, Any]:
                         "git_commit": "",
                         "min_config_version": 1,
                         "bundle_format_version": 1,
-                        "package_format": "source_tar_xz_v1",
-                        "package_mode": "runtime_source",
+                        "package_format": "release_artifact_tar_xz_v1" if IS_FROZEN else "source_tar_xz_v1",
+                        "package_mode": "runtime_artifact" if IS_FROZEN else "runtime_source",
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -60,7 +74,7 @@ def _read_version() -> Dict[str, Any]:
         except Exception as exc:
             return {**DEFAULT_VERSION, "_error_reading": str(exc)}
     try:
-        return json.loads(VERSION_FILE.read_text(encoding="utf-8"))
+        return json.loads(active_version_file.read_text(encoding="utf-8"))
     except Exception as exc:
         return {**DEFAULT_VERSION, "_error_reading": str(exc)}
 
@@ -327,6 +341,24 @@ def run_update(package_path: str, timeout: int = 3600) -> Dict[str, Any]:
     current_version = str(
         _read_version().get("version") or _read_version().get("current_version") or "1.0.0"
     )
+    if IS_FROZEN:
+        # A frozen backend cannot execute ``python updater.py`` in place and
+        # must not replace its own running executable synchronously.  Queue the
+        # same standalone task used by the Upgrade Manager; its runner can
+        # stop and replace the packaged backend safely.
+        from app.services.update.upgrade_manager import service as upgrade_service
+
+        task = upgrade_service.create_update_task(str(target))
+        return {
+            "ok": True,
+            "queued": True,
+            "task": task,
+            "current_version": current_version,
+            "new_version": new_version,
+            "package_path": str(target),
+            "message": "packaged update task queued",
+            "restart_required": True,
+        }
     command = [
         sys.executable,
         str(UPDATER_SCRIPT),

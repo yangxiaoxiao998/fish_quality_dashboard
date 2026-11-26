@@ -22,8 +22,11 @@ class Settings(BaseSettings):
 
     database_url: str
     redis_url: str
+    fish_api_key: str = ""
+    cors_allowed_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
 
-    # 处理参数（后续可写入 config/app.yaml，再由 loader 合并）
+    # Runtime processing parameters are environment-backed until a typed
+    # configuration service is introduced.
     sample_fps: int = 25
     snapshot_strategy: str = "first_seen"  # first_seen / best_sharpness / etc.
 

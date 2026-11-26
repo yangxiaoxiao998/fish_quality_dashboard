@@ -5,9 +5,53 @@
   "description": "鱼品质智能检测系统桌面 kiosk 启动器",
   "main": "main.cjs",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "start:static": "FISH_DESKTOP_STATIC=1 electron .",
+    "build:renderer": "npm --prefix ../frontend run build",
+    "pack:linux": "npm run build:renderer && electron-builder --linux dir",
+    "dist:linux": "npm run build:renderer && electron-builder --linux AppImage"
   },
   "devDependencies": {
-    "electron": "^36.3.2"
+    "electron": "^36.3.2",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "cn.edu.sdu.fish-quality",
+    "productName": "鱼品质智能检测系统",
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../frontend/docs",
+        "to": "renderer",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "build/icons/512x512.png",
+        "to": "app_icon.png"
+      }
+    ],
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Science",
+      "icon": "build/icons",
+      "executableName": "fish-quality-desktop",
+      "artifactName": "fish-quality-desktop-${version}-${arch}.${ext}",
+      "desktop": {
+        "entry": {
+          "Name": "鱼品质智能检测系统",
+          "Name[zh_CN]": "鱼品质智能检测系统",
+          "GenericName": "鱼品质智能检测系统",
+          "StartupWMClass": "fish-quality-desktop"
+        }
+      }
+    }
   }
 }

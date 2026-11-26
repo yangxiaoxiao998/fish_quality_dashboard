@@ -48,7 +48,6 @@ export interface OpsAlgorithmTaskSummary {
 
 export interface OpsAlgorithmTaskItem {
   video_id: string
-  source_type: string
   status: string
   display_status: string
   is_stuck: boolean
@@ -90,6 +89,9 @@ export interface OpsAlgorithmTaskStage {
   name: string
   status: 'done' | 'running' | 'pending' | 'failed' | 'skipped' | string
   elapsed_seconds: number | null
+  started_at?: string | null
+  finished_at?: string | null
+  timing_source?: 'recorded' | 'estimated' | string | null
   input_count: number | null
   output_count: number | null
   error_message: string | null
@@ -182,6 +184,7 @@ export interface OpsAlgorithmTaskDetail {
   }
   pipeline_result: { raw: Record<string, unknown> | null; parse_error: string | null }
   stages: OpsAlgorithmTaskStage[]
+  total_elapsed_seconds?: number | null
   display_status: string
   is_stuck: boolean
   stuck_reason: string

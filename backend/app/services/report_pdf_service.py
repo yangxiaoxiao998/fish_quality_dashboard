@@ -90,6 +90,7 @@ def generate_daily_fish_quality_pdf(
         "abnormal_fish_rate",
         "task_success_rate",
     }
+    _DURATION_KEYS = {"total_video_duration", "avg_processing_seconds"}
     for k, v in (summary or {}).items():
         if k not in context or v is None:
             continue
@@ -97,6 +98,10 @@ def generate_daily_fish_quality_pdf(
             # 重新走 helper（context 里已是字符串）
             from app.services.report_format_utils import format_percent
             context[k] = format_percent(v)
+        elif k in _DURATION_KEYS:
+            from app.services.report_stats_service import format_duration_with_unit
+
+            context[k] = format_duration_with_unit(v)
         else:
             context[k] = v
     context["report_file_name"] = file_name
@@ -268,7 +273,7 @@ def generate_video_fish_quality_pdf(
 
     # 1. 复用现有视频报告 PDF 生成（docx + pdf + 5 张图）
     try:
-        pdf_res = generate_video_pdf_report(video_id)
+        pdf_res = generate_video_pdf_report(video_id, db=db)
     except Exception as exc:
         logger.exception(
             "[video_report_pdf] generate_video_pdf_report failed: %s", exc
@@ -422,7 +427,7 @@ def generate_video_fish_quality_pdf(
 def _ctx_to_summary(ctx: dict) -> dict:
     """把 context 关键字段挑出来当 summary_json 存。"""
     keys = [
-        "video_total", "upload_video_total", "rtsp_video_total",
+        "video_total", "camera_video_total",
         "done_video_total", "failed_video_total", "no_fish_video_total",
         "fish_total", "valid_fish_total", "partial_fish_total",
         "abnormal_fish_total", "surface_damage_fish_total",
@@ -440,4 +445,4 @@ def _ctx_to_summary(ctx: dict) -> dict:
 
 
 def to_report_relative_path(path: Path) -> str:
-    return path.relative_to(DATA_DIR).as_posix()
+    return f"data/{path.relative_to(DATA_DIR).as_posix()}"

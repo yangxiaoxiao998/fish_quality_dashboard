@@ -8,7 +8,6 @@
  * 旧的 /api/calibration/status / /api/calibration/save / /api/calibration/clear
  * 已经被后端标记为 legacy；保留函数名兼容，但内部走新接口。
  */
-import { http } from '@/api/http'
 import {
   getAlgorithmCalibrationStatus,
   runAlgorithmCalibration,
@@ -62,10 +61,9 @@ export function clearCalibrationConfig() {
 // 旧 /api/calibration/perspective 上传图片自动计算透视矩阵：已删除。
 // 前端若仍调用，会返回 404 / 410。
 export function calibrateFromUpload(_file: File) {
-  return http.post('/api/calibration/perspective', _file).catch((err) => {
-    throw new Error(
-      'calibrateFromUpload 已废弃。请使用 runCalibrationByImagePath(source_image=服务器标定图片路径) 调用 /api/algorithm/calibration。原始错误：' +
-        (err?.message || String(err))
-    )
-  })
+  return Promise.reject(
+    new Error(
+      'calibrateFromUpload 已废弃。请使用摄像头抓帧接口和 /api/algorithm/calibration。',
+    ),
+  )
 }
